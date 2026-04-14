@@ -21,7 +21,15 @@ notebooks/
 │   └── 07_request_lifecycle.md     # 请求生命周期
 │
 ├── 02_model_specifics/             # 模型特定方法论
-│   └── 01_transformer_models.md    # Transformer模型实现
+│   ├── 01_transformer_models.md    # Transformer模型实现
+│   └── 02_deepseek_v3/             # DeepSeek V3模型分析
+│       ├── README.md               # 概述与参数
+│       ├── 01_architecture.md      # 整体架构
+│       ├── 02_mla_attention.md     # MLA注意力机制
+│       ├── 03_moe.md               # MoE混合专家
+│       ├── 04_mtp.md               # MTP投机解码
+│       ├── 05_nsa.md               # NSA稀疏注意力
+│       └── 06_optimization_patterns.md  # 推理优化模式
 │
 ├── 03_operators/                   # 算子设计
 │   └── 01_attention_ops.md         # 注意力算子
