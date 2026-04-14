@@ -1,333 +1,199 @@
-# 代码组织模式
+# Implementation Patterns
 
-## 1. 精简框架的代码原则
+## Common Patterns Across LLM Inference Frameworks
 
-### 1.1 核心原则
+These patterns appear consistently in nano-vllm, nano-sglang, and mini-sglang. They represent proven approaches for structuring inference code.
 
-1. **单一路径**：避免if-else分支，每个功能只有一条执行路径
-2. **直接调用**：避免动态派发，直接调用具体实现
-3. **固定配置**：避免可配置性，固定最优配置
-4. **最小抽象**：只在必要时引入抽象层
+### 1. Global Context / Thread-Local State
 
-### 1.2 反模式识别
+**Problem**: Batch metadata (slot mappings, block tables, sequence lengths) must be accessible deep in the model's attention layers, but threading it through every layer's forward() signature is verbose and fragile.
 
-```python
-# ❌ 反模式：动态派发
-def get_attention(backend):
-    if backend == "flash":
-        return FlashAttention()
-    elif backend == "triton":
-        return TritonAttention()
-    # ...
-
-# ✅ 推荐：直接实例化
-attention = FlashAttention()
-```
-
-## 2. 模块组织模式
-
-### 2.1 扁平结构
+**Solution**: Use a module-level or thread-local context object.
 
 ```python
-# 精简框架目录结构
-nano_llm/
-├── config.py          # 配置
-├── engine.py          # 引擎（包含Scheduler, BlockManager）
-├── model.py           # 模型（包含所有层）
-├── attention.py       # Attention实现
-├── sampler.py         # 采样器
-└── utils.py           # 工具函数
+# nano-vllm approach: module-level singleton
+class _Context:
+    is_prefill: bool
+    slot_mapping: Tensor
+    block_tables: Tensor
+    kvcache: Tensor
 
-# 而非：
-complex_llm/
-├── engine/
-│   ├── scheduler/
-│   ├── block_manager/
-│   ├── sequence/
-│   └── ...
-├── model/
-│   ├── layers/
-│   ├── attention/
-│   └── ...
-└── ...
-```
+context = _Context()
 
-### 2.2 内聚组织
+# Set before forward pass:
+context.is_prefill = True
+context.slot_mapping = computed_mapping
 
-```python
-# 相关功能放在同一文件
-# engine.py
-class Scheduler:
-    ...
-
-class BlockManager:
-    ...
-
-class Sequence:
-    ...
-
-# 而非分散在多个文件
-```
-
-## 3. 配置模式
-
-### 3.1 固定配置
-
-```python
-# ❌ 反模式：大量可配置项
-@dataclass
-class Config:
-    model_path: str
-    max_seqs: int = 512
-    max_tokens: int = 16384
-    block_size: int = 256
-    attention_backend: str = "flash"
-    scheduler_policy: str = "fcfs"
-    quantization: str = "fp16"
-    # ... 200+ 参数
-
-# ✅ 推荐：最小配置
-@dataclass
-class Config:
-    model_path: str
-    # 其他参数自动推导或固定
-```
-
-### 3.2 自动推导
-
-```python
-def create_config(model_path: str) -> Config:
-    """从模型自动推导配置"""
-    hf_config = AutoConfig.from_pretrained(model_path)
-    
-    return Config(
-        model_path=model_path,
-        hidden_size=hf_config.hidden_size,
-        num_layers=hf_config.num_hidden_layers,
-        # 自动计算，不暴露给用户
-    )
-```
-
-## 4. 接口设计模式
-
-### 4.1 简单接口
-
-```python
-# ❌ 反模式：复杂接口
-class LLM:
-    def generate(
-        self,
-        prompts,
-        sampling_params=None,
-        use_tqdm=True,
-        prefix_cache=True,
-        attention_backend=None,
-        stream=False,
-        # ... 更多参数
-    ): ...
-
-# ✅ 推荐：最小接口
-class LLM:
-    def generate(self, prompts, temperature=1.0, max_tokens=16):
-        ...
-```
-
-### 4.2 数据类封装
-
-```python
-# 使用数据类封装参数
-@dataclass
-class SamplingParams:
-    temperature: float = 1.0
-    max_tokens: int = 16
-
-class LLM:
-    def generate(self, prompts, params=None):
-        params = params or SamplingParams()
-        # 使用params
-```
-
-## 5. 错误处理模式
-
-### 5.1 快速失败
-
-```python
-# ❌ 反模式：复杂错误处理
-def allocate_memory(size):
-    try:
-        return torch.empty(size, device="cuda")
-    except RuntimeError as e:
-        if "out of memory" in str(e):
-            # 尝试清理
-            torch.cuda.empty_cache()
-            try:
-                return torch.empty(size, device="cuda")
-            except:
-                # 尝试更小的size
-                ...
-        else:
-            raise
-
-# ✅ 推荐：快速失败
-def allocate_memory(size):
-    return torch.empty(size, device="cuda")
-    # 让错误直接抛出，由调用者处理
-```
-
-### 5.2 断言优先
-
-```python
-def forward(self, input_ids):
-    # 使用断言检查前置条件
-    assert input_ids.dim() == 2
-    assert input_ids.max() < self.vocab_size
-    
-    # 正常逻辑
-    ...
-```
-
-## 6. 状态管理模式
-
-### 6.1 全局上下文
-
-```python
-# 使用全局变量避免参数传递
-_CONTEXT = None
-
-def get_context():
-    return _CONTEXT
-
-def set_context(**kwargs):
-    global _CONTEXT
-    _CONTEXT = Context(**kwargs)
-
-# 在模型各层中使用
-context = get_context()
-```
-
-### 6.2 状态封装
-
-```python
-# 将相关状态封装在一起
-class Sequence:
-    def __init__(self, token_ids):
-        self.token_ids = token_ids
-        self.block_table = []
-        self.status = Status.WAITING
-        # 所有状态集中管理
-```
-
-## 7. 性能优化模式
-
-### 7.1 避免过度优化
-
-```python
-# ❌ 反模式：过早优化
-def complex_optimized_function():
-    # 复杂的手动优化
-    ...
-
-# ✅ 推荐：先简洁，后优化
-def simple_function():
-    # 清晰的实现
-    ...
-
-# 使用torch.compile自动优化
-@torch.compile
-def optimized_function():
-    ...
-```
-
-### 7.2 内置优化
-
-```python
-# 利用PyTorch内置优化
-# Pinned memory
-tensor = torch.tensor(data, pin_memory=True)
-
-# Non-blocking transfer
-tensor = tensor.cuda(non_blocking=True)
-
-# torch.compile
-model = torch.compile(model)
-```
-
-## 8. 代码复用模式
-
-### 8.1 避免过度抽象
-
-```python
-# ❌ 反模式：过度抽象
-class BaseAttention(ABC):
-    @abstractmethod
-    def forward(self, q, k, v): ...
-
-class FlashAttention(BaseAttention):
-    def forward(self, q, k, v): ...
-
-class TritonAttention(BaseAttention):
-    def forward(self, q, k, v): ...
-
-# ✅ 推荐：直接实现
-class Attention:
+# Access in attention layer:
+class Attention(nn.Module):
     def forward(self, q, k, v):
-        # 直接使用Flash Attention
-        return flash_attn_func(q, k, v)
+        slot_mapping = context.slot_mapping  # Access global state
 ```
-
-### 8.2 组合优于继承
 
 ```python
-# 使用组合而非继承
-class Model:
-    def __init__(self, config):
-        self.embed = Embedding(config)
-        self.layers = nn.ModuleList([Layer(config) for _ in range(config.num_layers)])
-        self.norm = RMSNorm(config)
-        self.head = Linear(config)
+# mini-sglang approach: context manager
+class Context:
+    @contextmanager
+    def forward_batch(self, batch):
+        self._batch = batch
+        try:
+            yield
+        finally:
+            self._batch = None
 ```
 
-## 9. 测试模式
+**Rule**: Set context before the model forward pass, clear it after. Never leave stale state.
 
-### 9.1 简单测试
+### 2. Merged Linear Projections
+
+**Problem**: Q, K, V are three separate matrix multiplications with the same input, as are gate and up projections.
+
+**Solution**: Merge into a single GEMM and split the output.
 
 ```python
-# 直接测试核心功能
-def test_generate():
-    llm = LLM("path/to/model")
-    outputs = llm.generate(["Hello, world!"])
-    assert len(outputs) == 1
-    assert len(outputs[0]["text"]) > 0
+# Instead of:
+q = self.q_proj(x)  # [B, H] → [B, Q_dim]
+k = self.k_proj(x)  # [B, H] → [B, K_dim]
+v = self.v_proj(x)  # [B, H] → [B, V_dim]
+
+# Use:
+qkv = self.qkv_proj(x)  # [B, H] → [B, Q_dim + K_dim + V_dim]
+q, k, v = qkv.split([Q_dim, K_dim, V_dim], dim=-1)
 ```
 
-### 9.2 回归测试
+**Benefit**: One large GEMM is more efficient than three small GEMMs (better GPU utilization).
+
+### 3. Fused Residual + Normalization
+
+**Problem**: Residual addition and layer normalization are separate operations that read/write the same tensor.
+
+**Solution**: Fuse them into a single kernel that avoids materializing the intermediate sum.
 
 ```python
-# 与参考实现对比
-def test_correctness():
-    llm = LLM("path/to/model")
-    output = llm.generate(["Test prompt"], temperature=0)
-    
-    # 与HuggingFace对比
-    hf_output = hf_generate("Test prompt", temperature=0)
-    
-    assert output == hf_output
+# Instead of:
+hidden = hidden + residual        # Write intermediate
+residual = hidden                  # Copy for next residual
+hidden = rms_norm(hidden)          # Read intermediate
+
+# Use fused version:
+class RMSNormFused:
+    def forward(self, x, residual):
+        # Single kernel: add residual, save for next layer, normalize
+        x = x + residual
+        residual = x  # Save before normalization
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps) * self.weight
+        return x, residual
 ```
 
-## 10. 总结
+### 4. Weight Loader Attached to Parameters
 
-### 10.1 精简框架代码量对比
+**Problem**: TP-aware weight loading requires knowing how to shard each parameter, but the loading logic is separate from the parameter definition.
 
-| 框架 | 代码行数 | 模式复杂度 |
-|------|----------|------------|
-| nano-vllm | ~1.2K | 简单直接 |
-| nano-sglang | ~3K | 简单直接 |
-| vLLM | ~500K | 复杂抽象 |
-| SGLang | ~200K | 复杂抽象 |
+**Solution**: Attach a `weight_loader` callable to each Parameter.
 
-### 10.2 核心原则
+```python
+class ColumnParallelLinear(nn.Module):
+    def __init__(self):
+        self.weight = Parameter(...)
+        self.weight.weight_loader = self._load_column_shard
 
-1. **简洁 > 灵活**：宁可重复代码也不要过度抽象
-2. **直接 > 间接**：直接调用比动态派发更好
-3. **固定 > 可配置**：固定配置减少运行时判断
-4. **正确 > 优化**：先保证正确，再考虑性能
+    def _load_column_shard(self, param, loaded_weight, tp_rank, tp_size):
+        shard = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
+        param.data.copy_(shard)
+
+# Generic loader just calls the attached method:
+for name, param in model.named_parameters():
+    if hasattr(param, 'weight_loader'):
+        param.weight_loader(param, checkpoint[name], rank, size)
+```
+
+### 5. Two-Path Forward (Prefill + Decode)
+
+**Problem**: Prefill and decode have fundamentally different input shapes and optimal kernels.
+
+**Solution**: Explicit branching at the model runner level, not inside every layer.
+
+```python
+# Model Runner decides the path:
+if is_prefill:
+    inputs = prepare_prefill(sequences)
+    context.is_prefill = True
+else:
+    inputs = prepare_decode(sequences)
+    context.is_prefill = False
+
+output = model(inputs)  # Model uses context to choose kernels
+
+# Inside attention layer:
+if context.is_prefill:
+    return flash_attn_varlen_func(q, k, v, ...)
+else:
+    return flash_attn_with_kvcache(q, k_cache, v_cache, ...)
+```
+
+### 6. Streaming Weight Loading
+
+**Problem**: Loading all weights into CPU memory before transferring to GPU can exceed CPU RAM for large models.
+
+**Solution**: Stream weights file-by-file, shard-by-shard.
+
+```python
+for shard_file in safetensors_files:
+    with safe_open(shard_file, framework="pt") as f:
+        for key in f.keys():
+            tensor = f.get_tensor(key)  # Load one tensor at a time
+            load_into_model(model, key, tensor)
+            del tensor  # Free CPU memory immediately
+```
+
+### 7. CUDA Graph Batch Size Padding
+
+**Problem**: CUDA graphs require fixed tensor shapes, but actual batch sizes vary.
+
+**Solution**: Capture graphs for power-of-2 batch sizes and pad actual batches.
+
+```python
+captured_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+
+def get_graph_batch_size(actual_size):
+    for size in captured_sizes:
+        if size >= actual_size:
+            return size
+    return actual_size  # Fall back to eager if too large
+
+# Pad inputs before replay:
+padded_size = get_graph_batch_size(len(batch))
+input_buffer[:len(batch)].copy_(actual_inputs)
+# Remaining positions already have dummy data from capture
+```
+
+### 8. ZMQ for Inter-Process Communication
+
+**Problem**: Multi-process architectures need efficient, non-blocking communication.
+
+**Solution**: Use ZeroMQ PUSH/PULL sockets for fire-and-forget message passing.
+
+```python
+# Process A (sender):
+sender = zmq.Context().socket(zmq.PUSH)
+sender.connect(f"tcp://127.0.0.1:{port}")
+sender.send_pyobj(request)
+
+# Process B (receiver):
+receiver = zmq.Context().socket(zmq.PULL)
+receiver.bind(f"tcp://127.0.0.1:{port}")
+request = receiver.recv_pyobj()
+```
+
+**Why ZMQ over multiprocessing.Queue**: Higher throughput, supports TCP (cross-machine), doesn't require shared memory setup.
+
+---
+
+## Key Design Principles
+
+1. **Minimize dynamic dispatch**: Hard-code paths for the target model/hardware
+2. **Fuse operations**: Reduce memory bandwidth by combining adjacent operations
+3. **Pre-allocate everything**: Avoid runtime GPU memory allocation
+4. **Separate preparation from execution**: CPU work on one stream, GPU work on another
+5. **Keep the hot loop minimal**: The engine step() should be as simple as possible

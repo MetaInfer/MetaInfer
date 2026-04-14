@@ -1,417 +1,253 @@
-# 模型执行器
+# Model Runner - Forward Pass Execution
 
-## 1. 核心职责
+## Core Responsibility
 
-ModelRunner负责：
+The Model Runner is the bridge between the scheduler's logical decisions and the GPU's physical execution. It:
+1. Converts scheduled batches into GPU tensors
+2. Executes the model forward pass
+3. Samples next tokens from logits
+4. Optionally uses CUDA graphs for decode acceleration
 
-1. **模型加载**：加载模型权重到GPU
-2. **KV Cache分配**：分配和管理KV Cache内存
-3. **输入准备**：将调度结果转换为模型输入张量
-4. **前向传播**：执行模型推理
-5. **采样**：从logits生成token
+## Input Preparation
 
-## 2. 初始化流程
+### Prefill Input Preparation
 
-### 2.1 完整初始化流程
+For prefill, multiple tokens per request are processed simultaneously:
 
 ```python
-class ModelRunner:
-    def __init__(self, config: Config, rank: int):
-        self.config = config
-        self.rank = rank
-        
-        # 1. 初始化分布式
-        dist.init_process_group("nccl", ...)
-        torch.cuda.set_device(rank)
-        
-        # 2. 创建模型
-        self.model = ModelClass(config.hf_config)
-        
-        # 3. 加载权重
-        load_model(self.model, config.model)
-        
-        # 4. 创建采样器
-        self.sampler = Sampler()
-        
-        # 5. Warmup（确定峰值内存）
-        self.warmup_model()
-        
-        # 6. 分配KV Cache
-        self.allocate_kv_cache()
-        
-        # 7. 捕获CUDA Graph（可选）
-        if not config.enforce_eager:
-            self.capture_cudagraph()
+def prepare_prefill(sequences):
+    # Concatenate all prompt tokens into a flat 1D tensor
+    input_ids = concat([seq.tokens[cached:total] for seq in sequences])
+
+    # Build cumulative sequence lengths for varlen attention
+    cu_seqlens = [0]
+    for seq in sequences:
+        cu_seqlens.append(cu_seqlens[-1] + seq.num_new_tokens)
+
+    # Map each token to its physical KV cache location
+    slot_mapping = []
+    for seq in sequences:
+        for pos in range(seq.cached, seq.total):
+            block_id = seq.block_table[pos // block_size]
+            offset = pos % block_size
+            slot_mapping.append(block_id * block_size + offset)
+
+    # Block tables for accessing cached prefix KV data
+    block_tables = pad([seq.block_table for seq in sequences])
+
+    return input_ids, cu_seqlens, slot_mapping, block_tables
 ```
 
-### 2.2 Warmup流程
+### Decode Input Preparation
+
+For decode, exactly one token per request:
 
 ```python
-def warmup_model(self):
-    """
-    Warmup模型以确定峰值内存使用
-    """
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    
-    # 模拟最大batch的prefill
-    max_tokens = min(self.config.max_num_batched_tokens, self.config.max_model_len)
-    num_seqs = min(self.config.max_num_seqs, max_tokens // self.config.max_model_len)
-    
-    seqs = [Sequence([0] * self.config.max_model_len) for _ in range(num_seqs)]
-    for seq in seqs:
-        seq.num_scheduled_tokens = self.config.max_model_len
-        
-    self.run(seqs, is_prefill=True)
-    torch.cuda.empty_cache()
+def prepare_decode(sequences):
+    # One token per sequence (the last generated token)
+    input_ids = [seq.tokens[-1] for seq in sequences]
+
+    # Position of each token
+    positions = [seq.num_tokens - 1 for seq in sequences]
+
+    # Physical slot for the new KV entry
+    slot_mapping = []
+    for seq in sequences:
+        pos = seq.num_tokens - 1
+        block_id = seq.block_table[pos // block_size]
+        offset = pos % block_size
+        slot_mapping.append(block_id * block_size + offset)
+
+    # Full block tables for attention over all previous tokens
+    block_tables = pad([seq.block_table for seq in sequences])
+    context_lens = [seq.num_tokens for seq in sequences]
+
+    return input_ids, positions, slot_mapping, block_tables, context_lens
 ```
 
-## 3. 输入准备
+## Forward Pass Execution
 
-### 3.1 Prefill输入准备
-
+### Basic Flow
 ```python
-def prepare_prefill(self, seqs: list[Sequence]):
-    """
-    准备Prefill阶段的输入张量
-    """
-    input_ids = []
-    positions = []
-    cu_seqlens_q = [0]  # Query累积序列长度
-    cu_seqlens_k = [0]  # Key累积序列长度
-    max_seqlen_q = 0
-    max_seqlen_k = 0
-    slot_mapping = []    # KV Cache槽位映射
-    
-    for seq in seqs:
-        seqlen = len(seq)
-        start = min(seq.num_cached_tokens, seqlen - 1)  # 前缀缓存跳过已缓存部分
-        seqlen_q = seq.num_scheduled_tokens
-        seqlen_k = seqlen
-        end = start + seqlen_q
-        
-        # 输入token和位置
-        input_ids.extend(seq[start:end])
-        positions.extend(range(start, end))
-        
-        # 累积序列长度（用于变长Flash Attention）
-        cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-        cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-        max_seqlen_q = max(seqlen_q, max_seqlen_q)
-        max_seqlen_k = max(seqlen_k, max_seqlen_k)
-        
-        # 计算KV Cache槽位
-        slot_mapping.extend(self._compute_slot_mapping(seq, start, end))
-    
-    # 转换为GPU张量
-    input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-    positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-    cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-    cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-    
-    return input_ids, positions, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping
+def run(sequences, is_prefill):
+    if is_prefill:
+        inputs = prepare_prefill(sequences)
+    else:
+        inputs = prepare_decode(sequences)
+
+    # Set global context for attention layers
+    context.is_prefill = is_prefill
+    context.slot_mapping = inputs.slot_mapping
+    context.block_tables = inputs.block_tables
+
+    # Execute model
+    logits = model(inputs.input_ids, inputs.positions)
+
+    # Sample next tokens
+    if is_prefill:
+        # Only need logits at the last position of each sequence
+        last_indices = cumsum(seq_lens) - 1
+        logits = logits[last_indices]
+
+    next_tokens = sampler(logits, temperatures)
+    return next_tokens
 ```
 
-### 3.2 Decode输入准备
+### Context Object Pattern
+All three frameworks use a global/thread-local context to pass batch metadata to attention layers without threading it through every model layer:
 
 ```python
-def prepare_decode(self, seqs: list[Sequence]):
-    """
-    准备Decode阶段的输入张量
-    """
-    input_ids = []      # 只需要最后一个token
-    positions = []      # 当前位置
-    slot_mapping = []   # 新token的KV Cache槽位
-    context_lens = []   # 上下文长度
-    
-    for seq in seqs:
-        input_ids.append(seq.last_token)
-        positions.append(len(seq) - 1)
-        context_lens.append(len(seq))
-        
-        # 新token存储在最后一个block的末尾
-        slot = seq.block_table[-1] * self.block_size + (len(seq) - 1) % self.block_size
-        slot_mapping.append(slot)
-    
-    input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-    positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-    context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-    
-    block_tables = self._prepare_block_tables(seqs)
-    
-    return input_ids, positions, slot_mapping, context_lens, block_tables
-```
-
-### 3.3 Block Tables准备
-
-```python
-def prepare_block_tables(self, seqs: list[Sequence]):
-    """
-    准备Block Tables张量
-    """
-    max_len = max(len(seq.block_table) for seq in seqs)
-    
-    # 填充对齐
-    block_tables = [
-        seq.block_table + [-1] * (max_len - len(seq.block_table))
-        for seq in seqs
-    ]
-    
-    return torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-```
-
-## 4. 上下文传递
-
-### 4.1 全局上下文模式
-
-避免在模型各层之间传递大量参数，使用全局上下文：
-
-```python
-@dataclass
-class Context:
+# nano-vllm: module-level context
+class _Context:
     is_prefill: bool
-    cu_seqlens_q: torch.Tensor
-    cu_seqlens_k: torch.Tensor
-    max_seqlen_q: int
-    max_seqlen_k: int
-    slot_mapping: torch.Tensor
-    context_lens: torch.Tensor = None    # Decode用
-    block_tables: torch.Tensor = None    # Decode用
+    slot_mapping: Tensor
+    block_tables: Tensor
+    cu_seqlens: Tensor
+    max_seqlen: int
+    kvcache: Tensor
 
-# 全局变量
-_CONTEXT = Context()
+context = _Context()  # Global singleton
 
-def get_context(): return _CONTEXT
-def set_context(**kwargs): 
-    for k, v in kwargs.items():
-        setattr(_CONTEXT, k, v)
-def reset_context():
-    # 重置上下文
-    ...
+# mini-sglang: Context class with context manager
+class Context:
+    def forward_batch(self, batch):
+        """Context manager that sets active batch state"""
+        self._current_batch = batch
+        yield
+        self._current_batch = None
 ```
 
-### 4.2 使用方式
+## CUDA Graph Capture and Replay
 
+### Why CUDA Graphs?
+Decode batches have very small inputs (1 token per request) but require the same Python overhead for kernel launches. CUDA graphs pre-record the entire execution sequence and replay it in a single GPU call.
+
+### Capture Process (nano-vllm)
 ```python
-# 在ModelRunner中设置上下文
-def run(self, seqs, is_prefill):
-    if is_prefill:
-        input_ids, positions, ... = self.prepare_prefill(seqs)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, ...)
-    else:
-        input_ids, positions, ... = self.prepare_decode(seqs)
-        set_context(False, slot_mapping=slot_mapping, ...)
-    
-    logits = self.run_model(input_ids, positions, is_prefill)
-    token_ids = self.sampler(logits, temperatures)
-    
-    reset_context()
-    return token_ids
+def capture_cudagraph(max_batch_size):
+    # Capture graphs for fixed batch sizes: 1, 2, 4, 8, 16, 32, ...
+    batch_sizes = [1, 2, 4, 8] + list(range(16, max_batch_size+1, 16))
 
-# 在Attention层中获取上下文
-def forward(self, x):
-    context = get_context()
-    if context.is_prefill:
-        # Prefill路径
-        flash_attn_varlen_func(...)
-    else:
-        # Decode路径
-        flash_attn_with_kvcache(...)
-```
+    for bs in reversed(batch_sizes):  # Largest first to share memory
+        # Create fixed-size input buffers
+        input_ids = torch.zeros(bs, device='cuda')
+        positions = torch.zeros(bs, device='cuda')
+        # ... other fixed buffers
 
-## 5. 模型执行
+        # Warmup run (required by CUDA)
+        model(input_ids, positions)
 
-### 5.1 标准执行
-
-```python
-@torch.inference_mode()
-def run_model(self, input_ids, positions, is_prefill):
-    """
-    标准模型前向传播
-    """
-    hidden_states = self.model.embed_tokens(input_ids)
-    
-    for layer in self.model.layers:
-        hidden_states = layer(hidden_states, positions)
-    
-    hidden_states = self.model.norm(hidden_states)
-    logits = self.model.lm_head(hidden_states)
-    
-    return logits
-```
-
-### 5.2 CUDA Graph优化执行
-
-```python
-@torch.inference_mode()
-def run_model(self, input_ids, positions, is_prefill):
-    """
-    使用CUDA Graph加速Decode阶段
-    """
-    if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-        # Prefill或大batch：常规执行
-        return self.model(self.model(input_ids, positions))
-    
-    # Decode小batch：使用CUDA Graph
-    bs = input_ids.size(0)
-    context = get_context()
-    
-    # 选择合适的graph（batch size >= 实际bs）
-    graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-    
-    # 填充输入buffer
-    self.graph_vars["input_ids"][:bs] = input_ids
-    self.graph_vars["positions"][:bs] = positions
-    self.graph_vars["slot_mapping"][:bs] = context.slot_mapping
-    self.graph_vars["context_lens"][:bs] = context.context_lens
-    self.graph_vars["block_tables"][:bs] = context.block_tables
-    
-    # 重放graph
-    graph.replay()
-    
-    return self.model.compute_logits(self.graph_vars["outputs"][:bs])
-```
-
-### 5.3 CUDA Graph捕获
-
-```python
-@torch.inference_mode()
-def capture_cudagraph(self):
-    """
-    为不同batch size捕获CUDA Graph
-    """
-    max_bs = min(self.config.max_num_seqs, 512)
-    
-    # 预分配buffer
-    input_ids = torch.zeros(max_bs, dtype=torch.int64, device="cuda")
-    positions = torch.zeros(max_bs, dtype=torch.int64, device="cuda")
-    outputs = torch.zeros(max_bs, self.config.hidden_size, device="cuda")
-    
-    # 捕获不同batch size的graph
-    self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-    self.graphs = {}
-    self.graph_pool = None
-    
-    for bs in reversed(self.graph_bs):
+        # Capture
         graph = torch.cuda.CUDAGraph()
-        
-        # Warmup
-        outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-        
-        # 捕获
-        with torch.cuda.graph(graph, self.graph_pool):
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
-        
-        if self.graph_pool is None:
-            self.graph_pool = graph.pool()
-            
-        self.graphs[bs] = graph
-    
-    self.graph_vars = {
-        "input_ids": input_ids,
-        "positions": positions,
-        "outputs": outputs,
+        with torch.cuda.graph(graph, pool=memory_pool):
+            output = model(input_ids, positions)
+
+        captured_graphs[bs] = (graph, input_ids, positions, output)
+```
+
+### Replay Process
+```python
+def replay_cudagraph(batch):
+    # Find smallest captured size >= actual batch size
+    bs = next(s for s in captured_sizes if s >= len(batch))
+
+    graph, input_buf, pos_buf, output_buf = captured_graphs[bs]
+
+    # Copy actual data into captured buffers
+    input_buf[:len(batch)].copy_(batch.input_ids)
+    pos_buf[:len(batch)].copy_(batch.positions)
+
+    # Replay the graph (single GPU call)
+    graph.replay()
+
+    # Read results from captured output buffer
+    return output_buf[:len(batch)]
+```
+
+### Memory Pool Sharing (mini-sglang)
+```python
+# Use a shared memory pool so different batch-size graphs reuse GPU memory
+graph_pool = torch.cuda.graph_pool_handle()
+for bs in batch_sizes:
+    with torch.cuda.graph(graph, pool=graph_pool):
         ...
-    }
 ```
 
-## 6. 张量并行
+### CUDA Graph Limitations
+- **Fixed tensor shapes**: All inputs/outputs must have the same shape as during capture
+- **No dynamic control flow**: Cannot have if/else that depends on input values
+- **Padding required**: Actual batch must be padded to a captured size
+- **Not for prefill**: Prefill has variable-length inputs, so CUDA graphs are typically only used for decode
 
-### 6.1 多进程架构
+## Tensor Parallelism in Model Runner
 
+### Multi-Process Coordination (nano-vllm)
 ```python
-class ModelRunner:
-    def __init__(self, config, rank, events):
-        self.rank = rank
-        self.world_size = config.tensor_parallel_size
-        
-        # 初始化NCCL
-        dist.init_process_group(
-            "nccl",
-            init_method="tcp://localhost:2333",
-            world_size=self.world_size,
-            rank=rank
-        )
-        
-        if rank == 0:
-            # 主进程：接收请求，分发任务
-            self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-        else:
-            # Worker进程：监听执行
-            self.shm = SharedMemory(name="nanovllm")
-            self.loop()
-```
+# Rank 0 (main process):
+def run(seqs, is_prefill):
+    inputs = prepare(seqs, is_prefill)
 
-### 6.2 进程间通信
+    # Signal other ranks via SharedMemory
+    shared_mem.write(inputs.serialized())
+    event.set()  # Wake up other ranks
 
-```python
-def call(self, method_name, *args):
-    """主进程调用，分发到所有Worker"""
-    if self.world_size > 1 and self.rank == 0:
-        self.write_shm(method_name, *args)
-    method = getattr(self, method_name)
-    return method(*args)
+    # Execute on rank 0
+    output = model(inputs)
+    return output
 
-def write_shm(self, method_name, *args):
-    """写入共享内存，通知Worker"""
-    data = pickle.dumps([method_name, *args])
-    n = len(data)
-    self.shm.buf[0:4] = n.to_bytes(4, "little")
-    self.shm.buf[4:n+4] = data
-    for event in self.events:
-        event.set()  # 唤醒Worker
-
-def loop(self):
-    """Worker进程主循环"""
+# Rank 1-N (sub-processes):
+def worker_loop():
     while True:
-        method_name, args = self.read_shm()
-        self.call(method_name, *args)
-        if method_name == "exit":
-            break
+        event.wait()  # Wait for signal from rank 0
+        inputs = shared_mem.read()
+        model(inputs)  # Output discarded; all-reduce already happened
 ```
 
-## 7. 采样准备
-
+### Mini-sglang Approach
+Uses `torch.distributed` with NCCL backend. The Engine handles initialization:
 ```python
-def prepare_sample(self, seqs: list[Sequence]):
-    """准备采样参数"""
-    temperatures = [seq.temperature for seq in seqs]
-    return torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-
-def run(self, seqs, is_prefill):
-    # 准备输入
-    if is_prefill:
-        input_ids, positions = self.prepare_prefill(seqs)
-    else:
-        input_ids, positions = self.prepare_decode(seqs)
-    
-    temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-    
-    # 执行模型
-    logits = self.run_model(input_ids, positions, is_prefill)
-    
-    # 采样（只在rank 0执行）
-    token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-    
-    return token_ids
+def init_distributed(tp_size, rank):
+    torch.distributed.init_process_group(backend='nccl')
+    # Or use custom PyNCCL wrapper for lower overhead
 ```
 
-## 8. 设计选择建议
+## Weight Loading
 
-### 8.1 精简框架推荐
+### Streaming Shard Loading (mini-sglang)
+To minimize CPU memory usage:
+```python
+def load_weights(model, model_path, tp_rank, tp_size):
+    for shard_file in sorted(safetensors_files):
+        with safe_open(shard_file) as f:
+            for name in f.keys():
+                tensor = f.get_tensor(name)
+                param = model.get_parameter(name)
+                # Use param's weight_loader to shard for this TP rank
+                param.weight_loader(param, tensor, tp_rank, tp_size)
+```
 
-| 功能 | 推荐实现 | 原因 |
-|------|----------|------|
-| 分布式 | 无 | 单GPU足够学习 |
-| CUDA Graph | 可选 | 有明显加速但增加复杂度 |
-| 全局上下文 | 使用 | 简化参数传递 |
-| 异步传输 | 使用 | pin_memory + non_blocking |
+### Weight Loader Pattern (nano-vllm)
+Each parameter knows how to shard itself:
+```python
+class ColumnParallelLinear:
+    def __init__(self, ...):
+        self.weight = Parameter(...)
+        self.weight.weight_loader = self._column_shard_loader
 
-### 8.2 性能优化点
+    def _column_shard_loader(self, param, loaded_weight, tp_rank, tp_size):
+        shard_size = loaded_weight.shape[0] // tp_size
+        param.data.copy_(loaded_weight[tp_rank*shard_size:(tp_rank+1)*shard_size])
+```
 
-1. **Pinned Memory**：使用`pin_memory=True`加速CPU到GPU传输
-2. **Non-blocking Transfer**：使用`.cuda(non_blocking=True)`异步传输
-3. **CUDA Graph**：Decode阶段使用CUDA Graph减少kernel launch开销
-4. **KV Cache复用**：前缀缓存避免重复计算
+## Design Template
+
+A minimal Model Runner needs:
+1. **Input preparation**: Convert scheduled sequences into tensors
+2. **Context propagation**: Pass batch metadata to attention layers
+3. **Forward execution**: Run the model
+4. **Sampling**: Convert logits to tokens
+
+Optional enhancements:
+- CUDA graph capture/replay (significant speedup for decode, but adds complexity)
+- Overlap between GPU execution and CPU preparation
+- Shared memory for multi-rank metadata passing

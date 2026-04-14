@@ -1,444 +1,259 @@
-# Transformer模型实现
+# Transformer Models - General Dense Transformer Patterns
 
-## 1. 模型架构概述
+## Core Architecture
 
-标准的Decoder-only Transformer模型结构：
+All dense transformer models in LLM inference follow the same high-level structure:
 
 ```
-Input Tokens
-     │
-     ▼
-┌─────────────────┐
-│ Embedding Layer │  [batch, seq_len] → [batch, seq_len, hidden_size]
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Transformer Block × N                     │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │                  Attention Layer                       │  │
-│  │  Input → RMSNorm → QKV Proj → Attention → O Proj      │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                          │                                   │
-│                          ▼                                   │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │                    MLP Layer                           │  │
-│  │  Input → RMSNorm → Gate+Up Proj → SiLU → Down Proj    │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│   Final Norm    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│    LM Head      │  [batch, seq_len, hidden_size] → [batch, seq_len, vocab_size]
-└─────────────────┘
+Input Token IDs
+    ↓
+[Embedding Layer]  → token_ids → hidden_states
+    ↓
+[Transformer Block × N]
+    │
+    ├── [RMSNorm] → normalized_hidden
+    ├── [Attention] → attn_output
+    ├── [Residual Add] → hidden + attn_output
+    ├── [RMSNorm] → normalized_hidden
+    ├── [MLP / MoE] → mlp_output
+    └── [Residual Add] → hidden + mlp_output
+    ↓
+[RMSNorm]
+    ↓
+[LM Head]  → hidden_states → logits (vocab_size)
+    ↓
+[Sampler]  → logits → next_token_id
 ```
 
-## 2. 模型实现模板
+## Model Definition Pattern
 
-### 2.1 模型类结构
-
+### Standard Pattern (nano-vllm style)
 ```python
-class LlamaForCausalLM(nn.Module):
-    def __init__(self, config: LlamaConfig):
-        super().__init__()
-        self.config = config
-        
-        # Embedding
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        
-        # Transformer Layers
-        self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, layer_id)
-            for layer_id in range(config.num_hidden_layers)
-        ])
-        
-        # Final Layer Norm
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
-        # LM Head
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
-        # RoPE
-        self.rotary_emb = RotaryEmbedding(
-            head_dim=config.hidden_size // config.num_attention_heads,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
-    
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        # Embedding
-        hidden_states = self.embed_tokens(input_ids)
-        
-        # Transformer Layers
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, positions)
-        
-        # Final Norm
-        hidden_states = self.norm(hidden_states)
-        
-        # LM Head
-        logits = self.lm_head(hidden_states)
-        
+class Qwen3ForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    def __init__(self, config):
+        self.model = Qwen3Model(config)
+        self.lm_head = ParallelEmbedding(config.vocab_size, config.hidden_size)
+
+    def forward(self, input_ids, positions):
+        hidden = self.model(input_ids, positions)
+        logits = self.lm_head(hidden)
         return logits
+
+
+class Qwen3Model(nn.Module):
+    def __init__(self, config):
+        self.embed_tokens = ParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([
+            Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)
+        ])
+        self.norm = RMSNorm(config.hidden_size)
+
+    def forward(self, input_ids, positions):
+        hidden = self.embed_tokens(input_ids)
+        residual = None
+        for layer in self.layers:
+            hidden, residual = layer(hidden, residual, positions)
+        hidden = self.norm(hidden, residual)
+        return hidden
 ```
 
-### 2.2 Decoder Layer
-
+### Context-Driven Pattern (mini-sglang style)
 ```python
-class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_id: int):
-        super().__init__()
-        self.layer_id = layer_id
-        
-        # Attention
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = LlamaAttention(config, layer_id)
-        
-        # MLP
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = LlamaMLP(config)
-    
-    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor):
-        # Self Attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, positions)
-        hidden_states = residual + hidden_states
-        
-        # MLP
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        
-        return hidden_states
+class LlamaForCausalLM(BaseLLMModel):
+    def __init__(self, config):
+        self.embed = Embedding(config.vocab_size, config.hidden_size)
+        self.layers = OPList([LlamaDecoderLayer(config) for _ in range(num_layers)])
+        self.norm = RMSNormFused(config.hidden_size)
+        self.lm_head = LMHead(config.hidden_size, config.vocab_size)
+
+    def forward(self, batch):
+        ctx = get_global_ctx()
+        h = self.embed(ctx.input_ids)
+        h = self.layers(h)      # OPList chains forward calls
+        h = self.norm(h)
+        h = self.lm_head(h)
+        return h
 ```
 
-## 3. Attention实现
+## Attention Block
 
-### 3.1 Attention层结构
-
+### Standard MHA/GQA Attention
 ```python
-class LlamaAttention(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_id: int):
-        super().__init__()
-        self.layer_id = layer_id
-        
-        hidden_size = config.hidden_size
-        num_heads = config.num_attention_heads
-        num_kv_heads = config.num_key_value_heads
-        head_dim = hidden_size // num_heads
-        
-        # QKV Projection
+class Attention(nn.Module):
+    def __init__(self, config):
+        # Merged QKV projection for efficiency
         self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            head_dim,
-            num_heads,
-            num_kv_heads,
-            bias=False,
+            hidden_size=config.hidden_size,
+            num_q_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,  # GQA: fewer KV heads
+            head_dim=config.head_dim,
         )
-        
-        # QK Normalization (可选)
-        self.q_norm = RMSNorm(head_dim) if hasattr(config, "use_qk_norm") else None
-        self.k_norm = RMSNorm(head_dim) if hasattr(config, "use_qk_norm") else None
-        
-        # Output Projection
         self.o_proj = RowParallelLinear(
-            num_heads * head_dim,
-            hidden_size,
-            bias=False,
+            num_heads * head_dim, hidden_size
         )
-        
-        # KV Cache (运行时绑定)
-        self.k_cache = None
-        self.v_cache = None
-    
-    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor):
-        # QKV Projection
-        q, k, v = self.qkv_proj(hidden_states)
-        
-        # QK Normalization
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        
-        # RoPE
-        q, k = self.rotary_emb(positions, q, k)
-        
-        # Attention
-        context = get_context()
-        if context.is_prefill:
-            output = self._attention_prefill(q, k, v, context)
-        else:
-            output = self._attention_decode(q, k, v, context)
-        
-        # Output Projection
-        output = self.o_proj(output)
-        
-        return output
+        self.rotary_emb = RotaryEmbedding(head_dim, max_position, base=rope_theta)
+
+    def forward(self, hidden, positions):
+        qkv = self.qkv_proj(hidden)
+        q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
+
+        q = q.view(-1, num_q_heads, head_dim)
+        k = k.view(-1, num_kv_heads, head_dim)
+        v = v.view(-1, num_kv_heads, head_dim)
+
+        # Apply RoPE
+        q, k = self.rotary_emb(q, k, positions)
+
+        # Attention with KV cache (backend-specific)
+        attn_output = attention_backend(q, k, v, kv_cache, ...)
+
+        # Output projection (includes all-reduce for TP)
+        return self.o_proj(attn_output)
 ```
 
-### 3.2 Prefill Attention
+### Grouped Query Attention (GQA)
+GQA uses fewer KV heads than Q heads. The ratio `num_q_heads / num_kv_heads` determines the group size:
+- **MHA**: ratio = 1 (every Q head has its own KV head)
+- **GQA**: ratio > 1 (multiple Q heads share one KV head)
+- **MQA**: ratio = num_q_heads (all Q heads share one KV head)
 
+The attention kernel handles this by repeating KV heads or using optimized group-aware implementations.
+
+## MLP Block
+
+### Gated MLP (SwiGLU)
+The standard MLP in modern LLMs uses a gated architecture:
 ```python
-def _attention_prefill(self, q, k, v, context):
-    """Prefill阶段Attention"""
-    # 存储KV Cache
-    if self.k_cache is not None:
-        store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping)
-    
-    # 前缀缓存情况
-    if context.block_tables is not None:
-        # 使用缓存的K、V
-        k = self.k_cache
-        v = self.v_cache
-    
-    # Flash Attention (变长序列)
-    output = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q=context.cu_seqlens_q,
-        cu_seqlens_k=context.cu_seqlens_k,
-        max_seqlen_q=context.max_seqlen_q,
-        max_seqlen_k=context.max_seqlen_k,
-        softmax_scale=self.scaling,
-        causal=True,
-    )
-    
-    return output
-```
-
-### 3.3 Decode Attention
-
-```python
-def _attention_decode(self, q, k, v, context):
-    """Decode阶段Attention"""
-    # 存储新token的KV Cache
-    if self.k_cache is not None:
-        store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping)
-    
-    # Flash Attention with KV Cache
-    output = flash_attn_with_kvcache(
-        q.unsqueeze(1),  # [batch, 1, heads, head_dim]
-        self.k_cache,
-        self.v_cache,
-        block_tables=context.block_tables,
-        context_lens=context.context_lens,
-        softmax_scale=self.scaling,
-    )
-    
-    return output.squeeze(1)
-```
-
-## 4. MLP实现
-
-### 4.1 标准MLP
-
-```python
-class LlamaMLP(nn.Module):
-    def __init__(self, config: LlamaConfig):
-        super().__init__()
-        hidden_size = config.hidden_size
-        intermediate_size = config.intermediate_size
-        
-        # Gate + Up Projection (合并)
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
+class GatedMLP(nn.Module):
+    def __init__(self, config):
+        # Merged gate + up projection
+        self.gate_up_proj = ColumnParallelLinear(
+            hidden_size, 2 * intermediate_size
         )
-        
-        # Down Projection
         self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
+            intermediate_size, hidden_size
         )
-    
+        self.act = SiluAndMul()  # SiLU(gate) * up
+
     def forward(self, x):
-        gate, up = self.gate_up_proj(x)
-        x = silu_mul(gate, up)  # gate * silu(up)
-        x = self.down_proj(x)
+        gate_up = self.gate_up_proj(x)
+        x = self.act(gate_up)         # Split, SiLU(gate) * up
+        x = self.down_proj(x)         # Includes all-reduce
         return x
 ```
 
-### 4.2 MoE MLP (可选)
-
+### Activation: SiLU and Mul
 ```python
-class MixtralMLP(nn.Module):
-    """MoE MLP实现"""
-    def __init__(self, config):
-        super().__init__()
-        self.num_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_tok
-        
-        # Router
-        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
-        
-        # Experts
-        self.experts = nn.ModuleList([
-            LlamaMLP(config) for _ in range(self.num_experts)
-        ])
-    
+class SiluAndMul(nn.Module):
     def forward(self, x):
-        # Router输出
-        router_logits = self.router(x)
-        
-        # Top-k选择
-        top_k_weights, top_k_indices = torch.topk(
-            F.softmax(router_logits, dim=-1), self.top_k
-        )
-        
-        # Expert计算
-        output = torch.zeros_like(x)
-        for i in range(self.top_k):
-            expert_idx = top_k_indices[..., i]
-            weight = top_k_weights[..., i]
-            expert_output = self.experts[expert_idx](x)
-            output = output + weight * expert_output
-        
-        return output
+        gate, up = x.chunk(2, dim=-1)
+        return F.silu(gate) * up
 ```
 
-## 5. 权重加载
+## Normalization
 
-### 5.1 权重映射
+### RMSNorm with Fused Residual
+```python
+class RMSNorm(nn.Module):
+    def forward(self, x, residual=None):
+        if residual is not None:
+            x = x + residual
+            residual = x
+        # RMS normalization
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        x = x * self.weight
+        return x, residual
+```
+
+The "fused residual add + norm" pattern is critical for performance: it avoids materializing an intermediate tensor.
+
+## Rotary Positional Embedding (RoPE)
 
 ```python
-# Packed权重映射
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position=8192, base=10000.0):
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2) / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, q, k, positions):
+        freqs = positions.unsqueeze(-1) * self.inv_freq.unsqueeze(0)
+        cos = freqs.cos()
+        sin = freqs.sin()
+
+        # Apply rotation
+        q_rotated = rotate_half(q, cos, sin)
+        k_rotated = rotate_half(k, cos, sin)
+        return q_rotated, k_rotated
+
+def rotate_half(x, cos, sin):
+    x1, x2 = x[..., :dim//2], x[..., dim//2:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+```
+
+## Weight Loading Pattern
+
+### packed_modules_mapping
+When HuggingFace models have separate Q, K, V weight matrices but the inference framework uses a merged QKV layer:
+
+```python
+# Mapping: HF weight name → (merged layer name, position)
 packed_modules_mapping = {
-    "q_proj": ("qkv_proj", "q"),
+    "q_proj": ("qkv_proj", "q"),   # → stored in q portion of merged weight
     "k_proj": ("qkv_proj", "k"),
     "v_proj": ("qkv_proj", "v"),
-    "gate_proj": ("gate_up_proj", 0),
-    "up_proj": ("gate_up_proj", 1),
+    "gate_proj": ("gate_up_proj", 0),  # → first half of merged weight
+    "up_proj": ("gate_up_proj", 1),    # → second half of merged weight
 }
-
-def load_weights(self, model_path: str):
-    """加载模型权重"""
-    # 加载safetensors
-    state_dict = load_safetensors(model_path)
-    
-    for name, param in self.named_parameters():
-        # 处理packed权重
-        for orig_name, (packed_name, idx) in packed_modules_mapping.items():
-            if orig_name in name:
-                # 从packed权重中提取
-                packed_weight = state_dict[name.replace(orig_name, packed_name)]
-                if isinstance(idx, int):
-                    # gate_up_proj情况
-                    shard_size = packed_weight.shape[0] // 2
-                    param.data.copy_(packed_weight[idx * shard_size:(idx + 1) * shard_size])
-                else:
-                    # qkv_proj情况
-                    param.data.copy_(getattr(param, "weight_loader")(packed_weight))
-                break
-        else:
-            # 普通权重
-            param.data.copy_(state_dict[name])
 ```
 
-### 5.2 张量并行权重加载
-
+### Streaming Weight Loader
 ```python
-class ColumnParallelLinear(nn.Module):
-    def weight_loader(self, param, loaded_weight):
-        """列并行权重加载：按rank切分"""
-        tp_rank = get_tensor_parallel_rank()
-        tp_size = get_tensor_parallel_world_size()
-        
-        shard_size = param.shape[self.tp_dim] // tp_size
-        start = tp_rank * shard_size
-        end = start + shard_size
-        
-        param.data.copy_(loaded_weight.narrow(self.tp_dim, start, shard_size))
-
-class RowParallelLinear(nn.Module):
-    def weight_loader(self, param, loaded_weight):
-        """行并行权重加载：按输入维度切分"""
-        tp_rank = get_tensor_parallel_rank()
-        tp_size = get_tensor_parallel_world_size()
-        
-        shard_size = loaded_weight.shape[0] // tp_size
-        start = tp_rank * shard_size
-        end = start + shard_size
-        
-        param.data.copy_(loaded_weight[start:end])
+def load_weights(model, path, tp_rank, tp_size):
+    for shard_file in safetensors_files:
+        with safe_open(shard_file) as f:
+            for name in f.keys():
+                tensor = f.get_tensor(name)
+                param = find_parameter(model, name)  # May remap via packed_modules_mapping
+                if hasattr(param, 'weight_loader'):
+                    param.weight_loader(param, tensor, tp_rank, tp_size)
+                else:
+                    param.data.copy_(tensor)
 ```
 
-## 6. 模型配置
+## Model Configuration
 
-### 6.1 配置参数
-
+Key parameters from HuggingFace config that affect inference:
 ```python
 @dataclass
-class LlamaConfig:
-    # 基本维度
-    hidden_size: int = 4096
-    intermediate_size: int = 11008
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 32  # GQA支持
-    
-    # 位置编码
-    max_position_embeddings: int = 4096
-    rope_theta: float = 10000.0
-    
-    # 归一化
-    rms_norm_eps: float = 1e-5
-    
-    # 词表
-    vocab_size: int = 32000
-    
-    # 计算衍生值
-    @property
-    def head_dim(self) -> int:
-        return self.hidden_size // self.num_attention_heads
+class ModelConfig:
+    hidden_size: int           # e.g., 4096
+    num_hidden_layers: int     # e.g., 32
+    num_attention_heads: int   # Q heads, e.g., 32
+    num_key_value_heads: int   # KV heads for GQA, e.g., 8
+    intermediate_size: int     # MLP hidden dim, e.g., 11008
+    vocab_size: int            # e.g., 32000
+    max_position_embeddings: int  # e.g., 4096
+    rope_theta: float          # RoPE base frequency, e.g., 10000.0
+    head_dim: int              # hidden_size // num_attention_heads
+    rms_norm_eps: float        # e.g., 1e-6
 ```
 
-### 6.2 模型架构识别
+## Common Model Families and Their Differences
 
-```python
-def get_model_class(config) -> type:
-    """根据配置选择模型类"""
-    architectures = getattr(config, "architectures", [])
-    
-    for arch in architectures:
-        if "Llama" in arch:
-            return LlamaForCausalLM
-        elif "Mistral" in arch:
-            return MistralForCausalLM
-        elif "Qwen" in arch:
-            return QwenForCausalLM
-        # ...
-    
-    raise ValueError(f"Unknown architecture: {architectures}")
-```
-
-## 7. 不同模型变体
-
-### 7.1 主流模型差异
-
-| 模型 | 特殊之处 | 实现差异 |
-|------|----------|----------|
-| LLaMA | 基础架构 | 标准实现 |
-| Mistral | Sliding Window | 滑动窗口注意力 |
-| Qwen | RoPE变体 | 不同的旋转编码 |
-| DeepSeek | MLA | 多头潜在注意力 |
-| Mixtral | MoE | 专家混合架构 |
-| Gemma | 特殊RoPE | 不同的位置编码 |
-
-### 7.2 精简实现建议
-
-对于精简框架，建议：
-
-1. **只实现一种架构**：选择LLaMA作为基准
-2. **固定配置**：不通过配置切换行为
-3. **合并算子**：gate_up_proj, qkv_proj等
-4. **简化权重加载**：直接映射，不做复杂转换
+| Feature | Llama/Qwen2 | Qwen3 | Mistral | Mixtral |
+|---------|-------------|-------|---------|---------|
+| Attention | GQA | GQA + sliding window | GQA + sliding window | GQA |
+| MLP | SwiGLU | SwiGLU | SwiGLU | MoE (SwiGLU per expert) |
+| Norm | RMSNorm | RMSNorm (pre+post attn) | RMSNorm | RMSNorm |
+| RoPE | Standard | Standard | Standard | Standard |
+| Bias | No | No (QKV has no bias) | No | No |
+| QKV merge | Yes | Yes | Yes | Yes |

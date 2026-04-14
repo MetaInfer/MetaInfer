@@ -1,363 +1,164 @@
-# 调度器设计
+# Scheduler - Continuous Batching and Request Scheduling
 
-## 1. 调度器核心职责
+## Core Concept
 
-调度器是推理框架的核心组件，负责：
+The scheduler is the "brain" of an LLM inference framework. It decides **which requests** to process in each step and **in which phase** (prefill or decode). The key innovation over naive batching is **continuous batching**: requests can enter and exit the batch at any time, rather than waiting for an entire batch to finish.
 
-1. **请求排队**：管理等待中的请求
-2. **资源分配**：为请求分配KV Cache内存
-3. **批处理决策**：决定哪些请求参与当前推理步骤
-4. **抢占处理**：当内存不足时选择请求抢占
+## Two-Phase Execution Model
 
-## 2. 基础调度器实现
+LLM inference has two fundamentally different phases:
 
-### 2.1 核心数据结构
+### Prefill (Extend) Phase
+- **Input**: Multiple prompt tokens for a new request
+- **Compute**: All prompt tokens processed in parallel (like training)
+- **Output**: KV cache populated for all prompt positions, plus the first generated token
+- **Characteristic**: Compute-bound, high arithmetic intensity
+
+### Decode Phase
+- **Input**: A single new token per request
+- **Compute**: Attention over all previous KV cache entries + MLP for one position
+- **Output**: One new token per request
+- **Characteristic**: Memory-bandwidth-bound, low arithmetic intensity
+
+### Why This Matters for Scheduling
+Prefill and decode have different resource profiles. A good scheduler must balance:
+- **Prefill latency**: How quickly a new request gets its first token (TTFT)
+- **Decode throughput**: How many tokens/second are generated across all running requests
+- **Memory budget**: KV cache is finite; each running request consumes memory
+
+## Scheduling Algorithms
+
+### 1. Prefill-Priority (nano-vllm style)
+```
+def schedule():
+    if waiting_queue is not empty:
+        # Try to schedule as many prefills as possible
+        batch = select_from_waiting(budget=max_num_batched_tokens)
+        return batch, is_prefill=True
+    else:
+        # All waiting requests handled, do decode
+        batch = running_queue
+        return batch, is_prefill=False
+```
+
+**Logic**: Always try to start new requests first. Only decode when no new requests are waiting.
+
+**Trade-off**: Good TTFT, but can starve decode requests if new requests keep arriving.
+
+### 2. Interleaved Prefill-Decode (nano-sglang style)
+```
+def forward_step():
+    if can_schedule_new_requests() and num_decode_steps >= threshold:
+        batch = get_new_fill_batch()  # prefill
+        num_decode_steps = 0
+    else:
+        batch = running_batch  # decode
+        num_decode_steps += 1
+```
+
+**Logic**: Run a fixed number of decode steps (e.g., 10) between prefill batches. This reduces scheduling overhead and amortizes the cost of switching contexts.
+
+### 3. Overlap Scheduling (mini-sglang style)
+```
+def overlap_loop():
+    next_batch = schedule_next_batch()
+    while next_batch:
+        current_batch = next_batch
+        # GPU executes current_batch
+        future = engine.forward_batch(current_batch)
+        # CPU prepares next batch while GPU is busy
+        next_batch = schedule_next_batch()
+        # Wait for GPU
+        future.wait()
+        postprocess(current_batch)
+```
+
+**Logic**: Overlap CPU scheduling with GPU computation to hide scheduling latency. Uses separate CUDA streams for metadata preparation.
+
+## Key Scheduling Decisions
+
+### Batch Size Budget
+Every scheduler enforces a token budget:
+- `max_num_batched_tokens`: Maximum tokens in a single prefill batch (e.g., 16384)
+- `max_num_seqs`: Maximum concurrent sequences (e.g., 512)
+
+### Chunked Prefill
+When a prompt is too long to fit in one batch:
+```
+if prompt_len > remaining_budget:
+    chunk_size = remaining_budget
+    schedule only chunk_size tokens
+    mark request as partially prefilled
+    # Will continue in next prefill step
+```
+
+**Key rule in nano-vllm**: Only one sequence per batch can be chunked (the last one added).
+
+**Key rule in mini-sglang**: A `PrefillAdder` manages the chunking logic, creating `ChunkedReq` objects that track how much of the prompt has been processed.
+
+### Preemption (nano-vllm)
+When KV cache is full during decode:
+```
+def handle_oom_during_decode():
+    # Move lowest-priority sequences back to waiting
+    victim = running_queue.pop()
+    deallocate_blocks(victim)
+    victim.status = WAITING
+    waiting_queue.appendleft(victim)
+```
+
+### Prefix-Aware Scheduling (nano-sglang)
+Three heuristics for reordering the queue to maximize cache hits:
+1. **FCFS**: Simple first-come-first-served (default)
+2. **LPM (Longest Prefix Match)**: Prioritize requests whose prompts share the most tokens with the radix cache
+3. **Weight**: Tree-based scoring that considers how many pending requests share each cache node — favors branches that benefit the most requests
+
+## Memory Budget Calculation
+
+Before scheduling a request, the scheduler must check if there's enough KV cache:
 
 ```python
-class Scheduler:
-    def __init__(self, config: Config):
-        # 调度约束
-        self.max_num_seqs = config.max_num_seqs              # 最大并发序列数
-        self.max_num_batched_tokens = config.max_num_batched_tokens  # 最大批处理token数
-        
-        # 请求队列
-        self.waiting: deque[Sequence] = deque()  # 等待队列
-        self.running: deque[Sequence] = deque()  # 运行队列
-        
-        # KV Cache管理
-        self.block_manager = BlockManager(
-            config.num_kvcache_blocks, 
-            config.kvcache_block_size
-        )
+# nano-vllm style (block-based)
+needed_blocks = ceil(prompt_len / block_size) - cached_blocks
+can_schedule = block_manager.num_free_blocks >= needed_blocks
+
+# nano-sglang style (token-based)
+needed_tokens = prompt_len - prefix_cached_len
+can_schedule = token_pool.available() >= needed_tokens
 ```
 
-### 2.2 调度核心逻辑
-
+### Decode Memory Reservation (mini-sglang)
+During decode, each request needs space for one more token per step. The scheduler must **reserve** space:
 ```python
-def schedule(self) -> tuple[list[Sequence], bool]:
-    """
-    核心调度逻辑
-    
-    返回:
-        - scheduled_seqs: 本轮要处理的序列列表
-        - is_prefill: 是否为prefill阶段
-    """
-    scheduled_seqs = []
-    num_batched_tokens = 0
-
-    # Phase 1: Prefill（处理新请求）
-    while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-        seq = self.waiting[0]
-        
-        # 计算需要处理的token数
-        num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
-        remaining = self.max_num_batched_tokens - num_batched_tokens
-        
-        # 检查预算和资源约束
-        if remaining == 0:
-            break  # token预算耗尽
-        if not seq.block_table and not self.block_manager.can_allocate(seq):
-            break  # KV Cache不足
-            
-        # Chunked Prefill: 只允许第一个序列分块
-        if remaining < num_tokens and scheduled_seqs:
-            break
-            
-        # 分配KV Cache
-        if not seq.block_table:
-            self.block_manager.allocate(seq)
-            
-        # 设置本轮调度的token数
-        seq.num_scheduled_tokens = min(num_tokens, remaining)
-        
-        # 更新序列状态
-        if seq.num_scheduled_tokens == num_tokens:
-            seq.status = SequenceStatus.RUNNING
-            self.waiting.popleft()
-            self.running.append(seq)
-            
-        scheduled_seqs.append(seq)
-        num_batched_tokens += seq.num_scheduled_tokens
-        
-    if scheduled_seqs:
-        return scheduled_seqs, True  # is_prefill=True
-
-    # Phase 2: Decode（生成阶段）
-    while self.running and len(scheduled_seqs) < self.max_num_seqs:
-        seq = self.running.popleft()
-        
-        # 检查KV Cache空间
-        while not self.block_manager.can_append(seq):
-            if self.running:
-                self.preempt(self.running.pop())  # 抢占其他序列
-            else:
-                self.preempt(seq)
-                break
-        else:
-            seq.num_scheduled_tokens = 1
-            self.block_manager.may_append(seq)
-            scheduled_seqs.append(seq)
-            
-    self.running.extendleft(reversed(scheduled_seqs))
-    return scheduled_seqs, False  # is_prefill=False
+# Reserve one full page per running request to prevent mid-decode OOM
+inflight_tokens = num_running_reqs * page_size
+available = total_pages - used_pages - inflight_reserved
 ```
 
-## 3. 调度策略
+## Postprocessing
 
-### 3.1 FCFS（先到先服务）
-
-最简单的调度策略，按请求到达顺序处理：
-
+After a forward step, the scheduler updates state:
 ```python
-def schedule_fcfs(self):
-    # 按队列顺序处理，不做额外排序
-    return self.waiting
+def postprocess(batch, sampled_tokens):
+    for req, token in zip(batch.reqs, sampled_tokens):
+        req.append_token(token)
+        if token == eos_token or req.output_len >= max_tokens:
+            req.status = FINISHED
+            free_kv_cache(req)
+            # In radix cache systems: insert tokens into cache for future reuse
+            cache.insert(req.token_ids, req.cache_indices)
 ```
 
-**特点**：
-- 实现简单
-- 公平性好
-- 不考虑缓存复用
+## Design Template
 
-### 3.2 LPM（最长前缀匹配优先）
+A minimal scheduler needs:
+1. **Two queues**: `waiting` (new requests) and `running` (generating)
+2. **schedule()**: Select the next batch respecting memory and token budgets
+3. **postprocess()**: Update state, detect finished requests, free resources
+4. **Memory check**: Query the KV cache manager for available capacity
 
-优先调度与前缀缓存匹配最长的请求：
-
-```python
-def schedule_lpm(self, forward_queue):
-    # 按前缀匹配长度降序排序
-    forward_queue.sort(key=lambda x: -len(x.prefix_indices))
-    return forward_queue
-```
-
-**优点**：
-- 最大化缓存复用
-- 减少重复计算
-
-**缺点**：
-- 可能导致短请求饥饿
-- 需要前缀匹配信息
-
-### 3.3 Weight-Based（权重调度）
-
-基于Radix Tree权重决定调度优先级：
-
-```python
-def get_priority_queue(self, forward_queue):
-    # 计算每个节点的权重
-    node_to_weight = defaultdict(int)
-    self._calc_weight_recursive(self.tree_cache.root_node, node_to_weight)
-    
-    # 按权重遍历生成优先级队列
-    tmp_queue = []
-    self._get_weight_priority_recursive(
-        self.tree_cache.root_node, 
-        node_to_weight, 
-        tmp_queue
-    )
-    return tmp_queue
-
-def _calc_weight_recursive(self, node, node_to_weight):
-    # 权重 = 1 + 子节点权重之和 + 该节点上的请求数
-    node_to_weight[node] = 1
-    if node in last_node_to_reqs:
-        node_to_weight[node] += len(last_node_to_reqs[node])
-    for child in node.children.values():
-        self._calc_weight_recursive(child, node_to_weight)
-        node_to_weight[node] += node_to_weight[child]
-```
-
-**优点**：
-- 智能最大化缓存复用
-- 考虑整体缓存树结构
-
-### 3.4 策略选择建议
-
-| 场景 | 推荐策略 | 原因 |
-|------|----------|------|
-| 无前缀缓存 | FCFS | 简单高效 |
-| 有前缀缓存 | LPM/Weight | 最大化缓存复用 |
-| 高吞吐优先 | Weight | 智能调度 |
-| 低延迟优先 | FCFS | 公平响应 |
-
-## 4. 抢占机制
-
-### 4.1 抢占触发条件
-
-当以下情况发生时需要抢占：
-
-1. **KV Cache不足**：新请求需要更多内存
-2. **优先级调度**：高优先级请求需要资源
-
-### 4.2 抢占实现
-
-```python
-def preempt(self, seq: Sequence):
-    """
-    抢占序列：释放资源，放回等待队列
-    """
-    seq.status = SequenceStatus.WAITING
-    self.block_manager.deallocate(seq)  # 释放KV Cache
-    self.waiting.appendleft(seq)        # 放回等待队列头部
-```
-
-### 4.3 抢占策略
-
-**Preemption Recomputation（重计算）**：
-- 完全释放KV Cache
-- 请求重新排队
-- 下次调度时重新计算prefill
-
-**Swap to CPU（换出到CPU）**：
-- 将KV Cache换出到CPU内存
-- 需要时换回GPU
-- vLLM默认实现（复杂框架）
-
-**精简框架建议**：使用重计算策略，实现简单。
-
-## 5. Chunked Prefill
-
-### 5.1 概念
-
-Chunked Prefill允许将长prompt分成多个chunk处理：
-
-```
-长Prompt: [token_0, token_1, ..., token_10000]
-                │
-                ▼ 分成多个chunk
-Chunk 1: [token_0, ..., token_1023]
-Chunk 2: [token_1024, ..., token_2047]
-...
-```
-
-### 5.2 实现要点
-
-```python
-# 在schedule()中
-if remaining < num_tokens:
-    if scheduled_seqs:
-        break  # 只有第一个序列可以分块
-    # 允许第一个序列部分处理
-    seq.num_scheduled_tokens = remaining
-```
-
-### 5.3 优缺点
-
-**优点**：
-- 避免长prompt阻塞短请求
-- 提高系统响应性
-- 更好的GPU利用率
-
-**缺点**：
-- 实现复杂度增加
-- 可能增加总延迟
-
-## 6. 后处理逻辑
-
-### 6.1 Prefill后处理
-
-```python
-def postprocess_prefill(self, seqs, token_ids):
-    for seq, token_id in zip(seqs, token_ids):
-        # 更新已缓存token数
-        seq.num_cached_tokens = min(
-            seq.num_cached_tokens + seq.num_scheduled_tokens, 
-            seq.num_tokens
-        )
-        
-        # 检查是否完成prefill
-        if seq.num_cached_tokens < seq.num_tokens:
-            # Chunked prefill，等待下一轮
-            seq.num_scheduled_tokens = 0
-            continue
-            
-        # Prefill完成，生成第一个token
-        seq.append_token(token_id)
-        seq.num_cached_tokens += 1
-        seq.num_scheduled_tokens = 0
-```
-
-### 6.2 Decode后处理
-
-```python
-def postprocess_decode(self, seqs, token_ids):
-    for seq, token_id in zip(seqs, token_ids):
-        seq.append_token(token_id)
-        seq.num_scheduled_tokens = 0
-        
-        # 检查终止条件
-        if self._should_stop(seq, token_id):
-            seq.status = SequenceStatus.FINISHED
-            self.block_manager.deallocate(seq)
-            self.running.remove(seq)
-
-def _should_stop(self, seq, token_id):
-    # EOS终止
-    if not seq.ignore_eos and token_id == self.eos:
-        return True
-    # 长度限制
-    if seq.num_completion_tokens == seq.max_tokens:
-        return True
-    return False
-```
-
-## 7. 调度器设计原则
-
-### 7.1 精简原则
-
-1. **单一策略**：只实现一种调度策略（FCFS）
-2. **无优先级**：不区分请求优先级
-3. **重计算抢占**：使用简单的重计算而非换出
-4. **固定预算**：使用固定的批处理token预算
-
-### 7.2 扩展点
-
-如果需要扩展调度能力：
-
-```python
-class Scheduler:
-    def __init__(self, config, strategy="fcfs"):
-        self.strategy = strategy
-        
-    def schedule(self):
-        if self.strategy == "fcfs":
-            return self._schedule_fcfs()
-        elif self.strategy == "lpm":
-            return self._schedule_lpm()
-        # ...
-```
-
-## 8. 性能优化点
-
-### 8.1 避免频繁排序
-
-```python
-# 差：每次调度都排序
-def schedule_lpm(self):
-    self.waiting.sort(key=lambda x: -len(x.prefix_indices))
-    
-# 好：插入时维护有序性
-def add(self, seq):
-    bisect.insort(self.waiting, seq, key=lambda x: -len(x.prefix_indices))
-```
-
-### 8.2 批量操作
-
-```python
-# 差：逐个检查
-for seq in seqs:
-    if self.block_manager.can_allocate(seq):
-        self.block_manager.allocate(seq)
-
-# 好：批量检查和分配
-allocatable = [seq for seq in seqs if self.block_manager.can_allocate(seq)]
-for seq in allocatable:
-    self.block_manager.allocate(seq)
-```
-
-### 8.3 预分配数据结构
-
-```python
-# 预分配足够大的队列
-self.waiting = deque(maxlen=config.max_num_seqs * 2)
-```
+Optional enhancements (add based on requirements):
+- Chunked prefill (for very long prompts)
+- Preemption (for oversubscribed systems)
+- Prefix-aware scheduling (when radix cache is used)
+- Overlap scheduling (for maximum throughput)

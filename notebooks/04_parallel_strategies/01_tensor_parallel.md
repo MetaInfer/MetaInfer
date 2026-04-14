@@ -1,415 +1,213 @@
-# 张量并行
+# Tensor Parallelism
 
-## 1. 张量并行概述
+## Core Concept
 
-张量并行（Tensor Parallelism, TP）将模型参数切分到多个GPU上，每个GPU持有部分参数，通过All-Reduce同步结果。
+Tensor Parallelism (TP) splits individual layers across multiple GPUs, enabling inference of models that don't fit on a single GPU. It is the most common parallelism strategy for LLM inference because it minimizes latency (all GPUs work on every token).
+
+## Sharding Strategy
+
+### Column Parallel Linear
+Splits the **output dimension** across GPUs. Each GPU computes a portion of the output:
 
 ```
-单GPU模型:
-┌─────────────────────────────────────┐
-│         Full Model Weights          │
-│              [H, H]                 │
-└─────────────────────────────────────┘
+Full weight: [H_in, H_out]
+Rank 0: W[H_in, 0:H_out/N]
+Rank 1: W[H_in, H_out/N:2*H_out/N]
+...
 
-TP=2 切分:
-┌───────────────────┐ ┌───────────────────┐
-│  GPU 0: W[:, :H/2]│ │  GPU 1: W[:, H/2:]│
-│   Col Parallel    │ │   Col Parallel    │
-└───────────────────┘ └───────────────────┘
-          All-Reduce
+Input: [B, H_in]  (replicated on all ranks)
+Output: [B, H_out/N]  (partial, different on each rank)
 ```
 
-## 2. 并行线性层
+**No communication needed after the forward pass** — the partial outputs are consumed by the next layer.
 
-### 2.1 Column Parallel Linear
+Used for: `QKV projection`, `Gate+Up projection` in MLP
 
 ```python
 class ColumnParallelLinear(nn.Module):
-    """
-    列并行线性层：输出维度切分
-    
-    用途: QKV投影
-    
-    Y = XW, W: [in_features, out_features]
-    切分: W = [W_0, W_1], 每个 GPU 持有 W_i: [in_features, out_features/tp_size]
-    """
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        tp_size: int = 1,
-    ):
-        super().__init__()
-        self.tp_size = tp_size
-        self.tp_rank = get_tensor_parallel_rank()
-        
-        assert out_features % tp_size == 0
-        self.out_features_per_partition = out_features // tp_size
-        
-        # 只存储切分后的权重
-        self.weight = nn.Parameter(
-            torch.empty(self.out_features_per_partition, in_features)
-        )
-        if bias:
-            self.bias = nn.Parameter(
-                torch.empty(self.out_features_per_partition)
-            )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        每个 GPU 计算部分输出
-        无需通信，输出已在各 GPU 分散
-        """
-        return F.linear(x, self.weight, self.bias)
+    def __init__(self, input_size, output_size, tp_rank, tp_size):
+        self.local_output_size = output_size // tp_size
+        self.weight = Parameter(torch.empty(self.local_output_size, input_size))
+
+    def forward(self, x):
+        return F.linear(x, self.weight)
+
+    def weight_loader(self, param, loaded_weight, tp_rank, tp_size):
+        shard_size = loaded_weight.shape[0] // tp_size
+        start = tp_rank * shard_size
+        param.data.copy_(loaded_weight[start:start + shard_size])
 ```
 
-### 2.2 Row Parallel Linear
+### Row Parallel Linear
+Splits the **input dimension** across GPUs. Each GPU has a portion of the input:
+
+```
+Full weight: [H_in, H_out]
+Rank 0: W[0:H_in/N, H_out]
+Rank 1: W[H_in/N:2*H_in/N, H_out]
+...
+
+Input: [B, H_in/N]  (partial, from column parallel output)
+Output: [B, H_out]  (partial sum, needs all-reduce)
+```
+
+**Requires all-reduce** after the forward pass to sum partial results.
+
+Used for: `O projection`, `Down projection` in MLP
 
 ```python
 class RowParallelLinear(nn.Module):
-    """
-    行并行线性层：输入维度切分
-    
-    用途: O投影, Down投影
-    
-    Y = XW, W: [in_features, out_features]
-    切分: X = [X_0, X_1], W = [W_0; W_1]
-    每个 GPU 计算 Y_i = X_i W_i, 然后 All-Reduce
-    """
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        tp_size: int = 1,
-    ):
-        super().__init__()
-        self.tp_size = tp_size
-        self.tp_rank = get_tensor_parallel_rank()
-        
-        assert in_features % tp_size == 0
-        self.in_features_per_partition = in_features // tp_size
-        
-        # 只存储切分后的权重
-        self.weight = nn.Parameter(
-            torch.empty(out_features, self.in_features_per_partition)
-        )
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        每个 GPU 计算部分结果，然后 All-Reduce
-        """
-        output = F.linear(x, self.weight)
-        
-        # All-Reduce 求和
-        torch.distributed.all_reduce(output, group=self.tp_group)
-        
-        if self.bias is not None:
-            output = output + self.bias  # bias 只在一个 rank 加
-        
-        return output
+    def __init__(self, input_size, output_size, tp_rank, tp_size):
+        self.local_input_size = input_size // tp_size
+        self.weight = Parameter(torch.empty(output_size, self.local_input_size))
+
+    def forward(self, x):
+        y = F.linear(x, self.weight)
+        # All-reduce: sum partial results from all ranks
+        dist.all_reduce(y, op=dist.ReduceOp.SUM)
+        return y
+
+    def weight_loader(self, param, loaded_weight, tp_rank, tp_size):
+        shard_size = loaded_weight.shape[1] // tp_size
+        start = tp_rank * shard_size
+        param.data.copy_(loaded_weight[:, start:start + shard_size])
 ```
 
-### 2.3 QKV Parallel Linear
+### QKV Parallel Linear (Special Case)
+Q, K, V have different head counts (especially with GQA), requiring careful sharding:
 
 ```python
 class QKVParallelLinear(nn.Module):
-    """
-    QKV并行线性层：同时处理Q、K、V投影
-    
-    支持 GQA: Q的head数可能与K、V不同
-    """
-    def __init__(
-        self,
-        hidden_size: int,
-        head_dim: int,
-        num_heads: int,        # Q的head数
-        num_kv_heads: int,     # K、V的head数
-        bias: bool = False,
-        tp_size: int = 1,
-    ):
-        super().__init__()
-        self.tp_size = tp_size
-        self.tp_rank = get_tensor_parallel_rank()
-        
-        # 计算每个partition的head数
-        self.num_heads_per_partition = num_heads // tp_size
-        self.num_kv_heads_per_partition = num_kv_heads // tp_size
-        
-        # 总输出维度
-        q_dim = self.num_heads_per_partition * head_dim
-        kv_dim = self.num_kv_heads_per_partition * head_dim
-        total_dim = q_dim + 2 * kv_dim
-        
-        self.weight = nn.Parameter(
-            torch.empty(total_dim, hidden_size)
-        )
-    
-    def forward(self, x: torch.Tensor):
-        """
-        返回切分后的Q、K、V
-        """
-        qkv = F.linear(x, self.weight)
-        
-        # 分离Q、K、V
-        q_dim = self.num_heads_per_partition * self.head_dim
-        kv_dim = self.num_kv_heads_per_partition * self.head_dim
-        
-        q = qkv[..., :q_dim]
-        k = qkv[..., q_dim:q_dim + kv_dim]
-        v = qkv[..., q_dim + kv_dim:]
-        
+    def __init__(self, hidden_size, num_q_heads, num_kv_heads, head_dim, tp_size):
+        self.local_q_heads = num_q_heads // tp_size
+        self.local_kv_heads = num_kv_heads // tp_size
+        self.q_size = self.local_q_heads * head_dim
+        self.kv_size = self.local_kv_heads * head_dim
+        total_size = self.q_size + 2 * self.kv_size
+        self.weight = Parameter(torch.empty(total_size, hidden_size))
+
+    def forward(self, x):
+        output = F.linear(x, self.weight)
+        q, k, v = output.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         return q, k, v
 ```
 
-### 2.4 Merged Column Parallel Linear
+## Transformer Block TP Layout
 
-```python
-class MergedColumnParallelLinear(nn.Module):
-    """
-    合并列并行线性层：合并Gate和Up投影
-    
-    用途: MLP的gate_up_proj
-    """
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,  # gate + up 的总维度
-        bias: bool = False,
-        tp_size: int = 1,
-    ):
-        super().__init__()
-        self.tp_size = tp_size
-        
-        assert out_features % (2 * tp_size) == 0
-        self.out_features_per_partition = out_features // tp_size
-        
-        self.weight = nn.Parameter(
-            torch.empty(self.out_features_per_partition, in_features)
-        )
-    
-    def forward(self, x: torch.Tensor):
-        """
-        返回gate和up两部分
-        """
-        output = F.linear(x, self.weight)
-        
-        # 分离gate和up
-        half = self.out_features_per_partition // 2
-        gate = output[..., :half]
-        up = output[..., half:]
-        
-        return gate, up
+```
+                    Replicated           Column Parallel       Row Parallel
+                    ──────────           ──────────────        ────────────
+Input hidden        [B, H]               
+    ↓
+RMSNorm             [B, H]              (replicated)
+    ↓
+QKV Proj                                 [B, H] → [B, (Q+K+V)/N]
+    ↓
+Attention                                (local computation, no comm)
+    ↓
+O Proj                                                         [B, H/N] → [B, H] + all_reduce
+    ↓
+Residual            [B, H]              (replicated after all_reduce)
+    ↓
+RMSNorm             [B, H]              (replicated)
+    ↓
+Gate+Up Proj                             [B, H] → [B, 2*FFN/N]
+    ↓
+SiLU + Mul                              (local computation)
+    ↓
+Down Proj                                                      [B, FFN/N] → [B, H] + all_reduce
+    ↓
+Residual            [B, H]              (replicated after all_reduce)
 ```
 
-## 3. 并行通信
+**Communication**: Exactly 2 all-reduce operations per transformer layer (one after O proj, one after Down proj).
 
-### 3.1 进程组初始化
+## Embedding and LM Head TP
 
+### Parallel Embedding
 ```python
-def init_tensor_parallel(tp_size: int):
-    """初始化张量并行进程组"""
-    world_size = torch.distributed.get_world_size()
-    rank = torch.distributed.get_rank()
-    
-    assert world_size % tp_size == 0
-    
-    # 创建张量并行进程组
-    tp_group = torch.distributed.new_group(
-        ranks=list(range(tp_size))
+class ParallelEmbedding(nn.Module):
+    def __init__(self, vocab_size, hidden_size, tp_rank, tp_size):
+        self.local_vocab_size = vocab_size // tp_size
+        self.vocab_start = tp_rank * self.local_vocab_size
+        self.weight = Parameter(torch.empty(self.local_vocab_size, hidden_size))
+
+    def forward(self, input_ids):
+        # Mask out-of-range tokens for this rank
+        mask = (input_ids >= self.vocab_start) & (input_ids < self.vocab_start + self.local_vocab_size)
+        local_ids = input_ids - self.vocab_start
+        local_ids[~mask] = 0
+        output = F.embedding(local_ids, self.weight)
+        output[~mask] = 0
+        # All-reduce to combine results
+        dist.all_reduce(output)
+        return output
+```
+
+### LM Head (reuses embedding weight)
+Many models tie embedding and LM head weights. With TP:
+```python
+class ParallelLMHead(nn.Module):
+    def forward(self, hidden):
+        # Each rank computes logits for its vocab shard
+        local_logits = F.linear(hidden, self.weight)  # [B, local_vocab_size]
+        # All-gather to get full vocabulary logits
+        all_logits = all_gather(local_logits)  # [B, vocab_size]
+        return all_logits
+```
+
+## NCCL Initialization
+
+### Standard PyTorch Distributed
+```python
+def init_tp(tp_size, rank):
+    torch.distributed.init_process_group(
+        backend='nccl',
+        world_size=tp_size,
+        rank=rank,
     )
-    
+    tp_group = torch.distributed.new_group(list(range(tp_size)))
     return tp_group
 ```
 
-### 3.2 All-Reduce
-
+### Custom NCCL Wrapper (mini-sglang)
+For lower overhead:
 ```python
-def all_reduce(tensor: torch.Tensor, group=None):
-    """All-Reduce求和"""
-    torch.distributed.all_reduce(tensor, group=group)
-    return tensor
+class PyNCCLCommunicator:
+    def __init__(self, rank, size, uid):
+        # Directly initialize NCCL communicator via FFI
+        self.comm = nccl_module.create_comm(rank, size, uid)
 
-def all_reduce_async(tensor: torch.Tensor, group=None):
-    """异步All-Reduce"""
-    handle = torch.distributed.all_reduce(
-        tensor, 
-        group=group, 
-        async_op=True
-    )
-    return handle
+    def all_reduce(self, tensor, stream=None):
+        self.comm.all_reduce(tensor.data_ptr(), tensor.numel(), ...)
 ```
 
-## 4. 多进程架构
-
-### 4.1 进程启动
-
+### Multi-Process Coordination (nano-vllm)
+Uses SharedMemory + Events for metadata passing between ranks:
 ```python
-import torch.multiprocessing as mp
+# Rank 0: Prepare inputs, write to shared memory, signal other ranks
+shared_mem = SharedMemory(create=True, size=buffer_size)
+event = multiprocessing.Event()
 
-def launch_tensor_parallel(config: Config):
-    """启动张量并行进程"""
-    world_size = config.tensor_parallel_size
-    
-    # 使用spawn模式
-    ctx = mp.get_context("spawn")
-    
-    processes = []
-    for rank in range(world_size):
-        p = ctx.Process(
-            target=worker_main,
-            args=(config, rank, world_size)
-        )
-        p.start()
-        processes.append(p)
-    
-    for p in processes:
-        p.join()
+# Rank 0: Signal ready
+shared_mem.buf[:] = serialized_inputs
+event.set()
 
-def worker_main(config, rank, world_size):
-    """Worker进程主函数"""
-    # 设置设备
-    torch.cuda.set_device(rank)
-    
-    # 初始化分布式
-    torch.distributed.init_process_group(
-        backend="nccl",
-        init_method="tcp://localhost:2333",
-        world_size=world_size,
-        rank=rank,
-    )
-    
-    # 创建模型
-    model = Model(config, rank)
-    
-    # 运行推理循环
-    ...
+# Rank 1-N: Wait for signal, read inputs
+event.wait()
+inputs = deserialize(shared_mem.buf)
 ```
 
-### 4.2 主从通信
+## Design Template
 
-```python
-class ModelRunner:
-    def __init__(self, config, rank, events):
-        self.rank = rank
-        self.world_size = config.tensor_parallel_size
-        
-        if rank == 0:
-            # 主进程
-            self.shm = SharedMemory(name="llm_cache", create=True, size=2**20)
-            self.events = events
-        else:
-            # Worker进程
-            self.shm = SharedMemory(name="llm_cache")
-            self.loop()
-    
-    def call(self, method_name, *args):
-        """主进程调用，广播到所有Worker"""
-        if self.world_size > 1 and self.rank == 0:
-            self._broadcast_call(method_name, *args)
-        return getattr(self, method_name)(*args)
-    
-    def _broadcast_call(self, method_name, *args):
-        """广播调用到Worker"""
-        data = pickle.dumps([method_name, *args])
-        self.shm.buf[:4] = len(data).to_bytes(4, "little")
-        self.shm.buf[4:4+len(data)] = data
-        for event in self.events:
-            event.set()
-    
-    def loop(self):
-        """Worker进程主循环"""
-        while True:
-            # 等待主进程通知
-            self.event.wait()
-            
-            # 读取调用
-            data_len = int.from_bytes(self.shm.buf[:4], "little")
-            method_name, args = pickle.loads(self.shm.buf[4:4+data_len])
-            
-            # 执行
-            getattr(self, method_name)(*args)
-            
-            # 清除事件
-            self.event.clear()
-```
+For implementing TP:
+1. **Process group**: Initialize NCCL process group
+2. **ColumnParallelLinear**: Shard output dim, no post-communication
+3. **RowParallelLinear**: Shard input dim, all-reduce after forward
+4. **QKVParallelLinear**: Handle asymmetric Q/KV head counts
+5. **Weight loader**: Each parameter knows how to extract its TP shard
+6. **Embedding/LMHead**: Split vocabulary across ranks
 
-## 5. 权重加载
+**Communication cost**: 2 all-reduce per layer × `hidden_size` × `batch_size` × `dtype_bytes`
 
-### 5.1 切分权重加载
-
-```python
-def load_tensor_parallel_weights(model, state_dict, tp_rank, tp_size):
-    """加载张量并行权重"""
-    for name, param in model.named_parameters():
-        if name not in state_dict:
-            continue
-        
-        loaded_weight = state_dict[name]
-        
-        # 检查是否需要切分
-        if hasattr(param, "weight_loader"):
-            # 使用参数的weight_loader方法
-            param.weight_loader(param, loaded_weight)
-        else:
-            # 直接复制
-            param.data.copy_(loaded_weight)
-```
-
-### 5.2 Weight Loader
-
-```python
-class ColumnParallelLinear:
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        """列并行权重加载"""
-        # 按输出维度切分
-        shard_size = loaded_weight.shape[0] // self.tp_size
-        start = self.tp_rank * shard_size
-        end = start + shard_size
-        
-        param.data.copy_(loaded_weight[start:end])
-
-class RowParallelLinear:
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        """行并行权重加载"""
-        # 按输入维度切分
-        shard_size = loaded_weight.shape[1] // self.tp_size
-        start = self.tp_rank * shard_size
-        end = start + shard_size
-        
-        param.data.copy_(loaded_weight[:, start:end])
-```
-
-## 6. 精简实现建议
-
-### 6.1 最小化张量并行
-
-```python
-# 精简框架可以不实现张量并行
-# 只需要单GPU版本
-if config.tensor_parallel_size > 1:
-    raise NotImplementedError("TP not supported in minimal implementation")
-```
-
-### 6.2 必要的张量并行
-
-如果需要TP，推荐：
-
-1. **固定TP size**: 只支持特定的TP配置
-2. **简化通信**: 使用NCCL原生API
-3. **同步模式**: 使用同步通信，避免复杂的异步处理
-
-```python
-# 简化的TP实现
-class SimpleColumnParallel(nn.Module):
-    def __init__(self, in_features, out_features, tp_rank, tp_size):
-        super().__init__()
-        self.out_features = out_features // tp_size
-        self.weight = nn.Parameter(torch.empty(self.out_features, in_features))
-    
-    def forward(self, x):
-        return F.linear(x, self.weight)
-```
+**When to use TP**: Model doesn't fit on one GPU, or latency requirements demand multi-GPU (each GPU does less work per token)

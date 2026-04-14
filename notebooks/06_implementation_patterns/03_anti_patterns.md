@@ -1,415 +1,178 @@
-# 反模式（应避免）
+# Anti-Patterns in LLM Inference Frameworks
 
-## 1. 架构反模式
+## Complexity Traps Found in Production Frameworks
 
-### 1.1 过度抽象
+These patterns are present in vLLM and SGLang (the negative examples) and should be avoided in generated inference code.
 
+### 1. Over-Abstraction: Plugin Systems for Single-Use Components
+
+**Anti-pattern**:
 ```python
-# ❌ 反模式：多层抽象
-class BaseEngine(ABC):
+# vLLM: QuantizationConfig → QuantizationMethod → QuantizedLinear
+# When you only need AWQ, this creates 3 layers of indirection
+
+class QuantizationConfig(ABC):
     @abstractmethod
-    def step(self): ...
+    def get_quant_method(self, layer, prefix): ...
 
-class BaseScheduler(ABC):
-    @abstractmethod
-    def schedule(self): ...
+class AWQConfig(QuantizationConfig):
+    def get_quant_method(self, layer, prefix):
+        return AWQLinearMethod()
 
-class BaseBlockManager(ABC):
-    @abstractmethod
-    def allocate(self): ...
+class AWQLinearMethod(LinearMethodBase):
+    def create_weights(self, ...): ...
+    def apply(self, ...): ...
+```
 
-class LLMEngine(BaseEngine):
-    def __init__(self):
-        self.scheduler = SchedulerFactory.create()
-        self.block_manager = BlockManagerFactory.create()
-    # ...
+**Better approach for generated code**:
+```python
+# Direct implementation, no indirection
+class AWQLinear(nn.Module):
+    def forward(self, x):
+        return awq_gemm(x, self.qweight, self.scales, self.qzeros)
+```
 
-# ✅ 推荐：直接实现
+### 2. Environment Variable Explosion
+
+**Anti-pattern**:
+```python
+# vLLM/SGLang: hundreds of env vars controlling behavior
+VLLM_USE_FLASHINFER = os.getenv("VLLM_USE_FLASHINFER", "0")
+VLLM_ATTENTION_BACKEND = os.getenv("VLLM_ATTENTION_BACKEND", "")
+VLLM_USE_V1 = os.getenv("VLLM_USE_V1", "1")
+SGLANG_USE_RADIX_CACHE = os.getenv("SGLANG_USE_RADIX_CACHE", "1")
+# ... dozens more, creating invisible configuration surface
+```
+
+**Better approach**: Hard-code decisions at generation time. The AI agent chooses the configuration; the generated code has no runtime branches.
+
+### 3. Dynamic Model Dispatch
+
+**Anti-pattern**:
+```python
+# Runtime model selection with string matching
+MODEL_REGISTRY = {...}  # 270+ entries
+model_cls = MODEL_REGISTRY.get(config.architectures[0])
+if model_cls is None:
+    raise ValueError(f"Unsupported model: {config.architectures[0]}")
+model = model_cls(config)
+```
+
+**Better approach**: The model is known at generation time. Import and instantiate directly.
+
+### 4. Backward Compatibility Layers
+
+**Anti-pattern**:
+```python
+# Supporting both v0 and v1 engine simultaneously
 class LLMEngine:
-    def __init__(self, config):
-        self.scheduler = Scheduler(config)
-        self.block_manager = BlockManager(config.num_blocks, config.block_size)
-    
+    def __init__(self):
+        if USE_V1:
+            self._engine = V1Engine()
+        else:
+            self._engine = V0Engine()
+
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        ...
+        if USE_V1:
+            return self._engine.step_v1()
+        else:
+            return self._engine.step_v0()
 ```
 
-### 1.2 过度模块化
+**Better approach**: Pick one implementation. Generated code doesn't need migration paths.
 
+### 5. Universal Configuration Objects
+
+**Anti-pattern**:
 ```python
-# ❌ 反模式：过度拆分
-# file: engine/scheduler/base.py
-class BaseScheduler: ...
+# A config class that tries to represent every possible model
+@dataclass
+class ModelConfig:
+    # Standard transformer
+    hidden_size: int
+    num_heads: int
+    # MoE specific
+    num_experts: Optional[int] = None
+    num_shared_experts: Optional[int] = None
+    # MLA specific
+    kv_lora_rank: Optional[int] = None
+    qk_rope_head_dim: Optional[int] = None
+    # Mamba specific
+    state_size: Optional[int] = None
+    # Vision specific
+    image_size: Optional[int] = None
+    patch_size: Optional[int] = None
+    # ... 50+ optional fields
+```
 
-# file: engine/scheduler/policy/fcfs.py
-class FCFSPolicy: ...
+**Better approach**: Config contains only what the specific model needs.
 
-# file: engine/scheduler/policy/lpm.py
-class LPMPolicy: ...
+### 6. Kernel Fallback Chains
 
-# file: engine/scheduler/policy/weight.py
-class WeightPolicy: ...
+**Anti-pattern**:
+```python
+def get_attention_kernel():
+    if has_flash_attn_v3() and is_hopper():
+        return FlashAttnV3Backend()
+    elif has_flash_attn_v2():
+        return FlashAttnV2Backend()
+    elif has_flashinfer():
+        return FlashInferBackend()
+    elif has_triton():
+        return TritonBackend()
+    elif has_xformers():
+        return XformersBackend()
+    else:
+        return TorchSDPABackend()
+```
 
-# file: engine/scheduler/factory.py
-class SchedulerFactory: ...
+**Better approach**: The target hardware is known. Use the best kernel directly.
 
-# ✅ 推荐：必要模块
-# file: scheduler.py
+### 7. Excessive Logging and Metrics
+
+**Anti-pattern**:
+```python
+# Every component has its own logger, metrics collector, profiler hooks
 class Scheduler:
-    def __init__(self, config):
-        self.waiting = deque()
-        self.running = deque()
-    
-    def schedule(self): ...
+    def schedule(self):
+        logger.debug(f"Scheduling {len(self.waiting)} requests")
+        metrics.gauge("scheduler.waiting_count", len(self.waiting))
+        with profiler.trace("scheduler.schedule"):
+            # ... actual logic (3 lines)
+        metrics.histogram("scheduler.schedule_time", elapsed)
+        logger.debug(f"Scheduled {len(batch)} sequences")
 ```
 
-### 1.3 注册表滥用
+**Better approach**: Generated code is simple enough to understand without pervasive instrumentation. Add targeted logging only for debugging.
 
+### 8. Generic Data Structures with Type Tags
+
+**Anti-pattern**:
 ```python
-# ❌ 反模式：不必要的注册表
-MODEL_REGISTRY = {}
+# Using type tags to represent different message types
+class Message:
+    type: str  # "generate_req", "abort_req", "batch_result", ...
+    data: Any
 
-def register_model(name):
-    def decorator(cls):
-        MODEL_REGISTRY[name] = cls
-        return cls
-    return decorator
-
-@register_model("llama")
-class LlamaModel: ...
-
-@register_model("mistral")
-class MistralModel: ...
-
-def get_model(name):
-    return MODEL_REGISTRY[name]()
-
-# ✅ 推荐：直接定义
-class Model:  # 只支持一种模型
-    ...
+def handle_message(msg):
+    if msg.type == "generate_req":
+        handle_generate(msg.data)
+    elif msg.type == "abort_req":
+        handle_abort(msg.data)
+    # ... many more branches
 ```
 
-## 2. 配置反模式
+**Better approach**: Use typed function calls or typed dataclasses with discriminated unions.
 
-### 2.1 参数爆炸
+## Summary: What to Avoid in Generated Code
 
-```python
-# ❌ 反模式：过多参数
-@dataclass
-class ServerArgs:
-    model_path: str
-    tokenizer_path: str = None
-    host: str = "0.0.0.0"
-    port: int = 8000
-    workers: int = 1
-    max_num_seqs: int = 512
-    max_num_batched_tokens: int = 16384
-    max_model_len: int = 4096
-    block_size: int = 256
-    gpu_memory_utilization: float = 0.9
-    tensor_parallel_size: int = 1
-    pipeline_parallel_size: int = 1
-    attention_backend: str = "flash"
-    sampling_backend: str = "pytorch"
-    disable_cuda_graph: bool = False
-    disable_radix_cache: bool = False
-    # ... 200+ 参数
-
-# ✅ 推荐：最小参数
-@dataclass
-class Config:
-    model_path: str
-    max_model_len: int = 4096
-    # 其他参数自动推导或固定
-```
-
-### 2.2 深层嵌套配置
-
-```python
-# ❌ 反模式：嵌套配置
-@dataclass
-class ParallelConfig:
-    tp_size: int = 1
-    pp_size: int = 1
-    dp_size: int = 1
-
-@dataclass
-class AttentionConfig:
-    backend: str = "flash"
-    block_size: int = 256
-
-@dataclass
-class SchedulerConfig:
-    policy: str = "fcfs"
-    max_seqs: int = 512
-
-@dataclass
-class Config:
-    parallel: ParallelConfig
-    attention: AttentionConfig
-    scheduler: SchedulerConfig
-    # 访问: config.parallel.tp_size
-
-# ✅ 推荐：扁平配置
-@dataclass
-class Config:
-    model_path: str
-    max_seqs: int = 512
-    block_size: int = 256
-    # 访问: config.max_seqs
-```
-
-## 3. 运行时反模式
-
-### 3.1 过多条件分支
-
-```python
-# ❌ 反模式：条件分支爆炸
-def forward(self, x):
-    if self.config.model_type == "llama":
-        if self.config.attention_backend == "flash":
-            x = self.flash_attention(x)
-        elif self.config.attention_backend == "triton":
-            x = self.triton_attention(x)
-        else:
-            x = self.native_attention(x)
-    elif self.config.model_type == "mistral":
-        if self.config.use_sliding_window:
-            x = self.sliding_attention(x)
-        else:
-            x = self.normal_attention(x)
-    # ...
-
-# ✅ 推荐：固定实现
-def forward(self, x):
-    x = self.attention(x)  # 只有Flash Attention
-    ...
-```
-
-### 3.2 动态导入
-
-```python
-# ❌ 反模式：运行时动态导入
-def get_attention_backend(name):
-    if name == "flash":
-        from .flash_attn import FlashAttention
-        return FlashAttention
-    elif name == "triton":
-        from .triton_attn import TritonAttention
-        return TritonAttention
-    # ...
-
-# ✅ 推荐：静态导入
-from .flash_attn import FlashAttention
-
-class Model:
-    def __init__(self):
-        self.attention = FlashAttention()
-```
-
-### 3.3 反射滥用
-
-```python
-# ❌ 反模式：通过字符串调用方法
-def execute(self, method_name, *args):
-    method = getattr(self, method_name)
-    return method(*args)
-
-result = self.execute("forward", input_ids)
-
-# ✅ 推荐：直接调用
-result = self.forward(input_ids)
-```
-
-## 4. 设计模式反模式
-
-### 4.1 工厂模式滥用
-
-```python
-# ❌ 反模式：不必要的工厂
-class SchedulerFactory:
-    @staticmethod
-    def create(policy, config):
-        if policy == "fcfs":
-            return FCFSScheduler(config)
-        elif policy == "lpm":
-            return LPMScheduler(config)
-        # ...
-
-scheduler = SchedulerFactory.create("fcfs", config)
-
-# ✅ 推荐：直接实例化
-scheduler = Scheduler(config)  # 只有一种调度策略
-```
-
-### 4.2 策略模式滥用
-
-```python
-# ❌ 反模式：过多的策略选择
-class AllocationStrategy(ABC):
-    @abstractmethod
-    def allocate(self, seq): ...
-
-class ContiguousAllocation(AllocationStrategy):
-    ...
-
-class PagedAllocation(AllocationStrategy):
-    ...
-
-class BlockManager:
-    def __init__(self, strategy: AllocationStrategy):
-        self.strategy = strategy
-    
-    def allocate(self, seq):
-        return self.strategy.allocate(seq)
-
-# ✅ 推荐：固定策略
-class BlockManager:
-    def allocate(self, seq):
-        # 固定使用Paged Attention
-        ...
-```
-
-### 4.3 观察者模式滥用
-
-```python
-# ❌ 反模式：不必要的事件系统
-class Event:
-    pass
-
-class EventBus:
-    def subscribe(self, event_type, handler): ...
-    def publish(self, event): ...
-
-event_bus = EventBus()
-event_bus.subscribe("sequence_created", on_sequence_created)
-event_bus.subscribe("token_generated", on_token_generated)
-event_bus.publish(SequenceCreatedEvent(seq))
-
-# ✅ 推荐：直接调用
-def create_sequence(self, prompt):
-    seq = Sequence(prompt)
-    self.on_sequence_created(seq)
-    return seq
-```
-
-## 5. 性能反模式
-
-### 5.1 过度优化
-
-```python
-# ❌ 反模式：过早优化
-@triton.jit
-def custom_kernel(...):  # 手写复杂内核
-    ...
-
-# 在简单场景下反而更慢
-
-# ✅ 推荐：先用标准实现
-output = torch.matmul(a, b)  # PyTorch已优化
-```
-
-### 5.2 不必要的缓存
-
-```python
-# ❌ 反模式：缓存不需要的东西
-class Model:
-    def __init__(self):
-        self._logits_cache = {}
-    
-    def forward(self, input_ids):
-        key = tuple(input_ids.tolist())
-        if key in self._logits_cache:
-            return self._logits_cache[key]
-        logits = self._forward(input_ids)
-        self._logits_cache[key] = logits
-        return logits
-
-# ✅ 推荐：让KV Cache处理缓存
-# KV Cache是正确的缓存位置
-```
-
-### 5.3 复杂的异步处理
-
-```python
-# ❌ 反模式：复杂的异步流水线
-async def complex_pipeline(self):
-    task1 = asyncio.create_task(self.stage1())
-    task2 = asyncio.create_task(self.stage2())
-    task3 = asyncio.create_task(self.stage3())
-    # 复杂的同步逻辑...
-
-# ✅ 推荐：简单同步流程
-def simple_forward(self):
-    x = self.stage1()
-    x = self.stage2(x)
-    x = self.stage3(x)
-    return x
-```
-
-## 6. 代码风格反模式
-
-### 6.1 过度注释
-
-```python
-# ❌ 反模式：注释过多
-def forward(self, x):
-    # 首先进行输入归一化
-    # 使用RMSNorm
-    # eps设置为1e-5
-    x = self.norm(x)  # 归一化
-    
-    # 然后进行注意力计算
-    # 使用Flash Attention
-    # ...
-    x = self.attention(x)  # 注意力
-    
-    # ✅ 推荐：代码即注释
-def forward(self, x):
-    x = self.norm(x)
-    x = self.attention(x)
-    x = self.mlp(x)
-    return x
-```
-
-### 6.2 类型标注过度
-
-```python
-# ❌ 反模式：过度类型标注
-from typing import Dict, List, Tuple, Optional, Union, Callable, TypeVar, Generic
-
-T = TypeVar('T')
-
-class BlockManager(Generic[T]):
-    def allocate(
-        self,
-        seq: Sequence,
-        num_blocks: Optional[int] = None,
-    ) -> Tuple[List[int], Dict[str, Union[int, float]]]:
-        ...
-
-# ✅ 推荐：必要类型标注
-class BlockManager:
-    def allocate(self, seq: Sequence) -> list[int]:
-        ...
-```
-
-## 7. 总结
-
-### 7.1 反模式识别
-
-| 反模式 | 表现 | 解决方案 |
-|--------|------|----------|
-| 过度抽象 | 多层继承/接口 | 直接实现 |
-| 参数爆炸 | 配置项过多 | 固定配置 |
-| 条件分支 | 大量if-else | 单一路径 |
-| 工厂滥用 | 不必要的工厂 | 直接实例化 |
-| 动态导入 | 运行时导入 | 静态导入 |
-
-### 7.2 精简原则
-
-1. **能用一行代码解决的不要用十行**
-2. **能直接调用的不要动态派发**
-3. **能固定的配置不要暴露**
-4. **能省略的抽象不要添加**
+| Trap | Root Cause | Generated Code Approach |
+|------|-----------|------------------------|
+| Plugin systems | Supporting future unknowns | Direct implementation |
+| Env var explosion | Runtime configurability | Compile-time decisions |
+| Model registry | Supporting many models | Single model, direct import |
+| Compatibility layers | Supporting old versions | Clean single implementation |
+| Universal configs | One-size-fits-all | Model-specific config |
+| Kernel fallbacks | Multi-platform | Single optimal kernel |
+| Excessive instrumentation | Debugging at scale | Minimal, targeted logging |
+| Type-tagged messages | Generic messaging | Typed interfaces |
