@@ -20,6 +20,9 @@
 - [MTP](02_model_specifics/02_deepseek_v3/04_mtp.md) — Multi-Token Prediction / speculative decoding
 - [NSA](02_model_specifics/02_deepseek_v3/05_nsa.md) — Native Sparse Attention for long contexts
 - [Optimizations](02_model_specifics/02_deepseek_v3/06_optimization_patterns.md) — FP8, DeepEP patterns
+- [Qwen3 Overview](02_model_specifics/03_qwen3/README.md) — Qwen3 Dense/MoE architecture overview
+- [Qwen3 Dense](02_model_specifics/03_qwen3/01_dense.md) — Dense variant: QK Norm, weights, TP, code template
+- [Qwen3 MoE](02_model_specifics/03_qwen3/02_moe.md) — MoE variant: router, experts, fused kernel, weight packing
 
 ## 03 Operators
 - [Attention Ops](03_operators/01_attention_ops.md) — Flash Attention, FlashInfer, Triton attention kernels
