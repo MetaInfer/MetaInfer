@@ -7,6 +7,7 @@ This knowledge base distills the common patterns and design principles found acr
 ## Knowledge Structure
 
 ### Core Framework Design (`01_framework_design/`)
+
 Universal methodology for building any LLM inference framework. These are the essential building blocks that every inference system needs, regardless of the specific model or deployment scenario.
 
 - **Architecture** - Overall system topology, process model, and component relationships
@@ -18,31 +19,37 @@ Universal methodology for building any LLM inference framework. These are the es
 - **Request Lifecycle** - End-to-end flow from HTTP request to generated response
 
 ### Model-Specific Knowledge (`02_model_specifics/`)
+
 Architecture-specific patterns and implementation details for different model families. When generating code for a specific model, reference the relevant sub-section.
 
 - **Transformer Models** - General dense transformer patterns (Llama, Qwen, Mistral)
 - **DeepSeek V3** - MLA attention, MoE routing, MTP (Multi-Token Prediction), NSA
 
 ### Operators (`03_operators/`)
+
 Kernel-level knowledge for performance-critical operations.
 
 - **Attention Ops** - Flash Attention, FlashInfer, Triton attention, paged KV access
 - (Extensible: RoPE, MoE kernels, normalization, etc.)
 
 ### Parallel Strategies (`04_parallel_strategies/`)
+
 How to distribute computation across multiple GPUs.
 
 - **Tensor Parallelism** - Column/row splitting, all-reduce patterns, weight sharding
 
 ### Non-Core Features (`05_non_core_features/`)
+
 Features that are common in production frameworks but can be independently added or removed based on deployment requirements. Divided into two categories:
 
 **Extractable Complexity** (can be omitted entirely for minimal frameworks):
+
 - **Multi-Model Support** - Model registry, dynamic dispatch
 - **Multiple Quantization Methods** - AWQ, GPTQ, FP8, etc.
 - **Platform Abstraction** - Multi-hardware support (CUDA, ROCm, XPU, TPU)
 
 **Production Optional Features** (important in real deployments, each document includes integration guidance):
+
 - **PD Disaggregation** - Prefill-Decode separation for independent scaling
 - **KVCache Connector** - Cross-node KV cache transfer interface (NCCL, RDMA, Mooncake, NIXL)
 - **Post-Processing** - Incremental detokenization, stop string detection, streaming, output formatting
@@ -50,6 +57,7 @@ Features that are common in production frameworks but can be independently added
 - **Guided Decoding** - JSON schema, regex, grammar-constrained generation (XGrammar, Outlines)
 
 ### Implementation Patterns (`06_implementation_patterns/`)
+
 Code-level patterns and anti-patterns observed across projects.
 
 - **Code Patterns** - Common implementation patterns that work well
@@ -65,10 +73,11 @@ Code-level patterns and anti-patterns observed across projects.
 
 ## Source Projects
 
-| Project | Role | Description |
-|---------|------|-------------|
-| nano-vllm | Positive example | ~20 files, implements PagedAttention + continuous batching for Qwen3 |
-| nano-sglang | Positive example | ~35 files, implements RadixCache + multi-process serving for Llama/Mixtral |
-| mini-sglang | Positive example | ~60 files, official SGLang team simplified version with CUDA kernels and TP |
-| vllm | Reference (complex) | 270+ models, 20+ quantization methods, 15+ attention backends. Source for production features like PD disaggregation, KV connectors |
-| sglang | Reference (complex) | 100+ models, speculative decoding, guided decoding, multimodal. Source for production features like EAGLE, XGrammar integration |
+
+| Project     | Role                | Description                                                                                                                         |
+| ----------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| nano-vllm   | Positive example    | ~20 files, implements PagedAttention + continuous batching for Qwen3                                                                |
+| nano-sglang | Positive example    | ~35 files, implements RadixCache + multi-process serving for Llama/Mixtral                                                          |
+| mini-sglang | Positive example    | ~60 files, official SGLang team simplified version with CUDA kernels and TP                                                         |
+| vllm        | Reference (complex) | 270+ models, 20+ quantization methods, 15+ attention backends. Source for production features like PD disaggregation, KV connectors |
+| sglang      | Reference (complex) | 100+ models, speculative decoding, guided decoding, multimodal. Source for production features like EAGLE, XGrammar integration     |
