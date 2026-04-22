@@ -3,6 +3,7 @@
 ## Core Problem
 
 During autoregressive generation, each token's attention requires access to all previous tokens' key and value vectors. Storing and managing this KV cache is the primary memory bottleneck of LLM inference. A model with 32 layers, 32 heads, and 128-dim head on 1000 tokens uses:
+
 ```
 2 (K+V) × 32 layers × 32 heads × 128 dim × 1000 tokens × 2 bytes (fp16) ≈ 500 MB
 ```
@@ -10,6 +11,7 @@ During autoregressive generation, each token's attention requires access to all 
 ## Three Approaches (Increasing Sophistication)
 
 ### 1. Contiguous Allocation (Naive)
+
 Each request gets a contiguous chunk of memory sized to `max_seq_len`.
 
 ```
@@ -20,6 +22,7 @@ Request B: [██████░░░░░░░░░░░░░░]  (6 to
 **Problem**: Massive internal fragmentation. A 4096-token budget wastes ~50% memory on average.
 
 ### 2. Paged Attention (nano-vllm style)
+
 Borrowed from OS virtual memory: divide KV cache into fixed-size **blocks** (pages). Each request maintains a **block table** mapping logical positions to physical blocks.
 
 ```
@@ -31,6 +34,7 @@ Free blocks: [B2, B6, B7]
 ```
 
 **Key data structures**:
+
 ```python
 class Block:
     block_id: int
@@ -53,13 +57,16 @@ class BlockManager:
 ```
 
 **Block size trade-off**:
+
 - Large blocks (256 tokens): Less metadata overhead, fewer allocations, but more internal fragmentation
 - Small blocks (16 tokens): Less fragmentation, but more metadata, more scattered memory access
 
 ### 3. Token-Level Pool with Radix Cache (nano-sglang / mini-sglang style)
+
 Allocate individual token slots from a pre-allocated pool. Combined with a Radix Tree for prefix caching.
 
 **Two-level pool**:
+
 ```python
 class ReqToTokenPool:
     """Maps (request_id, position) → physical token index"""
@@ -73,6 +80,7 @@ class TokenToKVPool:
 ```
 
 **Allocation flow**:
+
 ```
 1. Request arrives with prompt tokens [t0, t1, t2, ..., tn]
 2. Query radix cache: match_prefix([t0..tn]) → cached 0..k
@@ -84,9 +92,11 @@ class TokenToKVPool:
 ## Prefix Caching with Radix Tree
 
 ### Concept
+
 Many requests share common prefixes (system prompts, few-shot examples). A Radix Tree indexes these shared prefixes so KV data can be reused.
 
 ### Data Structure (nano-sglang)
+
 ```python
 class TreeNode:
     children: Dict[int, TreeNode]  # token_id → child
@@ -101,6 +111,7 @@ class RadixCache:
 ```
 
 ### Data Structure (mini-sglang)
+
 ```python
 class RadixTreeNode:
     _key: Tensor      # Token IDs for this edge
@@ -113,6 +124,7 @@ class RadixTreeNode:
 ### Core Operations
 
 **match_prefix(tokens)**:
+
 ```
 Walk tree from root, consuming tokens that match edges.
 Return: (matched_length, last_matching_node)
@@ -123,6 +135,7 @@ Example:
 ```
 
 **insert(tokens, cache_indices)**:
+
 ```
 After request finishes, insert its full token sequence into tree.
 If partial match at node, split the node:
@@ -133,6 +146,7 @@ If partial match at node, split the node:
 ```
 
 **evict(num_tokens)**:
+
 ```
 While need to free more tokens:
   Pop leaf node with lowest last_access_time (and ref_count == 0)
@@ -141,6 +155,7 @@ While need to free more tokens:
 ```
 
 ### Reference Counting
+
 - **Increment** when a request starts using cached tokens (during scheduling)
 - **Decrement** when the request batch finishes or is preempted
 - Nodes with `ref_count > 0` are **pinned** and cannot be evicted
@@ -148,6 +163,7 @@ While need to free more tokens:
 ## Physical KV Buffer Layout
 
 ### Per-Layer Storage (nano-sglang)
+
 ```python
 # One tensor per layer
 kv_data[layer_idx].shape = [pool_size, 2, num_heads, head_dim]
@@ -155,6 +171,7 @@ kv_data[layer_idx].shape = [pool_size, 2, num_heads, head_dim]
 ```
 
 ### Monolithic Buffer (nano-vllm / mini-sglang)
+
 ```python
 # Single large tensor
 kv_cache.shape = [2, num_layers, num_blocks, block_size, num_heads, head_dim]
@@ -163,7 +180,9 @@ kv_cache.shape = [2, num_layers, num_blocks, block_size, num_heads, head_dim]
 ```
 
 ### Writing KV Data
+
 A specialized kernel maps new tokens to their physical locations:
+
 ```python
 def store_kvcache(k, v, kv_cache, slot_mapping):
     """
@@ -204,6 +223,7 @@ def estimate_kv_cache_blocks(config, gpu_memory_utilization=0.9):
 ## Design Template
 
 For a minimal KV cache system:
+
 1. **Choose granularity**: Blocks (simpler, works with PagedAttention) or tokens (more flexible, works with FlashInfer)
 2. **Allocate pool**: One large pre-allocated tensor
 3. **Track free slots**: A stack or deque of available indices
@@ -211,6 +231,8 @@ For a minimal KV cache system:
 5. **Manage lifecycle**: Allocate on schedule, free on completion
 
 Add prefix caching only when:
+
 - Requests share common prefixes (system prompts, templates)
 - The deployment serves many similar requests
 - Memory is constrained enough that reuse matters
+
