@@ -3,6 +3,7 @@
 ## Core Responsibility
 
 The Model Runner is the bridge between the scheduler's logical decisions and the GPU's physical execution. It:
+
 1. Converts scheduled batches into GPU tensors
 2. Executes the model forward pass
 3. Samples next tokens from logits
@@ -68,6 +69,7 @@ def prepare_decode(sequences):
 ## Forward Pass Execution
 
 ### Basic Flow
+
 ```python
 def run(sequences, is_prefill):
     if is_prefill:
@@ -94,6 +96,7 @@ def run(sequences, is_prefill):
 ```
 
 ### Context Object Pattern
+
 All three frameworks use a global/thread-local context to pass batch metadata to attention layers without threading it through every model layer:
 
 ```python
@@ -120,9 +123,11 @@ class Context:
 ## CUDA Graph Capture and Replay
 
 ### Why CUDA Graphs?
+
 Decode batches have very small inputs (1 token per request) but require the same Python overhead for kernel launches. CUDA graphs pre-record the entire execution sequence and replay it in a single GPU call.
 
 ### Capture Process (nano-vllm)
+
 ```python
 def capture_cudagraph(max_batch_size):
     # Capture graphs for fixed batch sizes: 1, 2, 4, 8, 16, 32, ...
@@ -146,6 +151,7 @@ def capture_cudagraph(max_batch_size):
 ```
 
 ### Replay Process
+
 ```python
 def replay_cudagraph(batch):
     # Find smallest captured size >= actual batch size
@@ -165,6 +171,7 @@ def replay_cudagraph(batch):
 ```
 
 ### Memory Pool Sharing (mini-sglang)
+
 ```python
 # Use a shared memory pool so different batch-size graphs reuse GPU memory
 graph_pool = torch.cuda.graph_pool_handle()
@@ -174,6 +181,7 @@ for bs in batch_sizes:
 ```
 
 ### CUDA Graph Limitations
+
 - **Fixed tensor shapes**: All inputs/outputs must have the same shape as during capture
 - **No dynamic control flow**: Cannot have if/else that depends on input values
 - **Padding required**: Actual batch must be padded to a captured size
@@ -182,6 +190,7 @@ for bs in batch_sizes:
 ## Tensor Parallelism in Model Runner
 
 ### Multi-Process Coordination (nano-vllm)
+
 ```python
 # Rank 0 (main process):
 def run(seqs, is_prefill):
@@ -204,7 +213,9 @@ def worker_loop():
 ```
 
 ### Mini-sglang Approach
+
 Uses `torch.distributed` with NCCL backend. The Engine handles initialization:
+
 ```python
 def init_distributed(tp_size, rank):
     torch.distributed.init_process_group(backend='nccl')
@@ -214,7 +225,9 @@ def init_distributed(tp_size, rank):
 ## Weight Loading
 
 ### Streaming Shard Loading (mini-sglang)
+
 To minimize CPU memory usage:
+
 ```python
 def load_weights(model, model_path, tp_rank, tp_size):
     for shard_file in sorted(safetensors_files):
@@ -227,7 +240,9 @@ def load_weights(model, model_path, tp_rank, tp_size):
 ```
 
 ### Weight Loader Pattern (nano-vllm)
+
 Each parameter knows how to shard itself:
+
 ```python
 class ColumnParallelLinear:
     def __init__(self, ...):
@@ -242,12 +257,15 @@ class ColumnParallelLinear:
 ## Design Template
 
 A minimal Model Runner needs:
+
 1. **Input preparation**: Convert scheduled sequences into tensors
 2. **Context propagation**: Pass batch metadata to attention layers
 3. **Forward execution**: Run the model
 4. **Sampling**: Convert logits to tokens
 
 Optional enhancements:
+
 - CUDA graph capture/replay (significant speedup for decode, but adds complexity)
 - Overlap between GPU execution and CPU preparation
 - Shared memory for multi-rank metadata passing
+
