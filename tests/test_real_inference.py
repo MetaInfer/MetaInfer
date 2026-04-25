@@ -6,9 +6,11 @@ import torch
 from llm_engine import LLMEngine
 
 PROMPTS: list[str] = [
-    "The capital of France is",
-    "写一首关于春天的诗",
-    "用英语介绍下你自己",
+    "用一两句话介绍苏州园林的特点。",
+    "什么是张量并行？用中文简要说明。",
+    "写一句关于夏天傍晚的描写。",
+    "什么是大语言模型？",
+    "怎么做面包？",
 ]
 
 

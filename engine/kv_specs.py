@@ -18,8 +18,16 @@ def hf_deepseek_v2_kv_bytes_per_token(config: Any, dtype: torch.dtype) -> int:
     """
     layers = int(config.num_hidden_layers)
     num_heads = int(config.num_attention_heads)
-    q_head_dim = int(config.qk_nope_head_dim) + int(config.qk_rope_head_dim)
-    v_head_dim = int(config.v_head_dim)
+    if hasattr(config, "qk_nope_head_dim") and hasattr(config, "qk_rope_head_dim") and hasattr(config, "v_head_dim"):
+        q_head_dim = int(config.qk_nope_head_dim) + int(config.qk_rope_head_dim)
+        v_head_dim = int(config.v_head_dim)
+    else:
+        # Dense/GQA fallback (e.g. Qwen): materialized K/V use kv_heads * head_dim
+        kv_heads = int(getattr(config, "num_key_value_heads", num_heads))
+        head_dim = int(getattr(config, "head_dim", int(config.hidden_size) // num_heads))
+        q_head_dim = head_dim
+        v_head_dim = head_dim
+        num_heads = kv_heads
     if dtype in (torch.float16, torch.bfloat16):
         elem = 2
     elif dtype == torch.float32:

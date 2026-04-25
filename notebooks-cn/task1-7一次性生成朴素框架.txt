@@ -1,0 +1,39 @@
+请扮演“首席系统架构师”和“Agent 协作专家”。我们需要固化当前的系统设计，并为未来的代码生成 Sub-agents 编写一套严格的执行规范。
+请仔细阅读以下核心背景文档：
+1、全局任务与目标：@tasks.md
+2、知识库总览：@MEMORY.md 及其对应的 @README.md
+3、当前已实现的简易框架总结：@real_inference_framework.md
+4、当前代码目录：@engine/ 以及 @llm_engine.py
+基于以上所有上下文，请为我生成两个文件：inference_blueprint.json 和 AGENT_SKILL.md。存放在 ./curosr/skills下
+
+文件 1：inference_blueprint.json (系统规格与接口契约)
+请基于现有代码和文档，提取最精确的结构化数据，严禁使用占位符：
+1. project_context: 简述 @tasks.md 中的核心背景（解决大框架臃肿问题，做小而美的定制化）。
+2. components: 列出核心组件（Scheduler, KVMemoryPool, ModelRunner, Sampler, Sequence，LLMEngine）。对每个组件标注：
+role: 核心职责。
+ref_docs: 关联的知识库路径（如 @01_framework_design/02_scheduler.md）。
+ref_code: 参考源码路径（如 nano-vllm/nanovllm/engine/block_manager.py）。
+其中：参考文档存放在@notebooks/01_framework_design中，根据相应的知识文档在@ref_projects下查找参考源代码，写入inference_blueprint.json
+3. data_flow_contracts: (核心) 严格定义层与层、组件与组件交接时的 Tensor 规格。
+还要必须包含 DeepSeek V2 MLA 降维 KV 维度与物理块索引对接的 Shape、Dtype、Device 要求。
+4. logic_constraints: 重点记录当前实现的具体约束。
+
+文件 2：AGENT_SKILL.md (Sub-agents 执行 SOP)
+这是一个写给未来 AI Agent 看的操作手册。请以命令式的语气，指导 Agent 如何读取上述 JSON 并执行闭环开发：
+1. 执行铁律 (Prime Directives):
+• 在当前meta-infer下新建agents-infer,将生成文件写入这里
+• 必须遵循 TDD（测试驱动开发），先写测试再写实现。
+• 必须随时读取 inference_blueprint.json 校对 Tensor 形状，禁止脑补。
+2. 开发工作流 (Workflow):
+• Step 1: 契约对齐: 每次开发新组件前，解析 JSON 中的 data_flow_contracts。
+• Step 2: 参考溯源: 使用 Bash 子智能体查阅 JSON 中指定的 ref_code（如 nano-vllm 或 mini-sglang）的实现逻辑。
+• Step 3: 编写与测试: 生成代码并立即调用 pytest。
+• Step 4：即时单测：每写完/改完一个组件，必须立即生成运行对应的tests/下的单测。测试不通，禁止接合：如果当前组件的单测未 100% 通过，严禁修改其他组件或进行整体串联
+3. 错误排查指南 (Troubleshooting):
+• 如果遇到 Shape mismatch，要求 Agent 回退查看真实模型的 config.json 或本框架的 JSON 契约。
+• 如果遇到 OOM (Out of Memory)，要求 Agent 检查 KVMemoryPool 的动态分配逻辑。
+• 如果遗忘，或者有多次无法解决的bug，阅读知识库总览：@MEMORY.md 及其对应的 @README.md 及inference_blueprint.json中对应组件的ref_docs ref_code
+4. 任务完成定义 (Definition of Done):
+• 任务只有在成功运行 python -m pytest tests/test_real_inference.py 且在终端捕获到真实的 16B 模型文本输出（如对“The capital of France is”的正确回答）后，才算真正完成。
+5. 人机协作与 Debug:
+•日志留存：Agent 必须在生成框架中保留详尽的 print 日志（包含 Tensor Shape、KV Cache 命中率、调度延迟等），以便人工在任务结束后进行二次核验。
