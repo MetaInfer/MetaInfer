@@ -11,6 +11,7 @@ from llm_engine import LLMEngine
 from engine.models.qwen import can_load_qwen_weights
 from engine.tp_layers.distributed import get_tp_rank, get_tp_size
 
+# torchrun --nproc_per_node=4 -m pytest tests/test_qwen_tp_real.py -q -s
 QWEN_06B = Path("/data/xinference/cache/Qwen3-0.6B")
 QWEN_8B = Path("/data/xinference/cache/Qwen3-8B")
 PROMPTS_ZH = [

@@ -20,8 +20,9 @@ from engine.scheduler import Scheduler
 from engine.structs import Sequence, SequenceStatus
 
 
-MODEL_DIR = Path("/data/xinference/cache/deepseek-v2-chat-pytorch-16b")
-# MODEL_DIR = Path("/data/xinference/cache/Qwen3-8B")
+MODEL_DIR = Path(
+    os.environ.get("META_INFER_MODEL_DIR", "/data/xinference/cache/Qwen3-8B")
+)
 
 
 def _is_rank0() -> bool:
@@ -33,6 +34,28 @@ def _is_rank0() -> bool:
 def _should_log() -> bool:
     rank0_only = os.environ.get("META_INFER_LOG_RANK0_ONLY", "0") == "1"
     return (not rank0_only) or _is_rank0()
+
+
+def _get_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
+def _log_rank_cuda_memory(stage: str) -> None:
+    """Print per-rank CUDA memory stats for quick TP device binding checks."""
+    if not torch.cuda.is_available():
+        return
+    rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
+    local_rank = _get_local_rank()
+    dev_idx = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(dev_idx) / 1024**3
+    reserved = torch.cuda.memory_reserved(dev_idx) / 1024**3
+    max_allocated = torch.cuda.max_memory_allocated(dev_idx) / 1024**3
+    print(
+        "[LLMEngine][mem] "
+        f"stage={stage} rank={rank} local_rank={local_rank} "
+        f"device=cuda:{dev_idx} allocated_gb={allocated:.2f} "
+        f"reserved_gb={reserved:.2f} max_allocated_gb={max_allocated:.2f}"
+    )
 
 
 def _read_primary_arch(model_dir: Path) -> str:
@@ -176,7 +199,9 @@ class LLMEngine:
         self._gen_step: int = 0
 
         if torch.cuda.is_available():
-            self.device = torch.device("cuda")
+            local_rank = _get_local_rank()
+            torch.cuda.set_device(local_rank)
+            self.device = torch.device(f"cuda:{local_rank}")
             self.dtype = torch.bfloat16
         else:
             self.device = torch.device("cpu")
@@ -194,6 +219,11 @@ class LLMEngine:
                 f"[LLMEngine] device={self.device}, dtype={self.dtype}, "
                 f"backend={inference_backend}"
                 + (f" -> {resolved_backend}" if inference_backend == "tp" else "")
+                + (
+                    f", local_rank={_get_local_rank()}, cuda_current_device={torch.cuda.current_device()}"
+                    if self.device.type == "cuda"
+                    else ""
+                )
             )
 
         self.inference_backend: Literal["hf", "tp", "qwen_tp", "deepseek_tp"] = inference_backend
@@ -210,6 +240,7 @@ class LLMEngine:
         else:
             self.runner = RealModelRunner(self.model_dir, self.device, self.dtype)
         self.eos_token_id = self.runner.tokenizer.eos_token_id
+        _log_rank_cuda_memory("after_model_load")
 
         num_blocks = self._estimate_kv_blocks()
         if _should_log():
@@ -222,6 +253,7 @@ class LLMEngine:
             device=self.device,
             reserve_physical_kv=True,
         )
+        _log_rank_cuda_memory("after_kv_pool_init")
         self.scheduler = Scheduler(
             memory_pool=self.memory_pool,
             max_num_seqs=max_num_seqs,

@@ -14,8 +14,20 @@ from engine.tp_layers.distributed import get_tp_rank, get_tp_size
 
 # 项目根 meta-infer；完整 torchrun+pytest 输出请: bash run_test_deepseek_tp.sh
 # 或: torchrun ... 2>&1 | tee "$PWD/torchrun_test_deepseek_tp.log"
+# torchrun --nproc_per_node=4 -m pytest tests/test_deepseek_tp_real.py -q -s
+# CUDA_VISIBLE_DEVICES=6,7
+
 _META_INFER_ROOT = Path(__file__).resolve().parent.parent
-MODEL_DIR = Path("/data/xinference/cache/deepseek-v2-chat-pytorch-16b")
+# 优先使用外部传入路径，避免目录迁移后测试被静默 skip。
+MODEL_DIR = Path(
+    os.environ.get(
+        "TEST_MODEL_DIR",
+        os.environ.get(
+            "META_INFER_MODEL_DIR",
+            "/home/honglin/models/deepseek-ai/DeepSeek-V2-Lite-Chat",
+        ),
+    )
+)
 PROMPTS_ZH = [
     "用一两句话介绍苏州园林的特点。",
     "什么是张量并行？用中文简要说明。",

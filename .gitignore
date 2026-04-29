@@ -1,2 +1,6 @@
-.nfs*
-notebooks-cn/prompt.txt
+__pycache__/
+*.pyc
+*.log
+*.json
+*.txt
+*.out
