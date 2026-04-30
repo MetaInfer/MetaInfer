@@ -1,0 +1,834 @@
+{
+  "metadata": {
+    "name": "meta-infer TP/EP Inference Blueprint",
+    "version": "2.3.0",
+    "last_updated": "2026-04-30",
+    "scope": "Framework + Qwen3 TP + DeepSeek-V2 TP/EP",
+    "purpose": "给 Agent 提供可直接执行的推理框架搭建知识与 TP 适配约束。"
+  },
+  "agent_navigation": {
+    "how_to_find_tp_knowledge": "Qwen 与 DeepSeek-V2 的并行与层间契约分两处：routing/算子语义在 model_layer.architecture_knowledge_base；具体 shape 在 framework_layer.data_flow_contracts.tp_layer_interface_contracts。实现代码入口见各 source_impl / impl_code 字段。",
+    "qwen3_dense_tp": {
+      "json_paths": [
+        "model_layer.architecture_knowledge_base.qwen_series_dense",
+        "framework_layer.data_flow_contracts.tp_layer_interface_contracts.qwen3_tp_model_interfaces"
+      ],
+      "impl_entrypoints": [
+        "engine/models/qwen.py",
+        "engine/tp_layers/linear.py",
+        "engine/tp_layers/embedding.py",
+        "llm_engine.py (inference_backend 路由)"
+      ]
+    },
+    "deepseek_v2_mla_moe_tp": {
+      "json_paths": [
+        "model_layer.architecture_knowledge_base.deepseek_v2_v3_mla_moe",
+        "model_layer.lazy_loader_synthesis_rules.deepseek_mla_moe_loader",
+        "framework_layer.data_flow_contracts.tp_layer_interface_contracts.deepseek_v2_tp_model_interfaces",
+        "framework_layer.data_flow_contracts.tp_layer_interface_contracts.deepseek_v2_mla_kv_contract"
+      ],
+      "impl_entrypoints": [
+        "engine/models/deepseek_v2.py",
+        "engine/tp_layers/moe.py",
+        "engine/tp_layers/linear.py",
+        "engine/tp_layers/embedding.py",
+        "llm_engine.py (inference_backend 路由)"
+      ]
+    },
+    "execution_policy": {
+      "single_agent_only": true,
+      "monitor_subagent_exception": "允许 1 个只读监控子代理，仅采集 HCU/VRAM 指标，不得改代码。",
+      "note": "禁止并行 subagents 改同一套文件；长任务分 phase 执行，默认目标是一次会话完成 phase_1~phase_5（见 AGENT_SKILL.md）。"
+    }
+  },
+  "framework_layer": {
+    "project_context": {
+      "problem_statement": "成熟推理框架过于臃肿，包含大量多模型、多部署、多策略动态分派，降低可维护性与性能。",
+      "goal": "先搭建最小可用推理框架组件，再完成 Qwen3 与 DeepSeek-V2 的 TP 推理闭环。"
+    },
+    "components": [
+      {
+        "name": "Scheduler",
+        "role": "执行 prefill/decode 连续批调度；prefill 优先；资源不足时只排队不抢占；在 postprocess 中推进状态并触发 token 级块扩展。",
+        "ref_docs": [
+          "notebooks/01_framework_design/02_scheduler.md",
+          "notebooks/01_framework_design/07_request_lifecycle.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/scheduler.py"
+        ],
+        "impl_code": [
+          "engine/scheduler.py"
+        ]
+      },
+      {
+        "name": "KVMemoryPool",
+        "role": "管理 KV 逻辑块容量、块分配/释放与可扩展性检查；基于模型配置估算 KV 字节预算；提供可选 GPU KV 占位张量。",
+        "ref_docs": [
+          "notebooks/01_framework_design/03_kv_cache.md",
+          "notebooks/01_framework_design/06_memory_pool.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/block_manager.py",
+          "ref_projects/nano-vllm/nanovllm/engine/model_runner.py"
+        ],
+        "impl_code": [
+          "engine/memory_pool.py",
+          "engine/kv_specs.py"
+        ]
+      },
+      {
+        "name": "BlockManager",
+        "role": "分页块分配器；维护 free/used block 集合；通过链式哈希执行 prefix caching 与 ref_count 共享；支持 may_append 增量扩展。",
+        "ref_docs": [
+          "notebooks/01_framework_design/03_kv_cache.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/block_manager.py"
+        ],
+        "impl_code": [
+          "engine/block_manager.py"
+        ]
+      },
+      {
+        "name": "ModelRunner",
+        "role": "加载 tokenizer 与模型 Runner；执行 prefill/decode 前向并调用采样器输出 next token。",
+        "ref_docs": [
+          "notebooks/01_framework_design/04_model_runner.md",
+          "notebooks/01_framework_design/07_request_lifecycle.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/model_runner.py"
+        ],
+        "impl_code": [
+          "llm_engine.py::RealModelRunner",
+          "engine/models/qwen.py::QwenTPModelRunner",
+          "engine/models/deepseek_v2.py::DeepseekTPModelRunner"
+        ]
+      },
+      {
+        "name": "Sampler",
+        "role": "根据 temperature/top_p 执行 greedy 或随机采样，将 logits 转换为 token ids。",
+        "ref_docs": [
+          "notebooks/01_framework_design/05_sampler.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/layers/sampler.py"
+        ],
+        "impl_code": [
+          "engine/sampler.py"
+        ]
+      },
+      {
+        "name": "Sequence",
+        "role": "请求级状态容器：维护 input/output token、block_table、缓存 token 计数、状态机转移与分块视图。",
+        "ref_docs": [
+          "notebooks/01_framework_design/01_architecture.md",
+          "notebooks/01_framework_design/07_request_lifecycle.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/sequence.py"
+        ],
+        "impl_code": [
+          "engine/structs.py"
+        ]
+      },
+      {
+        "name": "LLMEngine",
+        "role": "系统编排器：初始化 Runner/MemoryPool/Scheduler，驱动 while-loop 或 step-loop 直到所有序列完成并解码文本。",
+        "ref_docs": [
+          "notebooks/01_framework_design/01_architecture.md",
+          "notebooks/01_framework_design/07_request_lifecycle.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/llm_engine.py"
+        ],
+        "impl_code": [
+          "llm_engine.py::LLMEngine"
+        ]
+      }
+    ],
+    "data_flow_contracts": {
+    "request_level": {
+      "sequence_fields": {
+        "input_ids": "list[int]",
+        "output_ids": "list[int]",
+        "token_ids": "input_ids + output_ids",
+        "block_table": "list[int]",
+        "num_cached_tokens": "int",
+        "status": "WAITING|RUNNING_PREFILL|RUNNING_DECODE|FINISHED"
+      },
+      "status_transitions": [
+        "WAITING -> RUNNING_PREFILL",
+        "RUNNING_PREFILL -> RUNNING_DECODE",
+        "RUNNING_DECODE -> FINISHED"
+      ]
+    },
+    "scheduler_to_runner": {
+      "batch_type": "list[Sequence]",
+      "prefill_trigger": "schedule() 优先从 waiting 组 batch；必须满足 max_num_batched_tokens 与 can_allocate",
+      "decode_trigger": "waiting 无可调度项时，从 running 中选择 can_append_one_more 的序列",
+      "preemption_policy": "disabled; 资源不足时不抢占，只等待"
+    },
+    "runner_prefill_tensors": {
+      "input_ids": {
+        "shape": "[1, L_prompt] per sequence",
+        "dtype": "torch.int64",
+        "device": "cuda"
+      },
+      "forward_call": "model(input_ids=ids, use_cache=False, return_dict=True)",
+      "logits_shape": "[1, L_prompt, vocab_size]",
+      "sampling_input": {
+        "shape": "[1, vocab_size]",
+        "source": "logits[0, -1, :].unsqueeze(0)"
+      },
+      "sampling_output": {
+        "shape": "[1]",
+        "dtype": "torch.int64"
+      }
+    },
+    "runner_decode_tensors": {
+      "input_ids": {
+        "shape": "[B, L_max] (left padding)",
+        "dtype": "torch.int64",
+        "device": "cuda"
+      },
+      "attention_mask": {
+        "shape": "[B, L_max]",
+        "dtype": "torch.int64",
+        "device": "cuda",
+        "rule": "pad=0, valid_token=1"
+      },
+      "forward_call": "model(input_ids=ids, attention_mask=m, use_cache=False, return_dict=True)",
+      "logits_shape": "[B, L_max, vocab_size]",
+      "sampling_input": {
+        "shape": "[B, vocab_size]",
+        "source": "logits[:, -1, :]"
+      },
+      "sampling_output": {
+        "shape": "[B]",
+        "dtype": "torch.int64"
+      }
+    },
+    "tp_layer_interface_contracts": {
+      "tp_distributed_runtime": {
+        "source_impl": [
+          "engine/tp_layers/distributed.py"
+        ],
+        "rank_size_contract": {
+          "tp_rank": "dist.get_rank() or env RANK",
+          "tp_size": "dist.get_world_size() or env WORLD_SIZE"
+        },
+        "collectives": {
+          "all_reduce_sum": "输入输出同 shape；fp16/bf16 先转 fp32 归约再 cast 回",
+          "all_gather_last_dim": "输入 [..., local_dim] -> 输出 [..., local_dim * tp_size]"
+        }
+      },
+      "tp_embedding_and_lm_head": {
+        "source_impl": [
+          "engine/tp_layers/embedding.py"
+        ],
+        "vocab_parallel_embedding": {
+          "input_ids": "[B, T] int64",
+          "local_weight": "[vocab_size/tp, hidden_size]",
+          "local_embedding": "[B, T, hidden_size] (masked local vocab)",
+          "output_after_all_reduce": "[B, T, hidden_size]"
+        },
+        "parallel_lm_head": {
+          "input_hidden": "[B, T, hidden_size]",
+          "local_logits": "[B, T, vocab_size/tp]",
+          "output_logits_gather": "[B, T, vocab_size]"
+        }
+      },
+      "tp_linear_layers": {
+        "source_impl": [
+          "engine/tp_layers/linear.py"
+        ],
+        "column_parallel_linear": {
+          "weight_shape": "[out/tp, in]",
+          "input": "[B, T, in]",
+          "output_no_gather": "[B, T, out/tp]",
+          "output_with_gather": "[B, T, out]"
+        },
+        "row_parallel_linear": {
+          "weight_shape": "[out, in/tp]",
+          "input": "[B, T, in/tp]",
+          "partial_output": "[B, T, out]",
+          "output_after_all_reduce": "[B, T, out]"
+        }
+      },
+      "qwen3_tp_model_interfaces": {
+        "source_impl": [
+          "engine/models/qwen.py"
+        ],
+        "decoder_input_hidden": "[B, T, hidden_size]",
+        "attention": {
+          "q_local": "[B, T, num_heads/tp, head_dim]",
+          "k_local": "[B, T, num_kv_heads_local, head_dim]",
+          "v_local": "[B, T, num_kv_heads_local, head_dim]",
+          "attn_out_local": "[B, T, num_heads/tp * head_dim]",
+          "attn_out_projected": "[B, T, hidden_size]"
+        },
+        "mlp": {
+          "gate_local": "[B, T, intermediate_size/tp]",
+          "up_local": "[B, T, intermediate_size/tp]",
+          "ffn_down_out": "[B, T, hidden_size]"
+        },
+        "model_output": "[B, T, vocab_size]"
+      },
+      "deepseek_v2_tp_model_interfaces": {
+        "source_impl": [
+          "engine/models/deepseek_v2.py",
+          "engine/tp_layers/moe.py"
+        ],
+        "decoder_input_hidden": "[B, T, hidden_size]",
+        "mla_attention": {
+          "q_a_proj_out_replicated": "[B, T, q_lora_rank] or skip when q_lora_rank is None",
+          "q_b_local": "[B, T, num_heads/tp, qk_nope_head_dim + qk_rope_head_dim]",
+          "kv_a_latent_replicated": "[B, T, kv_lora_rank]",
+          "k_pe_replicated": "[B, T, qk_rope_head_dim]",
+          "kv_b_local": "[B, T, num_heads/tp, qk_nope_head_dim + v_head_dim]",
+          "attn_out_local": "[B, T, num_heads/tp * v_head_dim]",
+          "attn_out_projected": "[B, T, hidden_size]"
+        },
+        "dense_mlp": {
+          "gate_local": "[B, T, intermediate_size/tp]",
+          "up_local": "[B, T, intermediate_size/tp]",
+          "down_out": "[B, T, hidden_size]"
+        },
+        "moe_mlp": {
+          "router_logits_replicated": "[B*T, n_routed_experts]",
+          "topk_idx": "[B*T, top_k]",
+          "topk_weight": "[B*T, top_k]",
+          "local_expert_out_flat": "[B*T, hidden_size]",
+          "global_expert_out_after_all_reduce": "[B*T, hidden_size]",
+          "shared_experts_out": "[B, T, hidden_size] (if n_shared_experts > 0)",
+          "moe_final_out": "[B, T, hidden_size]"
+        },
+        "model_output": "[B, T, vocab_size]"
+      },
+      "deepseek_v2_mla_kv_contract": {
+        "config_dims": {
+          "kv_lora_rank": 512,
+          "qk_nope_head_dim": 128,
+          "qk_rope_head_dim": 64,
+          "q_head_dim": 192,
+          "v_head_dim": 128,
+          "num_attention_heads": 16,
+          "num_hidden_layers": 27
+        },
+        "hf_materialized_kv_shapes_per_layer": {
+          "key_states": "[batch, num_heads, q_len, q_head_dim] -> [batch, 16, q_len, 192]",
+          "value_states": "[batch, num_heads, q_len, v_head_dim] -> [batch, 16, q_len, 128]"
+        },
+        "logical_kv_bytes": {
+          "formula": "num_layers * num_heads * (q_head_dim + v_head_dim) * dtype_bytes",
+          "dtype_bfloat16_bytes_per_token": 276480,
+          "bytes_per_block_block_size_16": 4423680
+        },
+        "physical_block_indexing": {
+          "token_to_block": "block_index = token_pos // block_size",
+          "token_offset": "offset = token_pos % block_size",
+          "slot_id": "slot_id = block_table[block_index] * block_size + offset",
+          "block_table_dtype": "python list[int] (若转 tensor 用 int32)"
+        },
+        "device_dtype_requirements": {
+          "runner_inputs": "int64 on cuda",
+          "model_weights": "bfloat16 on cuda",
+          "kv_placeholder": "bfloat16 on cuda",
+          "sampler_logits_compute": "logits.float() before temperature/top_p"
+        }
+      }
+    }
+    },
+    "todo_generation_playbook": {
+      "phase_order": [
+        "phase_1_framework_components",
+        "phase_2_tp_runtime_plumbing",
+        "phase_3_qwen3_tp_adaptation",
+        "phase_4_deepseek_v2_tp_ep_adaptation",
+        "phase_5_realtime_acceptance"
+      ],
+      "phase_1_framework_components": {
+        "implementation_todos": [
+          "实现/验证 Sequence, Sampler, BlockManager",
+          "实现/验证 KVMemoryPool, Scheduler",
+          "实现 LLMEngine 基础 generate/step 闭环"
+        ],
+        "minimal_test_commands": [
+          "python -m pytest tests/test_scheduler.py -q",
+          "python -m pytest tests/test_sequence.py -q",
+          "python -m pytest tests/test_sampler.py -q",
+          "python -m pytest tests/test_model_runner.py -q",
+          "python -m pytest tests/test_block_manager.py -q",
+          "python -m pytest tests/test_memory_pool.py -q"
+        ],
+        "failure_fallback_strategy": [
+          "若 E2E 失败，先回退到单组件测试并只改当前组件。",
+          "优先检查 shape/device/status 转移是否符合 data_flow_contracts。",
+          "确认 Scheduler 的 prefill/decode 切换与 BlockManager 扩容行为。"
+        ],
+        "done_criteria": [
+          "框架基础单测全部通过。",
+          "LLMEngine 的 step-loop 不出现死循环或空批次异常。"
+        ]
+      },
+      "phase_2_tp_runtime_plumbing": {
+        "implementation_todos": [
+          "实现 distributed 初始化与 collectives",
+          "实现 embedding/linear 的 TP 算子与权重加载契约",
+          "修复 load_weight_shard 的双重切片风险"
+        ],
+        "minimal_test_commands": [
+          "python -m pytest tests/test_tp_layers.py -q",
+          "python -m pytest tests/test_kv_specs.py -q"
+        ],
+        "failure_fallback_strategy": [
+          "通信异常时先以 WORLD_SIZE=1 验证算子数学正确性。",
+          "shape 不一致时先检查 Column/RowParallel 的 local 维度公式。",
+          "若权重异常，先检查传入 full_weight 是否已是本 rank shard。"
+        ],
+        "done_criteria": [
+          "TP 基础层单测通过（embedding/linear/distributed）。",
+          "在 tp_size>1 下不出现 rank 间 shape 或 collective 错误。"
+        ]
+      },
+      "phase_3_qwen3_tp_adaptation": {
+        "implementation_todos": [
+          "实现 QwenTPModelRunner + load_weights",
+          "对齐 Qwen3 的 RoPE 风格（Neox half-half）与 RMSNorm 精度路径",
+          "完成 qwen_tp 实时回归测试"
+        ],
+        "minimal_test_commands": [
+          "torchrun --nproc_per_node=4 -m pytest tests/test_qwen_tp_real.py -v -s"
+        ],
+        "failure_fallback_strategy": [
+          "输出退化时优先检查 RoPE rotate_half 风格是否与 Qwen3 一致。",
+          "先做首 token logits 对比，再做全文本对比。",
+          "若显存紧张，先缩短 prompt 与 max_new_tokens 做快速回归。"
+        ],
+        "done_criteria": [
+          "Qwen3-8B 在 4 卡 TP 下输出可读文本。",
+          "测试日志中不存在关键 shape/device 断裂。"
+        ]
+      },
+      "phase_4_deepseek_v2_tp_ep_adaptation": {
+        "implementation_todos": [
+          "实现 MLA TP 切分（q_a/kv_a replicated, q_b/kv_b/o sharded）",
+          "实现 MoE 路由专家 EP + all_reduce 汇聚",
+          "实现 safetensors 惰性加载（专家按本地 id 稀疏读取）",
+          "补齐 YaRN scaling 与 routed 概率归一化逻辑"
+        ],
+        "minimal_test_commands": [
+          "torchrun --nproc_per_node=4 -m pytest tests/test_deepseek_tp_real.py -v -s"
+        ],
+        "failure_fallback_strategy": [
+          "乱码先做逐层定位，优先查 RoPE/scale，再查 MoE 路由与 all_reduce。",
+          "加载异常先核对 must_full_read 与 tp_slice_read 的边界。",
+          "OOM 时检查是否误读全量 routed experts 或 HF 模型误上 GPU。"
+        ],
+        "done_criteria": [
+          "DeepSeek-V2 在 4 卡 TP/EP 下输出可读文本。",
+          "不读取全量 routed experts，惰性加载符合本地专家约束。"
+        ]
+      },
+      "phase_5_realtime_acceptance": {
+        "implementation_todos": [
+          "串行执行 qwen 与 deepseek 的真实 TP 回归",
+          "记录模型输出、耗时、关键探针日志",
+          "沉淀失败模式到蓝图知识库"
+        ],
+        "minimal_test_commands": [
+          "torchrun --nproc_per_node=4 -m pytest tests/test_qwen_tp_real.py -v -s",
+          "torchrun --nproc_per_node=4 -m pytest tests/test_deepseek_tp_real.py -v -s"
+        ],
+        "failure_fallback_strategy": [
+          "若任一模型失败，回退到对应 phase（3 或 4）单模型修复后再重跑整体验收。",
+          "优先保证 temperature=0.0 的可读稳定输出，再做性能优化。"
+        ],
+        "done_criteria": [
+          "Qwen3-8B 与 DeepSeek-V2 均在 4 卡 TP 下通过真实 prompt 生成。",
+          "终端出现可读文本输出，且未出现致命异常。"
+        ]
+      }
+    }
+  },
+  "model_layer": {
+    "architecture_knowledge_base": {
+    "global_primitives_constraints": {
+      "rmsnorm_precision_law": {
+        "directive": "RMSNorm 在 fp16/bf16 下计算方差前必须先转 float32，归一化后再 cast 回输入 dtype。",
+        "reference_pattern": "x_fp32 = x.float(); var = x_fp32.pow(2).mean(-1, keepdim=True); out = (x_fp32 * rsqrt(var + eps) * weight).to(x.dtype)",
+        "why": "避免半精度方差计算溢出与 logits 漂移。",
+        "source_refs": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md"
+        ]
+      },
+      "tp_linear_load_no_double_shard": {
+        "directive": "ColumnParallelLinear/RowParallelLinear 的 load_weight_shard 必须先做形状拦截。",
+        "hard_rule": [
+          "若传入权重 shape == self.weight.shape，则直接 copy_。",
+          "仅当传入权重是全量张量时，才可按 tp_rank 执行切片。"
+        ],
+        "why": "磁盘惰性加载（safe_open.get_slice）常已预切分；再次切分会导致双重切片和权重错乱。",
+        "source_refs": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+        ]
+      },
+      "hf_baseline_test_oom_guard": {
+        "directive": "torchrun 多进程对齐测试时，HF 基准模型严禁 .to(device) 常驻 GPU。",
+        "hard_rule": [
+          "HF 模型保持 CPU 驻留。",
+          "仅在 forward 时将 input_ids/attention_mask 放到目标设备。",
+          "必要时调用 torch.cuda.empty_cache() 清理碎片。"
+        ],
+        "why": "避免 N 进程重复占用全量显存导致 OOM。",
+        "source_refs": [
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ]
+      },
+      "debug_evidence_before_guessing": {
+        "directive": "先做证据链，再推断根因。",
+        "mandatory_checks": [
+          "多 rank logits diff（max/mean/top1）",
+          "shape/device 打点",
+          "NaN/Inf 健康检查"
+        ],
+        "source_refs": [
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ]
+      }
+    },
+    "qwen_series_dense": {
+      "source_refs": [
+        "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md",
+        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md"
+      ],
+      "architectures": [
+        "Qwen2ForCausalLM",
+        "Qwen3ForCausalLM",
+        "Qwen2VLForCausalLM",
+        "Qwen2_5_VLForCausalLM"
+      ],
+      "classification": {
+        "family": "Dense",
+        "attention_type": "Standard MHA/GQA",
+        "ffn_type": "Dense MLP"
+      },
+      "attention_routing": {
+        "qkv": {
+          "parallel": "ColumnParallelLinear",
+          "split_dim": 0
+        },
+        "o_proj": {
+          "parallel": "RowParallelLinear",
+          "split_dim": 1
+        }
+      },
+      "mlp_routing": {
+        "gate_proj": {
+          "parallel": "ColumnParallelLinear",
+          "split_dim": 0
+        },
+        "up_proj": {
+          "parallel": "ColumnParallelLinear",
+          "split_dim": 0
+        },
+        "down_proj": {
+          "parallel": "RowParallelLinear",
+          "split_dim": 1
+        }
+      },
+      "rope_routing": {
+        "style": "Neox half-half rotate",
+        "hard_rule": "严禁使用 GPT-J 奇偶交错 rotate，Qwen 系列必须使用前后分半 rotate_half。",
+        "risk_if_violated": "常见表现为短句重复、局部复读、退化输出。",
+        "source_refs": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md"
+        ]
+      }
+    },
+    "deepseek_v2_v3_mla_moe": {
+      "source_refs": [
+        "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+        "notebooks-cn/04_parallel_strategies/04_vllm_tp4_deepseekv2_index.md",
+        "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+      ],
+      "architectures": [
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM"
+      ],
+      "classification": {
+        "family": "MLA + MoE",
+        "attention_type": "Decoupled RoPE MLA",
+        "ffn_type": "Hybrid Dense + MoE"
+      },
+      "attention_routing_mla": {
+        "replicated_must_not_shard": [
+          "q_a_proj",
+          "kv_a_proj_with_mqa"
+        ],
+        "tp_sharded": {
+          "q_b_proj": {
+            "parallel": "ColumnParallelLinear",
+            "split_dim": 0,
+            "note": "按 num_heads * head_dim 列切"
+          },
+          "kv_b_proj_with_mqa": {
+            "parallel": "ColumnParallelLinear",
+            "split_dim": 0,
+            "note": "按头维输出列切"
+          },
+          "o_proj": {
+            "parallel": "RowParallelLinear",
+            "split_dim": 1
+          }
+        },
+        "source_refs": [
+          "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+        ]
+      },
+      "yarn_rope_scaling_patch": {
+        "required": true,
+        "hard_rule": [
+          "Attention scaling 不仅是 dim ** -0.5。",
+          "当 rope_scaling.type == yarn 时，必须乘上 YaRN mscale 的平方修正。"
+        ],
+        "risk_if_violated": "注意力失焦，输出乱码或异常退化。",
+        "source_refs": [
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
+        ]
+      },
+      "moe_routing_hybrid_parallel": {
+        "shared_experts": {
+          "strategy": "TP",
+          "rule": "作为 Dense MLP 处理：gate/up 列切，down 行切。"
+        },
+        "routed_experts": {
+          "strategy": "Simplified EP via AllReduce",
+          "router_gate": "全卡复制（Replicated）",
+          "expert_instantiation": "各 rank 仅实例化 local_expert_ids",
+          "aggregation": "本地专家输出加权求和后做 dist.all_reduce_sum"
+        },
+        "source_refs": [
+          "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+        ]
+      },
+      "routed_probability_patch": {
+        "config_key": "norm_topk_prob",
+        "hard_rule": "若开启 norm_topk_prob，top-k 路由权重必须除以权重和做重归一化。",
+        "risk_if_violated": "FFN 信号衰减，语义能力显著下降。",
+        "source_refs": [
+          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
+        ]
+      }
+    },
+    "lazy_loader_synthesis_rules": {
+      "backend": "safetensors.safe_open",
+      "source_refs": [
+        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+        "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+      ],
+      "generic_strategy": [
+        "优先读取 model.safetensors.index.json 的 weight_map 定位分片文件。",
+        "仅在需要分片时调用 get_slice，避免整张量读入。",
+        "严格区分 replicated 权重与 tp/ep 分片权重。"
+      ],
+      "qwen_dense_loader": {
+        "split_dim_0": [
+          "q_proj",
+          "k_proj",
+          "v_proj",
+          "gate_proj",
+          "up_proj"
+        ],
+        "split_dim_1": [
+          "o_proj",
+          "down_proj"
+        ]
+      },
+      "deepseek_mla_moe_loader": {
+        "must_full_read": [
+          "q_a_proj",
+          "kv_a_proj_with_mqa"
+        ],
+        "tp_slice_read": [
+          "q_b_proj",
+          "kv_b_proj_with_mqa",
+          "o_proj",
+          "shared_experts.gate_proj",
+          "shared_experts.up_proj",
+          "shared_experts.down_proj"
+        ],
+        "ep_sparse_read": "遍历本 rank 的 local experts，仅加载对应 expert_id 的 gate/up/down，不得读取全量 routed experts。"
+      }
+    },
+    "engine_routing_contract": {
+      "entrypoint": "LLMEngine/RealModelRunner",
+      "source_refs": [
+        "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+      ],
+      "hard_rule": [
+        "必须读取 model_dir/config.json。",
+        "必须解析 architectures[0] 并路由到对应 TP Runner。",
+        "禁止将 RealModelRunner 固定绑定到单一模型 Runner。"
+      ],
+      "routing_table": {
+        "Qwen2ForCausalLM": "QwenTPModelRunner",
+        "Qwen3ForCausalLM": "QwenTPModelRunner",
+        "Qwen2VLForCausalLM": "QwenTPModelRunner",
+        "Qwen2_5_VLForCausalLM": "QwenTPModelRunner",
+        "DeepseekV2ForCausalLM": "DeepseekTPModelRunner",
+        "DeepseekV3ForCausalLM": "DeepseekTPModelRunner"
+      }
+    },
+    "alignment_and_validation_contracts": {
+      "source_refs": [
+        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+        "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+      ],
+      "realtime_tp_test_style": {
+        "required_pattern": [
+          "LLMEngine(model_dir, inference_backend='tp')",
+          "批量 add prompt 到调度器",
+          "while eng.has_unfinished_requests(): eng.step()",
+          "输出 eng.get_generation_outputs()"
+        ],
+        "forbidden_pattern": [
+          "在真实 TP 回归测试中依赖 AutoModelForCausalLM.from_pretrained 喂权重",
+          "把端到端验证完全退化成 HF-debug 广播路径"
+        ]
+      },
+      "numeric_alignment": {
+        "greedy_required": "temperature=0.0",
+        "recommended_checks": [
+          "首 token logits diff",
+          "多 prompt 文本稳定性复跑",
+          "分层 hidden diff 定位首个发散层"
+        ]
+      }
+    },
+    "failure_mode_library": {
+      "double_shard_weight_bug": {
+        "symptom": "模型能跑但文本高度异常，或部分层权重 shape 不匹配。",
+        "check": "确认 load_weight_shard 是否对已切片权重再次按 rank 切片。",
+        "fix": "加 shape 拦截，local shard 直接 copy。",
+        "source_refs": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+        ]
+      },
+      "rope_style_mismatch": {
+        "symptom": "短句重复、复读机、中文退化。",
+        "check": "确认目标模型需要 Neox 还是 GPT-J rotate。",
+        "fix": "按模型族切换 rotate_half 风格并对齐 cos/sin 展布。",
+        "source_refs": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ]
+      },
+      "missing_yarn_scaling": {
+        "symptom": "DeepSeek 输出焦散、语义漂移。",
+        "check": "确认 rope_scaling.type == yarn 时是否做 mscale 与 attention scaling 修正。",
+        "fix": "补齐 YaRN 频率与缩放补丁。",
+        "source_refs": [
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
+        ]
+      },
+      "hf_multirank_oom": {
+        "symptom": "torchrun 多进程测试显存瞬时打满。",
+        "check": "HF baseline 是否被每个 rank .to(cuda)。",
+        "fix": "HF 模型留 CPU，只搬输入，必要时 empty_cache。",
+        "source_refs": [
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ]
+      }
+    },
+    "knowledge_source_index": {
+      "global_primitives_constraints": [
+        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+      ],
+      "qwen_series_dense": [
+        "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md",
+        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md"
+      ],
+      "deepseek_v2_v3_mla_moe": [
+        "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+        "notebooks-cn/04_parallel_strategies/04_vllm_tp4_deepseekv2_index.md",
+        "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+      ],
+      "lazy_loader_synthesis_rules": [
+        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+      ],
+      "engine_routing_contract": [
+        "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+        "notebooks-cn/07_agentPlan/task10_deepseekv2_tp_stage1_stage2_plan.md"
+      ],
+      "alignment_and_validation_contracts": [
+        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+      ],
+      "failure_mode_library": [
+        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+        "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+      ]
+    }
+    }
+  },
+  "runtime_acceptance_layer": {
+    "logic_constraints": [
+      "先生成并验证推理框架基础组件（Scheduler/KVMemoryPool/BlockManager/ModelRunner/Sampler/Sequence/LLMEngine），测试成功后再进行 Qwen3 与 DeepSeek-V2 的 TP 适配。",
+      "RealModelRunner 的 use_cache=False 约束仅适用于 hf 基线路径；TP Runner 按各模型实现执行。",
+      "KVMemoryPool 的 block 数按模型配置与 dtype 估算，且预留 reserve_bytes 与 mem_utilization 安全因子。",
+      "Prefix caching 仅对完整 block token 切片生效；末尾不满 block 的 token 不入 hash_to_block_id。",
+      "Scheduler 采用 prefill 优先策略；decode 仅选择 can_append_one_more 的运行序列，资源不足时不抢占。",
+      "任务完成标准：4 卡 TP 使用 /data/xinference/cache/Qwen3-8B 和 /data/xinference/cache/deepseek-v2-chat-pytorch-16b 推理几句真实 prompt 通过，且终端出现模型可读文本输出。",
+      "运行时监控要求：真实 TP 推理时持续采集 HCU 0,1,2,3 的 HCU% 与 VRAM%（若可见设备不足 5 个需先打印设备清单并说明）。",
+      "4 卡 TP 真实推理期间，参与 TP 的 4 张卡 VRAM% 需同量级近似一致；Qwen3-8B TP=4 每卡 VRAM% 约 7%，DeepSeek-V2-16B TP=4 每卡 VRAM% 约 14%。",
+      "推理测试窗口中 HCU% 必须出现大于 0 的时刻，作为并行加载与真实计算证据；无监控证据仅有文本输出视为未通过。",
+      "开发约束：严格 TDD，新增或修改组件必须先写测试后实现；未通过单测禁止继续跨组件集成。"
+    ],
+    "acceptance_test_targets": {
+      "qwen3_tp": {
+        "model_dir": "/data/xinference/cache/Qwen3-8B",
+        "suggested_test": "tests/test_qwen_tp_real.py"
+      },
+      "deepseek_v2_tp": {
+        "model_dir": "/data/xinference/cache/deepseek-v2-chat-pytorch-16b",
+        "suggested_test": "tests/test_deepseek_tp_real.py"
+      }
+    }
+  },
+  "knowledge_source_policy": {
+    "rule": "每条核心知识必须能回溯到 notebooks-cn的原始文档。",
+    "primary_dirs": [
+      "notebooks-cn/01_framework_design",
+      "notebooks-cn/02_model_specifics",
+      "notebooks-cn/03_operators",
+      "notebooks-cn/04_parallel_strategies",
+      "notebooks-cn/05_memory_pool",
+      "notebooks-cn/06_request_lifecycle",
+      "notebooks-cn/07_agentPlan",
+      "notebooks-cn/08_history_prompt"
+    ]
+  }
+}

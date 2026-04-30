@@ -1,0 +1,15 @@
+[submodule "ref_projects/vllm"]
+	path = ref_projects/vllm
+	url = https://github.com/vllm-project/vllm.git
+[submodule "ref_projects/sglang"]
+	path = ref_projects/sglang
+	url = https://github.com/sgl-project/sglang.git
+[submodule "ref_projects/nano-vllm"]
+	path = ref_projects/nano-vllm
+	url = https://github.com/GeeeekExplorer/nano-vllm.git
+[submodule "ref_projects/nano-sglang"]
+	path = ref_projects/nano-sglang
+	url = https://github.com/gogongxt/nano-sglang.git
+[submodule "ref_projects/mini-sglang"]
+	path = ref_projects/mini-sglang
+	url = https://github.com/sgl-project/mini-sglang.git
