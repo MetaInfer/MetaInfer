@@ -39,5 +39,11 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+# Environment
+.env
+
+# Logs
+logs/
+
 # uv
 uv.lock
