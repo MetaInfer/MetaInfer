@@ -1,5 +1,11 @@
 # Python
 __pycache__/
+
+# Historical commit snapshots (git is the version control)
+commit-changes/
+
+# Chinese translated notebooks (use notebooks/ instead)
+notebooks-cn/
 *.py[cod]
 *$py.class
 *.so
