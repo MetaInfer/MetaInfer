@@ -90,6 +90,35 @@ Request → **Scheduler**（连续批调度）→ **ModelRunner**（前向计算
 - 参考 `notebooks/06_implementation_patterns/` 中的模式和反模式进行开发
 - 文档结构变更需同步更新 `notebooks/MEMORY.md` 索引
 
+## Project Structure Conventions
+
+### 目录职责
+
+- `engine/` — 推理引擎核心代码（CUDA 主路径）
+  - `engine/mac_gpu/` — Mac GPU (MPS) 引擎，仅存放 Mac 独有实现（memory_pool、model_runner、scheduler、engine、main），共用代码（structs、sampler、block_manager）直接引用父目录
+  - `engine/models/` — 模型 TP 实现，每个模型一个文件
+  - `engine/tp_layers/` — TP 通信与并行算子
+- `scripts/` — 所有 shell 脚本（启动服务、基准测试、TP 测试），脚本开头用 `cd "$(dirname "${BASH_SOURCE[0]}")/.."` 定位项目根目录
+- `tests/` — 测试文件，命名 `test_<模块>.py`
+- `notebooks/` — 知识库文档，中文撰写
+- `docs/` — 设计文档
+- `ref_projects/` — 参考项目（git 子模块，只读）
+
+### 根目录文件
+
+- `llm_engine.py` — 引擎入口，被 tests 和 openai_tp_server 直接 import，不要移动
+- `openai_tp_server.py` — OpenAI 兼容 HTTP 服务入口，被 scripts/ 中的 shell 脚本调用，不要移动
+- `CLAUDE.md` / `README.md` / `PROGRESS.md` / `TODO` — 项目文档
+- `pyproject.toml` — 包配置，packages 指向 `engine`
+
+### 代码规范
+
+- 引擎入口文件（`llm_engine.py`、`openai_tp_server.py`）留在根目录，因为 tests 和 torchrun 直接 import 它们
+- shell 脚本放在 `scripts/`，不在根目录散落 `.sh` 文件
+- 新增 Mac GPU 代码时优先复用 `engine/` 的共用组件，避免复制
+- `engine/structs.py` 是全局数据结构，所有子模块（包括 mac_gpu）共享
+- 删除文件前确认没有其他模块 import 它
+
 ## Reference Projects (`ref_projects/`)
 
 | 项目 | 类型 | 用途 |
