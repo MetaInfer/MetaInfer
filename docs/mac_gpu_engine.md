@@ -31,7 +31,7 @@ meta-infer 项目的现有推理引擎（`engine/`）面向 CUDA + Tensor Parall
 ### 文件结构
 
 ```
-mac_gpu/
+engine/mac_gpu/
   __init__.py           # 包标记
   structs.py            # Sequence/SequenceStatus 数据结构（复制自 engine/）
   sampler.py            # greedy/top-p 采样器（复制自 engine/）

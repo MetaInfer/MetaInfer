@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # DeepSeek TP 正确性用例（pytest），与压测的「5 条默认 prompt」一致见 tests/test_deepseek_tp_real.py。
-# 与 bench 的对应关系: run_myengine_benchmark.sh 在 DATASET=zh-default 时使用相同 5 句循环。
+# 与 bench 的对应关系: scripts/run_myengine_benchmark.sh 在 DATASET=zh-default 时使用相同 5 句循环。
 # 在 meta-infer 根目录下生成完整日志
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PYTHONPATH="$ROOT"
 TP_SIZE="${TP_SIZE:-4}"

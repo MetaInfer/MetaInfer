@@ -4,10 +4,10 @@ Mac GPU (MPS) 推理引擎入口。简化版 LLMEngine，不含 TP 和 CUDA 逻�
 
 from __future__ import annotations
 
-from mac_gpu.memory_pool import MPSMemoryPool
-from mac_gpu.model_runner import MPSModelRunner
-from mac_gpu.scheduler import Scheduler
-from mac_gpu.structs import Sequence, SequenceStatus
+from engine.mac_gpu.memory_pool import MPSMemoryPool
+from engine.mac_gpu.model_runner import MPSModelRunner
+from engine.mac_gpu.scheduler import Scheduler
+from engine.structs import Sequence, SequenceStatus
 
 
 class MacGPUEngine:

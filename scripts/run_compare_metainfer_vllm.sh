@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 顺序跑 vLLM TP 与 meta-infer TP 的 serving benchmark，并输出对比表（同一 GPU、同一参数）。
 # 用法:
-#   bash run_compare_metainfer_vllm.sh dsv2
-# 环境变量（与 run_myengine_benchmark.sh 对齐）:
+#   bash scripts/run_compare_metainfer_vllm.sh dsv2
+# 环境变量（与 scripts/run_myengine_benchmark.sh 对齐）:
 #   TP_SIZE, CUDA_VISIBLE_DEVICES
 #   ROUNDS, STEPS, REQUEST_RATE, MAX_CONCURRENCY
 #   DATASET (zh-default | sharegpt-json), SHAREGPT_JSON
@@ -12,7 +12,7 @@
 #   SKIP_VLLM=1 只跑 meta-infer；SKIP_MYENGINE=1 只跑 vLLM
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH_SCRIPT="${ROOT_DIR}/ref_projects/vllm/benchmarks/benchmark_serving_structured_output.py"
 export PYTHONPATH="${PYTHONPATH:-}:${ROOT_DIR}"
 

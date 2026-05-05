@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from mac_gpu.block_manager import BlockManager
-from mac_gpu.structs import Sequence
+from engine.block_manager import BlockManager
+from engine.structs import Sequence
 
 
 class MPSMemoryPool:

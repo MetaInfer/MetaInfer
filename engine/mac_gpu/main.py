@@ -18,7 +18,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from mac_gpu.engine import MacGPUEngine
+    from engine.mac_gpu.engine import MacGPUEngine
 
     engine = MacGPUEngine(args.model)
     output = engine.generate(

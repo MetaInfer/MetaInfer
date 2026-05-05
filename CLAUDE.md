@@ -64,8 +64,12 @@ Request → **Scheduler**（连续批调度）→ **ModelRunner**（前向计算
 
 - **tp_distributed.py** — TP 分布式初始化工具
 - **openai_tp_server.py** — OpenAI 兼容 HTTP 服务，用于 vllm bench 压测
-- **start_tp_infer_service.sh** — 服务启动脚本
-- **run_*.sh** — 各类基准测试脚本
+- **scripts/start_tp_infer_service.sh** — 服务启动脚本
+- **scripts/run_*.sh** — 各类基准测试脚本
+
+### Mac GPU 引擎 (`engine/mac_gpu/`)
+
+基于 Apple Silicon MPS 后端的最小推理引擎，结构与 CUDA 引擎类似但面向 Mac GPU。
 
 ## Knowledge Base (`notebooks/`)
 

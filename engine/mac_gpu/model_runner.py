@@ -8,8 +8,8 @@ from __future__ import annotations
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from mac_gpu.sampler import sample_next_tokens
-from mac_gpu.structs import Sequence
+from engine.sampler import sample_next_tokens
+from engine.structs import Sequence
 
 
 class MPSModelRunner:

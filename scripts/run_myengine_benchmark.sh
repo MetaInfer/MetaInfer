@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 压测 meta-infer OpenAI 服务（需先启动 start_tp_infer_service.sh）
+# 压测 meta-infer OpenAI 服务（需先启动 scripts/start_tp_infer_service.sh）
 #
 # 环境变量（可选）:
 #   PORT / HOST           服务地址，默认 9000 / 127.0.0.1
@@ -18,7 +18,7 @@
 # 不指定数据集文件时: 使用内置 5 条中文句（与 tests 一致），无需 SHAREGPT。
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH_SCRIPT="${ROOT_DIR}/ref_projects/vllm/benchmarks/benchmark_serving_structured_output.py"
 
 QWEN_MODEL="/home/honglin/models/qwen/Qwen3-8B"

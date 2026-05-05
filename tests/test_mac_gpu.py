@@ -17,8 +17,8 @@ def test_mps_device_available():
 
 def test_structs_and_block_manager():
     """数据结构和块管理是纯 Python，不需要 GPU。"""
-    from mac_gpu.block_manager import BlockManager
-    from mac_gpu.structs import Sequence, SequenceStatus
+    from engine.block_manager import BlockManager
+    from engine.structs import Sequence, SequenceStatus
 
     bm = BlockManager(num_blocks=8, block_size=4)
     seq = Sequence(request_id="test", input_ids=[1, 2, 3, 4, 5])
@@ -39,7 +39,7 @@ def test_structs_and_block_manager():
 
 def test_sampler():
     """采样器在 MPS tensor 上工作。"""
-    from mac_gpu.sampler import sample_next_tokens
+    from engine.sampler import sample_next_tokens
 
     logits = torch.zeros(1, 100, device="mps")
     logits[0, 42] = 10.0
@@ -48,8 +48,8 @@ def test_sampler():
 
 
 def test_memory_pool():
-    from mac_gpu.memory_pool import MPSMemoryPool
-    from mac_gpu.structs import Sequence
+    from engine.mac_gpu.memory_pool import MPSMemoryPool
+    from engine.structs import Sequence
 
     pool = MPSMemoryPool(num_blocks=32, block_size=4)
     seq = Sequence(request_id="test", input_ids=[1, 2, 3, 4, 5, 6])
@@ -62,9 +62,9 @@ def test_memory_pool():
 
 
 def test_scheduler():
-    from mac_gpu.memory_pool import MPSMemoryPool
-    from mac_gpu.scheduler import Scheduler
-    from mac_gpu.structs import Sequence, SequenceStatus
+    from engine.mac_gpu.memory_pool import MPSMemoryPool
+    from engine.mac_gpu.scheduler import Scheduler
+    from engine.structs import Sequence, SequenceStatus
 
     pool = MPSMemoryPool(num_blocks=32, block_size=4)
     sched = Scheduler(memory_pool=pool, max_num_seqs=4, max_num_batched_tokens=512)
@@ -79,8 +79,8 @@ def test_scheduler():
 
 def test_model_load_and_prefill():
     """加载小模型并运行 prefill（需要联网下载）。"""
-    from mac_gpu.model_runner import MPSModelRunner
-    from mac_gpu.structs import Sequence
+    from engine.mac_gpu.model_runner import MPSModelRunner
+    from engine.structs import Sequence
 
     runner = MPSModelRunner("Qwen/Qwen2.5-0.5B")
     seq = Sequence(
@@ -96,7 +96,7 @@ def test_model_load_and_prefill():
 
 def test_end_to_end():
     """端到端推理测试（需要联网下载模型）。"""
-    from mac_gpu.engine import MacGPUEngine
+    from engine.mac_gpu.engine import MacGPUEngine
 
     engine = MacGPUEngine("Qwen/Qwen2.5-0.5B", block_size=16, max_num_seqs=2)
     output = engine.generate("What is 2+2?", max_new_tokens=16, temperature=0.0)

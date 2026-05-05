@@ -1,7 +1,7 @@
 from collections import deque
 
-from mac_gpu.memory_pool import MPSMemoryPool
-from mac_gpu.structs import Sequence, SequenceStatus
+from engine.mac_gpu.memory_pool import MPSMemoryPool
+from engine.structs import Sequence, SequenceStatus
 
 
 class Scheduler:

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # 启动 meta-infer TP + OpenAI 兼容 HTTP 服务
 #
-# 若不指定 DATASET_PATH（或设为空）: 不检查数据集文件，压测请用 run_myengine_benchmark.sh 的 zh-default。
+# 若不指定 DATASET_PATH（或设为空）: 不检查数据集文件，压测请用 scripts/run_myengine_benchmark.sh 的 zh-default。
 # 环境变量: TP_SIZE, PORT, HOST, MAX_NUM_SEQS, MAX_NUM_BATCHED_TOKENS, BACKEND,
 #           MAX_NEW_TOKENS_CAP（应 >= 压测 STEPS）
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # 可选本地 ShareGPT: /data/dataset/ShareGPT_V3_unfiltered_cleaned_split/ShareGPT_V3_unfiltered_cleaned_split.json
 QWEN_MODEL="/home/honglin/models/qwen/Qwen3-8B"
