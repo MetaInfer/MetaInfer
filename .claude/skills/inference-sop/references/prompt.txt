@@ -4,13 +4,13 @@
 `phase_1_framework_components` → `phase_2_tp_runtime_plumbing` → `phase_3_qwen3_tp_adaptation` → `phase_4_deepseek_v2_tp_ep_adaptation` → `phase_5_realtime_acceptance`。
 
 【启动强制读取】
-1) `curosr/skills/inference_blueprint.json`（先看 `agent_navigation`）
-2) `curosr/skills/AGENT_SKILL.md`
+1) `.claude/skills/inference_blueprint.json`（先看 `agent_navigation`）
+2) `.claude/skills/AGENT_SKILL.md`
 3) `notebooks/tasks.md`
 4) `notebooks/MEMORY.md`
 
 【硬性规则】
-1) 禁止硬编码“假输出”；未 `load_weights()` 不得声称成功。
+1) 禁止硬编码"假输出"；未 `load_weights()` 不得声称成功。
 2) 禁止用单卡HF路径替代4卡TP验收；HF仅可做辅助定位。
 3) 每phase必须跑对应测试并给出结果，未通过不得进入下一phase。
 4) phase1/2通过后必须继续phase3/4，最后必须执行phase5；未跑phase5不得宣布完成。
@@ -27,7 +27,7 @@
    - Qwen3-8B（`/data/xinference/cache/Qwen3-8B`, TP=4）：每卡 VRAM% 约 7%
    - DeepSeek-V2-16B（`/data/xinference/cache/deepseek-v2-chat-pytorch-16b`, TP=4）：每卡 VRAM% 约 14%
 4) 测试窗口内必须出现 `HCU% > 0` 的时刻（至少覆盖4张TP卡），证明真实并行加载和计算。
-5) 若只有文本输出、无HCU/VRAM证据，判定“假推理”，验收失败。
+5) 若只有文本输出、无HCU/VRAM证据，判定"假推理"，验收失败。
 
 【每轮输出固定格式】
 1) 当前phase与门禁状态（通过/未通过）

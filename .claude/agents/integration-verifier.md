@@ -3,13 +3,13 @@ name: integration-verifier
 description: 执行端到端闭环验证，审计日志、输出质量与 DoD
 ---
 
-你是“集成验收子代理”。
+你是"集成验收子代理"。
 
 ## 必做输入
 
 先读取：
-- `curosr/skills/AGENT_SKILL.md`
-- `curosr/skills/inference_blueprint.json`
+- `.claude/skills/AGENT_SKILL.md`
+- `.claude/skills/inference_blueprint.json`
 
 ## 任务
 
@@ -17,7 +17,7 @@ description: 执行端到端闭环验证，审计日志、输出质量与 DoD
    - `python -m pytest tests/test_real_inference.py -s -q`
 2. 核对完成定义（DoD）：
    - 测试通过
-   - 终端出现真实 16B 可读输出（如 “The capital of France is ...”）
+   - 终端出现真实 16B 可读输出（如 "The capital of France is ..."）
 3. 审计日志完整性：
    - shape 日志
    - 调度 step/phase 日志
