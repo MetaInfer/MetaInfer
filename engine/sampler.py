@@ -32,7 +32,8 @@ def top_p_sample(
     sorted_indices_to_remove[..., 0] = False
     filtered = sorted_logits.masked_fill(sorted_indices_to_remove, float("-inf"))
     probs_filtered = F.softmax(filtered, dim=-1)
-    return torch.multinomial(probs_filtered, num_samples=1, generator=generator).squeeze(-1)
+    sampled_idx = torch.multinomial(probs_filtered, num_samples=1, generator=generator).squeeze(-1)
+    return sorted_indices.gather(-1, sampled_idx.unsqueeze(-1)).squeeze(-1)
 
 
 def sample_next_tokens(

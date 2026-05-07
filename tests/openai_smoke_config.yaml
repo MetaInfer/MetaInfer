@@ -1,0 +1,6 @@
+# OpenAI Smoke Test Configuration
+# Modify these values to match your server setup
+
+base_url: "http://localhost:8000"
+model: "qwen"
+timeout: 60

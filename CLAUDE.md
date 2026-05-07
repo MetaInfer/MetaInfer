@@ -23,11 +23,20 @@ pytest tests/test_scheduler.py tests/test_sequence.py tests/test_memory.py tests
 torchrun --nproc_per_node=4 -m pytest tests/test_qwen_tp_real.py -v -s
 torchrun --nproc_per_node=4 -m pytest tests/test_deepseek_tp_real.py -v -s
 
+# Run OpenAI smoke tests (requires running server, edit tests/openai_smoke_config.yaml first)
+pytest tests/test_openai_smoke.py -v
+
 # Run single test file
 pytest tests/test_scheduler.py -v
 
 # Pre-commit
 pre-commit run --all-files
+
+# Download Qwen3.5 MoE model (mirror)
+HF_ENDPOINT=https://hf-mirror.com python engine/20260507/mac_qwen/download_model.py --local-dir ~/.cache/qwen35-moe
+
+# Run Qwen3.5 MoE inference
+uv run python engine/20260507/mac_qwen/engine.py --prompt "你好" --model-dir ~/.cache/qwen35-moe --stream
 ```
 
 ## Architecture
@@ -60,6 +69,10 @@ Request → **Scheduler**（连续批调度）→ **ModelRunner**（前向计算
 - **deepseek_v2.py** — DeepSeek V2 TP 实现（MLA + MoE）
 - **qwen.py** — Qwen3 TP 实现（Dense + MoE）
 
+### Qwen3.5 MoE 引擎 (`engine/20260507/mac_qwen/`)
+
+自包含的 Qwen3.5 MoE 推理引擎，支持混合注意力（Gated DeltaNet 线性注意力 + softmax 全注意力）+ MoE（256 experts）。独立于主引擎运行，通过 `importlib` 导入（目录名含数字前缀）。详见 `engine/20260507/mac_qwen/WORKFLOW.md`。
+
 ### 辅助文件
 
 - **tp_distributed.py** — TP 分布式初始化工具
@@ -89,6 +102,19 @@ Request → **Scheduler**（连续批调度）→ **ModelRunner**（前向计算
 - `ref_projects/` 中的子模块只读不改，知识提取后存入 notebooks
 - 参考 `notebooks/06_implementation_patterns/` 中的模式和反模式进行开发
 - 文档结构变更需同步更新 `notebooks/MEMORY.md` 索引
+
+## OpenAI 冒烟测试规范
+
+运行冒烟测试后，**必须人工检查每个用例的生成文本质量**，不能仅依赖 keyword 断言通过就认为测试成功。检查要点：
+
+1. **运行命令**: `pytest tests/test_openai_smoke.py -v -s`（`-s` 输出生成文本）
+2. **逐条审阅输出内容**，识别以下异常模式：
+   - 重复退化：后半段变成重复的 `**`、换行、标点或循环文本
+   - 乱码字符：出现 Unicode 乱码（如 ``）或不可见字符
+   - 语义断裂：前半段正常但中途语义崩塌，答非所问
+3. **短输出（< 30 tokens）通常正常**，重点检查中长输出（> 50 tokens）的用例
+4. 发现异常文本时，记录到 `engine/20260507/mac_qwen/WORKFLOW.md` 的 Bug 修复或待完成章节
+5. 如需重放单个用例：`pytest tests/test_openai_smoke.py -v -s --case "用例名"`，列出所有用例：`pytest tests/test_openai_smoke.py --list-cases`
 
 ## Project Structure Conventions
 
