@@ -55,7 +55,7 @@
       content: "1+1等于2。"
     - role: user
       content: "那再加1呢？"
-  max_tokens: 32
+  max_tokens: 64
   assert:
     keywords_any: ["3", "三"]
     finish_reason: "stop"

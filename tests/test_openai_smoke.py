@@ -12,8 +12,8 @@ Usage:
 from __future__ import annotations
 
 import json
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -77,7 +77,7 @@ def test_smoke(case: dict, request: pytest.FixtureRequest) -> None:
     message = choice.get("message", {})
     content = message.get("content", "")
     assert isinstance(content, str) and len(content.strip()) > 0, (
-        f"choices[0].message.content is empty"
+        "choices[0].message.content is empty"
     )
 
     # --- finish_reason ---
@@ -106,8 +106,8 @@ def test_smoke(case: dict, request: pytest.FixtureRequest) -> None:
     # --- print generated text for inspection (visible with -s) ---
     usage_info = f"tokens={usage.get('completion_tokens', '?')}"
     finish_info = choice.get("finish_reason", "?")
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"[{case['name']}] {usage_info}, finish={finish_info}")
-    print(f"{'-'*60}")
+    print(f"{'-' * 60}")
     print(content)
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")

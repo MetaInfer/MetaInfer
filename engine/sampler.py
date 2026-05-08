@@ -20,20 +20,37 @@ def top_p_sample(
     """
     Nucleus (top-p) sampling per row.
     logits: [batch, vocab], top_p in (0, 1].
+
+    Optimization: first select top-k candidates to reduce sort cost on large vocab.
     """
     if not (0.0 < top_p <= 1.0):
         raise ValueError("top_p must be in (0, 1]")
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+    vocab_size = logits.shape[-1]
+    # For large vocab, first narrow to top-k candidates
+    k = min(1024, vocab_size)
+    if k < vocab_size:
+        top_k_logits, top_k_indices = torch.topk(logits, k, dim=-1)
+        # Do top-p on the reduced set
+        sorted_logits, sorted_idx = torch.sort(top_k_logits, descending=True, dim=-1)
+    else:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        top_k_indices = None
+
     probs = F.softmax(sorted_logits, dim=-1)
     cumsum = torch.cumsum(probs, dim=-1)
-    # Remove tokens with cumulative mass strictly above top_p (keep first set that reaches top_p)
+    # Remove tokens with cumulative mass strictly above top_p
     sorted_indices_to_remove = cumsum > top_p
     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
     sorted_indices_to_remove[..., 0] = False
     filtered = sorted_logits.masked_fill(sorted_indices_to_remove, float("-inf"))
     probs_filtered = F.softmax(filtered, dim=-1)
     sampled_idx = torch.multinomial(probs_filtered, num_samples=1, generator=generator).squeeze(-1)
-    return sorted_indices.gather(-1, sampled_idx.unsqueeze(-1)).squeeze(-1)
+
+    # Map back: sampled_idx → position in top-k → original vocab index
+    if top_k_indices is not None:
+        local_idx = sorted_idx.gather(-1, sampled_idx.unsqueeze(-1)).squeeze(-1)
+        return top_k_indices.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)
+    return sorted_idx.gather(-1, sampled_idx.unsqueeze(-1)).squeeze(-1)
 
 
 def sample_next_tokens(

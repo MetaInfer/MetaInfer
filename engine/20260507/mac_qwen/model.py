@@ -129,7 +129,10 @@ class RMSNorm(nn.Module):
 
 
 class RMSNormGated(nn.Module):
-    """RMSNorm(x) * silu(gate) — 线性注意力层输出归一化。"""
+    """RMSNorm(x) * silu(gate) — 线性注意力层输出归一化。
+
+    与 RMSNorm 不同，这里直接使用 weight（不加 1），与 HF transformers 对齐。
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -141,8 +144,9 @@ class RMSNormGated(nn.Module):
         x = x.to(torch.float32)
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
-        x = (1.0 + self.weight) * x
-        return (x * F.silu(gate.to(torch.float32))).to(input_dtype)
+        x = self.weight * x.to(input_dtype)
+        x = x * F.silu(gate.to(torch.float32))
+        return x.to(input_dtype)
 
 
 # ─── Partial RoPE ────────────────────────────────────────────────────────
@@ -154,23 +158,72 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _precompute_rope_inv_freq(theta: float, rotary_dim: int, device: torch.device) -> torch.Tensor:
+    """Precompute inverse frequency for partial RoPE."""
+    freqs = torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32) / rotary_dim
+    return 1.0 / (theta**freqs)
+
+
+@torch.no_grad()
+def precompute_rope_table(
+    theta: float,
+    rotary_dim: int,
+    max_seq_len: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Precompute cos/sin table for partial RoPE.
+
+    Returns (cos_table, sin_table) each of shape (1, max_seq_len, 1, rotary_dim).
+    """
+    inv_freq = _precompute_rope_inv_freq(theta, rotary_dim, device)
+    t = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)  # (max_seq_len, rotary_dim//2)
+    emb = torch.cat([freqs, freqs], dim=-1)  # (max_seq_len, rotary_dim)
+    cos_table = emb.cos().unsqueeze(0).unsqueeze(2).to(dtype)  # (1, max_len, 1, rotary_dim)
+    sin_table = emb.sin().unsqueeze(0).unsqueeze(2).to(dtype)
+    return cos_table, sin_table
+
+
+def apply_rope_from_table(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE using precomputed cos/sin table.
+
+    cos/sin: (1, S, 1, rotary_dim) — sliced from the precomputed table.
+    q, k: (B, S, H, D) — will only rotate the first rotary_dim dims.
+    """
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_rotated = (q_rot * cos) + (_rotate_half(q_rot) * sin)
+    k_rotated = (k_rot * cos) + (_rotate_half(k_rot) * sin)
+    return torch.cat([q_rotated, q_pass], dim=-1), torch.cat([k_rotated, k_pass], dim=-1)
+
+
 def apply_partial_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
-    theta: float,
-    rotary_dim: int,
+    inv_freq: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """只对 head_dim 的前 rotary_dim 维应用 RoPE，其余维度直接透传。"""
+    """只对 head_dim 的前 rotary_dim 维应用 RoPE，其余维度直接透传。
+
+    inv_freq: precomputed via _precompute_rope_inv_freq()
+    """
+    rotary_dim = inv_freq.shape[0] * 2
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-    dim = rotary_dim
-    device = q.device
-    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
     t = positions.to(torch.float32)
     if t.dim() == 1:
         freqs = torch.outer(t, inv_freq)
+    elif t.shape[-1] == 1:
+        # Decode fast path: (B, 1) positions → (B, 1, rotary_dim//2)
+        freqs = t * inv_freq[None, None, :]
     else:
         b = t.shape[0]
         freqs = (inv_freq[None, :, None].expand(b, -1, 1) @ t[:, None, :]).transpose(1, 2)
@@ -202,13 +255,20 @@ class Qwen35MoeFullAttention(nn.Module):
         q_out = cfg.num_attention_heads * cfg.head_dim
         if self.attn_output_gate:
             q_out *= 2
+        kv_out = cfg.num_key_value_heads * cfg.head_dim
 
-        self.q_proj = nn.Linear(cfg.hidden_size, q_out, bias=False)
-        self.k_proj = nn.Linear(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim, bias=False)
-        self.v_proj = nn.Linear(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim, bias=False)
+        # Fused QKV projection: q + k + v in one matmul
+        self.qkv_proj = nn.Linear(cfg.hidden_size, q_out + 2 * kv_out, bias=False)
         self.o_proj = nn.Linear(cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size, bias=False)
         self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
+
+        # Precompute RoPE inv_freq (lazy init on first forward)
+        self._rope_inv_freq: torch.Tensor | None = None
+
+        # Store split sizes for fused projection
+        self._q_dim = q_out
+        self._kv_dim = kv_out
 
     def forward(
         self,
@@ -220,10 +280,14 @@ class Qwen35MoeFullAttention(nn.Module):
     ) -> tuple[torch.Tensor, int]:
         B, S, _ = hidden_states.shape
 
+        # Fused QKV projection
+        qkv = self.qkv_proj(hidden_states)
         q_out_dim = self.head_dim * 2 if self.attn_output_gate else self.head_dim
-        q = self.q_proj(hidden_states).view(B, S, self.num_heads, q_out_dim)
-        k = self.k_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim)
+        q = qkv[..., : self._q_dim].view(B, S, self.num_heads, q_out_dim)
+        k = qkv[..., self._q_dim : self._q_dim + self._kv_dim].view(
+            B, S, self.num_kv_heads, self.head_dim
+        )
+        v = qkv[..., self._q_dim + self._kv_dim :].view(B, S, self.num_kv_heads, self.head_dim)
 
         gate = None
         if self.attn_output_gate:
@@ -232,7 +296,11 @@ class Qwen35MoeFullAttention(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q, k = apply_partial_rope(q, k, position_ids, self.rope_theta, self.rotary_dim)
+        if self._rope_inv_freq is None:
+            self._rope_inv_freq = _precompute_rope_inv_freq(
+                self.rope_theta, self.rotary_dim, hidden_states.device
+            )
+        q, k = apply_partial_rope(q, k, position_ids, self._rope_inv_freq)
 
         key_cache[:, cache_len : cache_len + S] = k
         value_cache[:, cache_len : cache_len + S] = v
@@ -265,6 +333,161 @@ class Qwen35MoeFullAttention(nn.Module):
 # ─── Gated DeltaNet kernels (pure PyTorch) ───────────────────────────────
 
 
+def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    return F.normalize(x, p=2, dim=dim, eps=eps)
+
+
+@torch.inference_mode()
+def torch_chunk_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gated DeltaNet chunk parallel prefill — adapted from HF transformers.
+
+    Uses WY representation for intra-chunk attention and recurrent updates
+    for inter-chunk state. All computation in float32 for precision.
+
+    q: (B, S, H, D_k),  k: (B, S, H, D_k),  v: (B, S, H, D_v)
+    g: (B, S, H),  beta: (B, S, H)
+    """
+    initial_dtype = query.dtype
+    # QK L2 norm + scaling done inside
+    query = _l2norm(query.float(), dim=-1)
+    key = _l2norm(key.float(), dim=-1)
+
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous() for x in (query, key, value, beta, g)
+    ]  # (B, H, S, D)
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+    total_sequence_length = sequence_length + pad_size
+    scale = 1.0 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    # reshape to chunks
+    query, key, value, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, k_beta, v_beta)
+    ]
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
+    )
+
+    # chunk decay — cumulative sum of g, then compute exp(g_i - g_j)
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    last_recurrent_state = (
+        torch.zeros(
+            batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device
+        )
+        if initial_state is None
+        else initial_state.to(value).float()
+    )
+    core_attn_out = torch.zeros_like(value)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+    )
+
+    for i in range(total_sequence_length // chunk_size):
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        attn_i = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
+        v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn_i @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    core_attn_out = core_attn_out.reshape(
+        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+    )
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state.to(initial_dtype)
+
+
+@torch.inference_mode()
+def torch_recurrent_gated_delta_rule_single(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gated DeltaNet single-token decode — fast path for S=1.
+
+    Avoids loop overhead, unnecessary indexing, and extra reshapes.
+    All inputs have S=1 dimension; output is squeezed to (B, H, V).
+
+    q: (B, 1, H, D), k: (B, 1, H, D), v: (B, 1, H, V)
+    g: (B, 1, H), beta: (B, 1, H)
+    initial_state: (B, H, D, V)
+    Returns: (output: (B, 1, H, V), new_state: (B, H, D, V))
+    """
+    input_dtype = q.dtype
+    B, _, H, D = q.shape
+    V_dim = v.shape[-1]
+    BH = B * H
+    scale = D**-0.5
+
+    # Squeeze S=1, go to float32, L2 norm + scale
+    q = _l2norm(q.squeeze(1).float(), dim=-1) * scale  # (B, H, D)
+    k = _l2norm(k.squeeze(1).float(), dim=-1)  # (B, H, D)
+    v = v.squeeze(1).float()  # (B, H, V)
+    g_decay = g.squeeze(1).float().exp()  # (B, H)
+    beta_sq = beta.squeeze(1).float()  # (B, H)
+
+    # Flatten B*H for batched matmul
+    q_flat = q.reshape(BH, 1, D)
+    k_flat = k.reshape(BH, 1, D)
+    v_flat = v.reshape(BH, 1, V_dim)
+    g_flat = g_decay.reshape(BH, 1, 1)
+    beta_flat = beta_sq.reshape(BH, 1, 1)
+
+    S_state = (
+        initial_state.float()
+        if initial_state is not None
+        else torch.zeros(B, H, D, V_dim, device=q.device, dtype=torch.float32)
+    )
+    S_flat = S_state.reshape(BH, D, V_dim)
+
+    S_flat = S_flat * g_flat
+    kv_mem = torch.bmm(k_flat, S_flat)  # (BH, 1, V)
+    delta = (v_flat - kv_mem) * beta_flat
+    S_flat = S_flat + torch.bmm(k_flat.transpose(-1, -2), delta)  # (BH, D, V)
+    out_flat = torch.bmm(q_flat, S_flat)  # (BH, 1, V)
+
+    output = out_flat.reshape(B, H, V_dim).unsqueeze(1)  # (B, 1, H, V)
+    S_state = S_flat.reshape(B, H, D, V_dim)
+    return output.to(input_dtype), S_state.to(input_dtype)
+
+
 @torch.inference_mode()
 def torch_recurrent_gated_delta_rule(
     q: torch.Tensor,
@@ -276,23 +499,28 @@ def torch_recurrent_gated_delta_rule(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gated DeltaNet 递归计算 — 逐 token 更新循环状态 S。
 
-    内部使用 float32 计算以避免 float16 下 recurrent state 累积精度退化。
+    内部使用 float32 计算。QK L2 norm + scaling 在内部完成。
+    S=1 时委托给 single-token fast path。
 
     q: (B, S, H_v, D_k),  k: (B, S, H_v, D_k),  v: (B, S, H_v, D_v)
     g: (B, S, H_v) — 衰减 logits (负值, 将 exp 得到 0~1 衰减因子)
     beta: (B, S, H_v) — 更新率 (已 sigmoid)
     initial_state: (B, H_v, D_k, D_v) or None
     """
+    if q.shape[1] == 1:
+        return torch_recurrent_gated_delta_rule_single(q, k, v, g, beta, initial_state)
+
     B, S, H, D = q.shape
     V_dim = v.shape[-1]
     input_dtype = q.dtype
 
-    # Upgrade to float32 for precision
-    q = q.float()
-    k = k.float()
+    # L2 norm + scaling (matching HF behavior)
+    q = _l2norm(q.float(), dim=-1)
+    k = _l2norm(k.float(), dim=-1)
     v = v.float()
     g = g.float()
     beta = beta.float()
+    q = q * (D**-0.5)
 
     if initial_state is None:
         S_state = torch.zeros(B, H, D, V_dim, device=q.device, dtype=torch.float32)
@@ -302,20 +530,26 @@ def torch_recurrent_gated_delta_rule(
     output = torch.empty(B, S, H, V_dim, device=q.device, dtype=torch.float32)
     g_decay = g.exp()
 
+    # Pre-flatten batch+head dims for bmm efficiency
+    BH = B * H
     for t in range(S):
-        q_t = q[:, t]
-        k_t = k[:, t]
-        v_t = v[:, t]
-        g_t = g_decay[:, t].unsqueeze(-1).unsqueeze(-1)
-        beta_t = beta[:, t].unsqueeze(-1)
+        q_t = q[:, t].reshape(BH, 1, D)  # (BH, 1, D)
+        k_t = k[:, t].reshape(BH, 1, D)  # (BH, 1, D)
+        v_t = v[:, t]  # (B, H, V)
+        g_t = g_decay[:, t].reshape(BH, 1, 1)  # (BH, 1, 1)
+        beta_t = beta[:, t].reshape(BH, 1, 1)  # (BH, 1, 1)
 
-        S_state = S_state * g_t
-        kv_mem = (S_state * k_t.unsqueeze(-1)).sum(dim=-2)
-        delta = (v_t - kv_mem) * beta_t
-        S_state = S_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        output[:, t] = (S_state * q_t.unsqueeze(-1)).sum(dim=-2)
+        S_flat = S_state.reshape(BH, D, V_dim)
+        S_flat = S_flat * g_t
+        # kv_mem = k^T @ S → (BH, 1, V)
+        kv_mem = torch.bmm(k_t, S_flat).reshape(B, H, V_dim)
+        delta = (v_t - kv_mem).reshape(BH, 1, V_dim) * beta_t
+        # S += k * delta^T → outer product
+        S_flat = S_flat + torch.bmm(k_t.transpose(-1, -2), delta)  # (BH, D, V)
+        S_state = S_flat.reshape(B, H, D, V_dim)
+        # output = q^T @ S → (BH, 1, V)
+        output[:, t] = torch.bmm(q_t, S_flat).reshape(B, H, V_dim)
 
-    # Convert output back to model dtype, keep S_state in float32 for next call
     return output.to(input_dtype), S_state.to(input_dtype)
 
 
@@ -334,10 +568,9 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         self.conv_kernel_size = cfg.linear_conv_kernel_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
 
-        self.in_proj_qkv = nn.Linear(cfg.hidden_size, self.conv_dim, bias=False)
-        self.in_proj_z = nn.Linear(cfg.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(cfg.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(cfg.hidden_size, self.num_v_heads, bias=False)
+        # Fused input projection: [qkv | z | b | a] in one matmul
+        self.fused_proj_dim = self.conv_dim + self.value_dim + self.num_v_heads * 2
+        self.in_proj = nn.Linear(cfg.hidden_size, self.fused_proj_dim, bias=False)
         self.out_proj = nn.Linear(self.value_dim, cfg.hidden_size, bias=False)
 
         self.conv1d_weight = nn.Parameter(torch.empty(self.conv_dim, 1, self.conv_kernel_size))
@@ -345,6 +578,9 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         A = torch.rand(self.num_v_heads) * 16
         self.A_log = nn.Parameter(torch.log(A))
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+
+        # Cache exp(A_log) to avoid repeated exp() during decode
+        self._A_exp_cache: torch.Tensor | None = None
 
         self.norm = RMSNormGated(self.head_v_dim, eps=cfg.rms_norm_eps)
 
@@ -360,14 +596,14 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         B, S, _ = hidden_states.shape
         K = self.conv_kernel_size
 
-        mixed_qkv_raw = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        # Fused projection → split into qkv, z, b, a
+        fused = self.in_proj(hidden_states)
+        splits = [self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads]
+        mixed_qkv_raw, z, b, a = torch.split(fused, splits, dim=-1)
 
         # Causal conv1d
         if S == 1 and conv_state is not None:
-            x_flat = mixed_qkv_raw.squeeze(1)
+            x_flat = mixed_qkv_raw.squeeze(1)  # (B, conv_dim)
             window = torch.cat([conv_state, x_flat.unsqueeze(-1)], dim=-1)
             w = self.conv1d_weight.squeeze(1)
             mixed_qkv = (window * w.unsqueeze(0)).sum(dim=-1).unsqueeze(1)
@@ -376,9 +612,9 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
         else:
             x_t = mixed_qkv_raw.transpose(1, 2)
             x_t = F.pad(x_t, (K - 1, 0))
-            mixed_qkv = F.silu(
-                F.conv1d(x_t, self.conv1d_weight, groups=self.conv_dim)
-            ).transpose(1, 2)
+            mixed_qkv = F.silu(F.conv1d(x_t, self.conv1d_weight, groups=self.conv_dim)).transpose(
+                1, 2
+            )
             if S >= K - 1:
                 conv_state = mixed_qkv_raw[:, -(K - 1) :].transpose(1, 2).contiguous()
             else:
@@ -404,24 +640,21 @@ class Qwen35MoeGatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.repeat_factor, dim=2)
             key = key.repeat_interleave(self.repeat_factor, dim=2)
 
-        # QK L2 norm + scaling
-        query = F.normalize(query, p=2, dim=-1)
-        key = F.normalize(key, p=2, dim=-1)
-        query = query * (self.head_k_dim**-0.5)
-
         # Decay & beta
         beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        if self._A_exp_cache is None:
+            self._A_exp_cache = self.A_log.float().exp()
+        g = -self._A_exp_cache * F.softplus(a.float() + self.dt_bias)
 
-        # Recurrent gated delta rule
-        output, recurrent_state = torch_recurrent_gated_delta_rule(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            initial_state=recurrent_state,
-        )
+        # Prefill: chunk parallel; Decode: recurrent (single token)
+        if S > 1:
+            output, recurrent_state = torch_chunk_gated_delta_rule(
+                query, key, value, g, beta, initial_state=None, chunk_size=64
+            )
+        else:
+            output, recurrent_state = torch_recurrent_gated_delta_rule(
+                query, key, value, g, beta, initial_state=recurrent_state
+            )
 
         # Gated RMSNorm
         z = z.view(B, S, self.num_v_heads, self.head_v_dim)
@@ -466,16 +699,17 @@ class Qwen35MoeTopKRouter(nn.Module):
 
 
 class Qwen35MoeMLP(nn.Module):
-    """Shared expert MLP (独立 gate/up/down)。"""
+    """Dense MLP — fused gate_up_proj for single matmul。"""
 
     def __init__(self, cfg: Qwen35MoeConfig, intermediate_size: int):
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(cfg.hidden_size, intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(cfg.hidden_size, intermediate_size * 2, bias=False)
         self.down_proj = nn.Linear(intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate_up = self.gate_up_proj(x)
+        gate, up = gate_up.chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
 
 class Qwen35MoeSparseMoeBlock(nn.Module):
@@ -659,18 +893,20 @@ def load_weights(model: Qwen35MoeForCausalLM) -> None:
 
         attn = layer.self_attn
         if layer.layer_type == "full_attention":
-            attn.q_proj.weight.data.copy_(_w(f"{pfx}.self_attn.q_proj.weight"))
-            attn.k_proj.weight.data.copy_(_w(f"{pfx}.self_attn.k_proj.weight"))
-            attn.v_proj.weight.data.copy_(_w(f"{pfx}.self_attn.v_proj.weight"))
+            q_w = _w(f"{pfx}.self_attn.q_proj.weight")
+            k_w = _w(f"{pfx}.self_attn.k_proj.weight")
+            v_w = _w(f"{pfx}.self_attn.v_proj.weight")
+            attn.qkv_proj.weight.data.copy_(torch.cat([q_w, k_w, v_w], dim=0))
             attn.o_proj.weight.data.copy_(_w(f"{pfx}.self_attn.o_proj.weight"))
             attn.q_norm.weight.data.copy_(_w(f"{pfx}.self_attn.q_norm.weight"))
             attn.k_norm.weight.data.copy_(_w(f"{pfx}.self_attn.k_norm.weight"))
         else:
             attn_prefix = f"{pfx}.linear_attn"
-            attn.in_proj_qkv.weight.data.copy_(_w(f"{attn_prefix}.in_proj_qkv.weight"))
-            attn.in_proj_z.weight.data.copy_(_w(f"{attn_prefix}.in_proj_z.weight"))
-            attn.in_proj_b.weight.data.copy_(_w(f"{attn_prefix}.in_proj_b.weight"))
-            attn.in_proj_a.weight.data.copy_(_w(f"{attn_prefix}.in_proj_a.weight"))
+            qkv_w = _w(f"{attn_prefix}.in_proj_qkv.weight")
+            z_w = _w(f"{attn_prefix}.in_proj_z.weight")
+            b_w = _w(f"{attn_prefix}.in_proj_b.weight")
+            a_w = _w(f"{attn_prefix}.in_proj_a.weight")
+            attn.in_proj.weight.data.copy_(torch.cat([qkv_w, z_w, b_w, a_w], dim=0))
             attn.out_proj.weight.data.copy_(_w(f"{attn_prefix}.out_proj.weight"))
             attn.conv1d_weight.data.copy_(_w(f"{attn_prefix}.conv1d.weight"))
             attn.A_log.data.copy_(_w(f"{attn_prefix}.A_log"))
@@ -694,8 +930,9 @@ def load_weights(model: Qwen35MoeForCausalLM) -> None:
             )
             mlp.shared_expert_gate.weight.data.copy_(_w(f"{pfx}.mlp.shared_expert_gate.weight"))
         else:
-            mlp.gate_proj.weight.data.copy_(_w(f"{pfx}.mlp.gate_proj.weight"))
-            mlp.up_proj.weight.data.copy_(_w(f"{pfx}.mlp.up_proj.weight"))
+            gate_w = _w(f"{pfx}.mlp.gate_proj.weight")
+            up_w = _w(f"{pfx}.mlp.up_proj.weight")
+            mlp.gate_up_proj.weight.data.copy_(torch.cat([gate_w, up_w], dim=0))
             mlp.down_proj.weight.data.copy_(_w(f"{pfx}.mlp.down_proj.weight"))
 
     model.norm.weight.data.copy_(_w("norm.weight"))

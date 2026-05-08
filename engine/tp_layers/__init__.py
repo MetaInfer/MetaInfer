@@ -9,7 +9,11 @@ from engine.tp_layers.distributed import (
 )
 from engine.tp_layers.embedding import ParallelLMHead, VocabParallelEmbedding
 from engine.tp_layers.linear import ColumnParallelLinear, RowParallelLinear
-from engine.tp_layers.moe import ExpertParallelMoE, ExpertParallelMoEConfig, partition_experts_for_rank
+from engine.tp_layers.moe import (
+    ExpertParallelMoE,
+    ExpertParallelMoEConfig,
+    partition_experts_for_rank,
+)
 
 __all__ = [
     "init_tp_distributed",

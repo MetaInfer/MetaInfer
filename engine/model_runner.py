@@ -11,9 +11,9 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from engine.sampler import greedy_sample, sample_next_tokens
 from engine.structs import Sequence

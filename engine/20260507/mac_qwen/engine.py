@@ -40,7 +40,6 @@ class Qwen35MoeEngine:
         max_seq_len: int = 8192,
         max_new_tokens: int = 512,
     ):
-
         device, dtype = _select_device()
         print(f"[Engine] device={device}, dtype={dtype}")
 

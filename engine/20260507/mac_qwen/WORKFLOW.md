@@ -10,7 +10,7 @@
 - **无 MoE**：Dense MLP，intermediate_size=6144
 - hidden_size=2048, head_dim=256, partial_rotary_factor=0.25
 - GQA: full_attn 8 heads / 2 kv_heads; linear_attn 16 key_heads / 16 value_heads
-- RMSNorm 使用 `(1 + weight)` 格式
+- RMSNorm：`input_layernorm` 使用 `(1 + weight)` 格式，`linear_attn.norm` (RMSNormGated) 使用 `weight * x` 格式（不加 1）
 - Full attention 层有 sigmoid 输出门控
 - tie_word_embeddings=true（lm_head 共享 embed_tokens 权重）
 
@@ -62,8 +62,9 @@
 - ruff lint + format 全部通过
 - 模块 `importlib` 导入正常（目录名含数字前缀需 `importlib.import_module`）
 - 现有 11 个单元测试全部通过
-- 端到端推理：HF transformers logits 对比 cosine similarity > 0.99
-- OpenAI 接口冒烟测试通过（temperature=0.6，输出连贯中文）
+- 端到端推理：HF transformers logits 对比 cosine similarity > 0.9999（4 个 prompt 全部 > 0.9999，top-1 token 完全匹配）
+- OpenAI 接口冒烟测试 10/10 全部通过（temperature=0.6，输出质量优秀：中文诗歌、数学推理、角色扮演均正常）
+- Decode 性能基准（MPS, float16）：~25 tok/s
 
 ### Bug 修复
 
@@ -81,6 +82,7 @@
 12. **Gated DeltaNet recurrent state float32 计算**: MPS float16 下 decode 超过 ~30 步后输出退化（重复 `**`、循环文本、乱码）。修复：`torch_recurrent_gated_delta_rule` 内部升级为 float32 计算，`create_layer_states` 中 linear attention 的 recurrent state 初始分配为 float32，输出前转回模型 dtype (fp16)。效果：长文本输入用例质量明显提升（从完全循环变成有意义的摘要），但其他中长输出用例仍然退化（空行重复、文本循环），说明还有其他精度瓶颈
 13. **截断 thinking tokens 失败（负优化，已回退）**: 尝试在 chat template 末尾注入 `<think\>\n\n</think\>\n\n` 让模型跳过思考。失败原因：模型在 prompt 中看到 `<think\></think\>` 后会跳过思考直接回答，但去掉 prompt 中的 thinking tokens 后模型会自己生成 `<think\>` 进入 thinking mode，导致输出全是思考文本。结论：不应截断 thinking tokens，保留原始 chat template
 14. **skip_thinking 过滤失败（负优化，已回退）**: 在 `_generate_tokens` 中添加 skip_thinking 过滤，等看到 `</think\>` token 后才开始输出。失败原因：(a) 模型在 prompt 中看到 `<think\></think\>` 时跳过思考直接回答，第一个 token 就不是 `</think\>`，导致 thinking_done 永远为 False；(b) 去掉 prompt 中的 thinking tokens 后模型会自己生成 thinking 内容，但 max_tokens 在 thinking 阶段也被消耗完，导致输出为空
+15. **RMSNormGated 使用了错误的 weight 格式（关键修复）**: `RMSNormGated` 使用了 `(1 + weight)` 格式（与 layer RMSNorm 一致），但 HF transformers 中 `Qwen3_5RMSNormGated` 使用的是 `weight * x`（不加 1）。这导致 linear attention 层的输出幅度偏差约 2 倍（our norm=5.07 vs HF norm=3.17），进而导致所有后续层的 hidden states 发散。修复后 prefill logits cosine similarity 从 0.845 提升到 >0.9999，所有 4 个测试 prompt 的 top-1 token 完全匹配
 
 ## 常用命令
 
@@ -110,22 +112,40 @@ pytest tests/test_scheduler.py tests/test_sequence.py tests/test_memory.py tests
 
 ### Step 6: 正确性验证
 
-- 对比 HF transformers 多 prompt 的 logits（余弦相似度 > 0.999）
-- 验证 decode 多步后 recurrent state 精度不退化
+- [x] 对比 HF transformers 多 prompt 的 logits（余弦相似度 > 0.9999，4 个 prompt 全部通过）
+- [x] 验证 decode 多步后 recurrent state 精度不退化（50 步 greedy decode，cosine > 0.9999，top-1 100% 匹配）
+- [x] 逐层 hidden norm 对比（24 层全部 cos > 0.9999，norm ratio = 1.000，与 HF 完全一致）
+- [x] hidden_norm "发散" 问题已确认是 RMSNormGated bug 导致，修复后不存在发散。norm 从 2.53→129.61 (x51.3) 是模型正常行为（HF 也完全一致）
 
-### Step 7: 精度优化（进行中）
+### Step 7: 精度优化（已完成）
 
-- [x] **Gated DeltaNet recurrent state float32 计算**：`torch_recurrent_gated_delta_rule` 内部已升级为 float32，recurrent state 初始分配为 float32。长文本用例改善明显，但中长输出仍有退化（空行重复、文本循环）。**仍需进一步排查其他精度瓶颈**
-- [ ] 对比 HF transformers 多 prompt 的 logits（余弦相似度 > 0.999）
-- [ ] **排查剩余精度退化**：float32 修复仅改善了部分用例，退化模式从 `**` 重复变为空行重复和文本循环。可能的瓶颈方向：(a) KV cache（softmax attention 层）的 fp16 累积误差；(b) MLP 层中间激活的精度损失；(c) MPS 后端特定算子的数值精度问题。需要逐层对比 HF 输出定位
+- [x] **Gated DeltaNet recurrent state float32 计算**：`torch_recurrent_gated_delta_rule` 内部已升级为 float32，recurrent state 初始分配为 float32
+- [x] **Chunk parallel prefill kernel**：实现了 `torch_chunk_gated_delta_rule`（基于 HF transformers 参考实现）
+- [x] **RMSNormGated weight 格式修复**：修复后 prefill logits cosine similarity 从 0.845 → >0.9999
+- [x] **验证 decode 多步精度**：CPU float32 下 50 步 greedy decode，cosine > 0.9999，top-1 100%
+- [x] **冒烟测试质量验证**：10/10 通过，输出质量优秀（诗歌、数学、角色扮演均正常）
 
 ### Step 8: 性能优化
 
-- [ ] Gated DeltaNet prefill 路径：实现 chunk parallel 计算替代逐 token 循环
-- [ ] MoE expert batch：token 路由到同一 expert 时合并 matmul（如切换回 MoE 模型）
-- [ ] `torch.compile` 编译 MoE routing + expert 计算图
-- [ ] 多序列 batch decode
-- [ ] MPS 特定优化（`torch.backends.mps` 路径验证）
+- [x] **MLP gate_up_proj 合并**：将独立的 `gate_proj` + `up_proj` 合并为 `gate_up_proj`，减少 decode 路径的矩阵乘法次数。权重加载时 `torch.cat([gate_w, up_w], dim=0)` 合并
+- [x] **Linear attention fused in_proj**：将 `in_proj_qkv` + `in_proj_z` + `in_proj_b` + `in_proj_a` 四个独立线性层合并为单个 `in_proj`（2048→8224），减少 decode 路径 4 次 matmul → 1 次。权重加载时 `torch.cat([qkv_w, z_w, b_w, a_w], dim=0)` 合并
+- [x] **Recurrent kernel bmm 优化**: 用 `torch.bmm` 替代 Gated DeltaNet recurrent kernel 中的手动 broadcast+sum，减少中间张量分配。decode 速度从 23.2 → 27.8 tok/s（+20%）
+- [x] **Single-token decode fast path**: 特化 S=1 的 recurrent kernel（`torch_recurrent_gated_delta_rule_single`），去掉循环和多余 indexing/reshape
+- [x] **Full attention fused QKV projection**: 将 q_proj + k_proj + v_proj 合并为单个 `qkv_proj`（2048→9216），减少 decode 路径 matmul 次数
+- [x] **RoPE inv_freq 预计算**: `_precompute_rope_inv_freq` 预计算 RoPE 逆频率，避免每层每次 decode 重复计算 `arange` 和 `pow`
+- [x] **Decode 循环状态管理优化**: `openai_server.py` decode 循环中 kw_list 只构建一次，每步 in-place 更新 position_ids 和 layer state，避免 `states_to_kwargs` 的重复调用
+- [x] **A_log exp 缓存**: `Qwen35MoeGatedDeltaNet` 中缓存 `exp(A_log)` 避免每步重复 exp 计算
+- [x] **top-p 采样 top-k 预筛选**: `engine/sampler.py` 中 `top_p_sample` 先取 top-1024 候选再做 top-p 排序，避免对 248320 vocab 全量排序。采样时间从 12.68ms → 0.88ms（-93%），decode 速度从 28 → 45 tok/s（+64%）。这是本轮最大性能提升
+- [x] **性能基准**（MPS, float16）：decode ~45 tok/s, prefill 512 tokens ~0.33s (1548 tok/s)
+  - Model forward: 96.0% | Sampling: 4.0%
+- [x] **Usage token 计数优化**: `_generate_tokens` 直接跟踪 output token 数，避免 `_batch_chat`/`_batch_compl` 重新 encode 输出文本计算 token 数。yield 改为三元组 `(text, reason, token_count)`
+- [ ] **`torch.compile` decode 路径**：编译 decode 路径（单 token）的模型前向来消除 Python 开销
+  - 尝试 aot_eager 和 inductor 两个 backend，均失败
+  - aot_eager: (a) full attention 层的 KV cache in-place 赋值 `key_cache[:, cache_len:cache_len+S] = k` 不兼容图捕获；(b) linear attention 的 chunk kernel 中 transpose/contiguous 在 MPS 上触发 weakref 错误
+  - inductor: MPS 后端 PythonDispatcher dispatch 错误
+  - 结论：PyTorch 2.11 的 `torch.compile` 对 MPS 后端支持不够成熟，暂不可用
+- [ ] **多序列 batch decode**：支持多请求并行推理
+- [ ] **MPS 特定优化**：验证 `torch.backends.mps` 路径，优化 memory pool
 
 ## 失败经验总结
 
@@ -137,3 +157,11 @@ QwenPaw-Flash-2B 的 chat template 包含 `<think\>` 相关 token。尝试操控
 2. **skip_thinking 过滤**: 过滤 `</think\>` 之前的 token，但模型可能直接跳过思考（第一个 token 不是 `</think\>`），导致永远等不到标记而输出为空
 
 **结论**: 保留原始 chat template，不做任何 thinking token 相关的特殊处理。模型的 thinking 行为由 chat template 和采样参数（temperature、top_p）自然控制。
+
+### RoPE 预计算表在 MPS 上负优化
+
+CPU 上 RoPE cos/sin 预计算表查找比直接计算快 107x，但在 MPS 上 fancy indexing (`tensor[:, pos_tensor]`) 的 kernel launch 开销抵消了计算节省，实测 decode 速度从 43.4 → 38.5 tok/s（-11%）。已回退，保留直接计算 + inv_freq 预缓存的方式。
+
+**原因**: MPS 后端对 fancy indexing 的实现效率低，每次索引操作都需要启动新的 Metal kernel，而直接计算（element-wise 乘法 + cos/sin）可以被 MPS 的 compute graph 优化合并。
+
+**结论**: 在 MPS 上避免使用 tensor indexing，优先使用 element-wise 操作和 compute-bound 的数学运算。

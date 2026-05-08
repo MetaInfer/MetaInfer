@@ -98,7 +98,7 @@ class QwenOpenAIServer:
         top_p: float,
         skip_thinking: bool = False,
     ):
-        """Yield (token_text, finish_reason) per step.
+        r"""Yield (token_text, finish_reason, output_token_count) per step.
 
         If skip_thinking=True, suppress output until </think\> is seen
         (Qwen3.5 thinking mode: model first generates <think\>...thinking...</think\> then answer).
@@ -133,16 +133,30 @@ class QwenOpenAIServer:
         if skip_thinking and tok == self._THINK_END:
             thinking_done = True
         elif thinking_done:
-            yield self.tokenizer.decode([tok], skip_special_tokens=True), None
+            yield self.tokenizer.decode([tok], skip_special_tokens=True), None, 1
 
-        for _ in range(1, max_tokens):
-            dec_ids = torch.tensor([[seq.output_ids[-1]]], dtype=torch.long, device=dev)
-            cur_pos = seq.total_tokens - 1
-            kw_list = states_to_kwargs(states)
-            for kw in kw_list:
-                kw["position_ids"] = torch.tensor([[cur_pos]], device=dev, dtype=torch.long)
+        # Decode loop — reuse kw_list in-place, only refresh changed fields
+        dec_buf = torch.zeros(1, 1, dtype=torch.long, device=dev)
+        pos_buf = torch.zeros(1, 1, dtype=torch.long, device=dev)
 
-            logits = self.runner.model(dec_ids, kw_list)
+        # Build kw_list once; we update position_ids and layer states in-place each step
+        kw_list = states_to_kwargs(states)
+
+        for step in range(1, max_tokens):
+            dec_buf[0, 0] = seq.output_ids[-1]
+            pos_buf[0, 0] = seq.total_tokens - 1
+
+            # Refresh state references (recurrent/conv tensors may have been replaced)
+            for idx, s in enumerate(states):
+                kw = kw_list[idx]
+                kw["position_ids"] = pos_buf
+                if s.layer_type == "full_attention":
+                    kw["cache_len"] = s.cache_len
+                else:
+                    kw["recurrent_state"] = s.recurrent
+                    kw["conv_state"] = s.conv
+
+            logits = self.runner.model(dec_buf, kw_list)
             tok = int(
                 sample_next_tokens(
                     logits[:, -1, :].cpu().float(), temperature=temperature, top_p=top_p
@@ -150,6 +164,8 @@ class QwenOpenAIServer:
             )
             seq.append_token(tok)
             update_states_from_kwargs(states, kw_list)
+
+            n_output = len(seq.output_ids)
 
             reason = None
             if tok == self.runner.eos_token_id:
@@ -162,7 +178,7 @@ class QwenOpenAIServer:
                     thinking_done = True
                 # Don't yield anything during thinking phase
             else:
-                yield self.tokenizer.decode([tok], skip_special_tokens=True), reason
+                yield self.tokenizer.decode([tok], skip_special_tokens=True), reason, n_output
 
             if reason is not None:
                 break
@@ -206,7 +222,7 @@ class QwenOpenAIServer:
         h.end_headers()
 
         n_compl = 0
-        for text, reason in gen:
+        for text, reason, _ in gen:
             n_compl += 1
             delta = {"role": "assistant", "content": text} if n_compl == 1 else {"content": text}
             chunk = {
@@ -230,12 +246,13 @@ class QwenOpenAIServer:
     def _batch_chat(self, h, req_id, model_name, gen):
         parts: list[str] = []
         finish = "stop"
-        for text, reason in gen:
+        n_tokens = 0
+        for text, reason, tok_count in gen:
             parts.append(text)
+            n_tokens = tok_count
             if reason is not None:
                 finish = reason
         content = "".join(parts)
-        compl_tokens = len(self.tokenizer.encode(content, add_special_tokens=False))
         prompt_tokens = 0  # not available from generator
 
         body = {
@@ -251,8 +268,8 @@ class QwenOpenAIServer:
             ],
             "usage": {
                 "prompt_tokens": prompt_tokens,
-                "completion_tokens": compl_tokens,
-                "total_tokens": prompt_tokens + compl_tokens,
+                "completion_tokens": n_tokens,
+                "total_tokens": prompt_tokens + n_tokens,
             },
         }
         _json_resp(h, HTTPStatus.OK, body)
@@ -283,7 +300,7 @@ class QwenOpenAIServer:
         h.send_header("Connection", "close")
         h.end_headers()
 
-        for text, reason in self._generate_tokens(token_ids, max_tokens, temp, top_p):
+        for text, reason, _ in self._generate_tokens(token_ids, max_tokens, temp, top_p):
             chunk = {
                 "id": req_id,
                 "object": "text_completion",
@@ -298,13 +315,14 @@ class QwenOpenAIServer:
     def _batch_compl(self, h, req_id, model_name, token_ids, max_tokens, temp, top_p):
         parts: list[str] = []
         finish = "stop"
-        for text, reason in self._generate_tokens(token_ids, max_tokens, temp, top_p):
+        n_tokens = 0
+        for text, reason, tok_count in self._generate_tokens(token_ids, max_tokens, temp, top_p):
             parts.append(text)
+            n_tokens = tok_count
             if reason is not None:
                 finish = reason
         content = "".join(parts)
         prompt_tokens = len(token_ids)
-        compl_tokens = len(self.tokenizer.encode(content, add_special_tokens=False))
 
         body = {
             "id": req_id,
@@ -313,8 +331,8 @@ class QwenOpenAIServer:
             "choices": [{"index": 0, "text": content, "finish_reason": finish}],
             "usage": {
                 "prompt_tokens": prompt_tokens,
-                "completion_tokens": compl_tokens,
-                "total_tokens": prompt_tokens + compl_tokens,
+                "completion_tokens": n_tokens,
+                "total_tokens": prompt_tokens + n_tokens,
             },
         }
         _json_resp(h, HTTPStatus.OK, body)
