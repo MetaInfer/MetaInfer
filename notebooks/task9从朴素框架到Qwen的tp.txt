@@ -1,0 +1,16 @@
+task9: To truly realize the core vision of "AI automatically generating customized frameworks", we completely abandon the import vllm shortcut. We need you as a pure code generator, based on the local knowledge base I provide, modify and supplement @meta-infer/engine @meta-infer/llm_engine.py from scratch hand-write Tensor Parallel (TP) full pipeline code.
+Please carefully read all Markdown knowledge files under @meta-infer/notebooks-cn/04_parallel_strategies directory, and strictly follow the following three phases for generation:
+Phase 1: Build底层 TP Operator Library (TP Primitives)
+Read knowledge: Carefully read @meta-infer/notebooks-cn/04_parallel_strategies/01_tensor_parallel.md @meta-infer/notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md
+Write code: Create tp_layers folder under engine/ to store TP-related files
+Implementation requirements: Pure hand-written基于 torch.distributed core TP operators:
+ColumnParallelLinear: Weight sharded by column, input Broadcast, output optionally AllGather.
+RowParallelLinear: Weight sharded by row, input保持 in Sequence/Batch dimension, output must AllReduce aggregation.
+VocabParallelEmbedding: Vocab dimension sharding.
+Phase 2: Generate Dense Model TP Pipeline (Using Qwen as基准)
+Write code: Create engine/models/qwen.py.
+Implementation requirements:
+Network skeleton: Use你在 Phase 1写的 tp_layers.py to搭建 Qwen3's DecoderLayer (Attention's QKV用 Column切, o_proj用 Row切; MLP's up/gate用 Column切, down用 Row切).
+Lazy loading: Hand-write load_weights function, use safetensors.safe_open, according to current process's tp_rank get corresponding Slice read into显存,坚决 prevent OOM.
+TDD test: Write unit tests and run through/data/xinference/cache/Qwen3-0.6B    /data/xinference/cache/Qwen3-8B two models' local 4-card forward propagation, ensure logits与 single card无缝 alignment. Input 5句 Chinese prompts, until获得 5句 real inference results
+Additionally test output print, select model's first and last layer's core matrices (e.g., q_proj and gate_up_proj), on each Rank print their param.shape and param.device. ModelRunner.run() or model forward entry, inject print statements. Requirements: Print input_ids所在 device. After computation得到 logits, print logits.device and logits.shape. Explicit print: "Rank [X] is computing on [Device Y]...".

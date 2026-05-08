@@ -1,0 +1,83 @@
+task10: Now we need to update TP support for deepseekv2
+Carefully read @meta-infer/notebooks-cn/04_parallel_strategies and @meta-infer/notebooks-cn/02_model_specifics/02_deepseek_v3, acquire TP-related knowledge. We only prioritize adapting deepseekv2, but保留 for deepseekv3 extension adaptation.
+Phase 1: Upgrade底层 TP Operator Library (Add MoE Support)
+1. Create new moe.py under engine/tp_layers/.
+2. Implement ExpertParallelMoE component. Use "simplified Expert Parallel (EP via AllReduce)" strategy:
+Router (Gate): Not sharded, all Ranks replicate一份 same Router weights, compute same routing scores.
+Expert allocation: Evenly distribute total experts (e.g., 160, can联网查找 deepseekv2 info) to tp_size cards. Rank  only responsible for instantiating and computing its portion of experts (e.g., Rank 0 responsible for Expert 0~39).
+Forward computation: Judge each Token's Top-K experts. If selected expert is local to current Rank, compute its output and weighted sum; if not, directly skip (output 0).
+Communication aggregation: After current Rank's local experts complete computation, execute all_reduce_sum, merge各 card's partial results into global MoE output.
+Phase 2:攻克 MLA (Multi-Head Latent Attention) Sharding Rules
+Create new deepseek_v2.py under engine/models/, implement DeepseekAttentionTP.
+Dimensions that absolutely cannot be sharded (Replicated):
+• q_a_proj and kv_a_proj_with_mqa (latent vector dimensionality reduction projection): They compress hidden_size to q_lora_rank / kv_lora_rank. Strictly prohibited to shard, all Ranks must fully load this weight.
+Dimensions that must be sharded (Column / Row Parallel):
+• q_b_proj and kv_b_proj_with_mqa (latent vector upsampling to multi-head): Their output is num_heads * head_dim. Please use ColumnParallelLinear to evenly distribute Head数 to各个 Rank.
+• o_proj: Use RowParallelLinear for result aggregation.
+RoPE handling: DeepSeek's RoPE is decoupled (Decoupled RoPE), only作用于 appended RoPE tokens, please carefully handle q_pe and k_pe rotation logic, use Neox (first-half/second-half) style.
+5. KV Cache alignment: Only need to cache dimensionality-reduced Latent Vector (plus少量 RoPE vectors), do not cache expanded K and V.
+Phase 3: Safely Load 16B Weights (Anti-OOM Iron Rules)
+1. Implement DeepseekForCausalLMTP.load_weights() in deepseek_v2.py.
+2. Lazy Loading: Use safetensors.safe_open.
+• For MLA's q_b_proj, by current Rank's Head range at disk level get_slice().
+• For MoE expert weights, Rank  only reads and copies weight matrices belonging to its expert ID range,坚决 prohibit reading other Ranks' expert weights causing system memory explosion.
+Implementation process should reference @meta-infer/notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md, previous错误 experience should not be犯 again
+
+This is an extremely complex task. Please
+only write Phase 1 (ExpertParallelMoE skeleton in moe.py) and Phase 2 MLA structure definition, write as document存入 @meta-infer/notebooks-cn/07_agentPlan, don't modify code first
+
+Please正式 start writing Phase 1 (moe.py) and Phase 2 (deepseek_v2.py structure) code. But before writing, please first follow TDD (Test-Driven Development) principles, write me a most严格 alignment test script tests/test_deepseek_tp_alignment.py.
+TDD Test Script Requirements:
+1. Dual-engine same-run comparison: In test script, given same input Prompt (e.g., "用一两句话介绍苏州园林的特点。").
+• Baseline: Use HuggingFace's AutoModelForCausalLM and AutoTokenizer on GPU 0 to single-card load /data/xinference/cache/deepseek-v2-chat-pytorch-16b, use temperature=0.0 (Greedy Search) to run reference text and first step Reference Logits.
+• Our framework (TP=4): Through multi-process launch our custom DeepseekForCausalLMTP, also adopt temperature=0.0 for inference, get TP Logits and generated text.
+2. Assert constraints:
+• torch.testing.assert_close(tp_logits, ref_logits, rtol=1e-3, atol=1e-3): Due to AllReduce floating point accumulation order differences, allow small errors, but绝对 cannot deviate too much.
+• assert tp_generated_text == ref_generated_text: Text must word-by-word correspond, completely一致!
+3. Memory safety guarantee: Since GPU 0 will simultaneously load full HF model (~32G) and 1/4 TP model (~8G), total占用 ~40G. Currently machine single card memory has 64G, can safely放下. But in script please explicitly call torch.cuda.empty_cache().
+Execution order:
+1. Please first output tests/test_deepseek_tp_alignment.py.
+2. Then according to plan file, write engine/tp_layers/moe.py and engine/models/deepseek_v2.py (without load_weights).
+3. To let test run through verify numerical values, after writing structure, please temporarily write a load_weights_from_hf_model(self, hf_model) debug method in deepseek_v2.py, directly in显存 slice and copy_ single card HF model weights to our TP model, to prove your MLA and MoE数学 sharding logic absolutely correct.
+Currently using 4-card self-implemented TP with HF single-card inference deepseek_v2 seems very complex, you first use already completed deepseek_v2 moe TP inference pipeline, write a script using /data/xinference/cache/deepseek-v2-chat-pytorch-16b to infer @meta-infer/tests/test_qwen_tp_real.py:17-21 these几句 prompt, I want to see real output
+
+@meta-infer/tests/test_deepseek_tp_real.py current inference报错 is due to you某些 layer sharding不对, carefully read @meta-infer/notebooks-cn/04_parallel_strategies/04_vllm_tp4_deepseekv2_index.md @meta-infer/notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md @meta-infer/notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md related knowledge and reference knowledge paths given source code modifications, @meta-infer/engine/models/deepseek_v2.py @meta-infer/engine/tp_layers/moe.py until获得 real inference output
+
+You left comment in deepseek_v2.py's load_weights_from_hf_model: # 其余保留阶段三完成。**This is a serious misunderstanding.** I asked you to暂缓 Phase 3 (disk loading),是为了 in current phase use pure memory copy method, thoroughly verify your MLA and MoE数学 sharding logic is correct. @meta-infer/engine/models/deepseek_v2.py:303-327 You漏拷 MLP and MoE weights, causing model output completely garbled!
+Additionally, baseline test memory also exploded. Please immediately fix following two points:
+1, @meta-infer/tests/test_deepseek_tp_real.py @meta-infer/tests/test_deepseek_tp_real.py:76-81 Since torchrun is multi-process, hf_model.to(device) causes 4 cards all loading full model (32G * 4).
+Fix action: Remove hf_model's .to(device), let ground truth model only驻留 in CPU memory.
+2, @meta-infer/engine/models/deepseek_v2.py:304-328, you漏掉了 MLP and MoE weights copy. Please according to your刚才 defined class structure,补齐 MLP layer weight loading logic.
+Please strictly follow following mapping logic (pseudocode idea), don't生搬硬套 variable names, please对照 your actually written class attribute names to implement:
+Determine current layer's MLP type: Check current layer's MLP is ordinary Dense MLP or MoE.
+If MoE layer (DeepseekMoETP), please分三步 copy:
+(1) Router Gate network: All Ranks must fully replicate. Directly copy HF model corresponding gate weights fully (.copy_) to our router gate.
+(2) Routed Experts: Execute Expert Parallel (EP). Iterate current Rank's instantiated local expert dictionary, get expert_id. Then go to HF model's expert list to取出 corresponding index expert, directly fully copy its内部 gate_proj, up_proj, down_proj weights over (no slicing needed).
+(3) Shared Experts: If exist, execute Tensor Parallel (TP). Please call your implemented load_weight_shard interface, to HF model shared experts' gate_proj, up_proj, down_proj进行 slicing loading.
+If ordinary Dense layer (first few layers' MLP):
+Directly execute Tensor Parallel (TP). Call load_weight_shard interface, to that layer's gate_proj, up_proj, down_proj进行 slicing loading.
+Please combine real hf_model structure and your written TP class attribute names, safely补齐这段 memory copy logic. After complete re-run alignment test.
+
+Pure self-developed TP convergence route (I will execute this):
+Close HF-debug, fixed run:
+torchrun --nproc_per_node=4 -m pytest tests/test_deepseek_tp_real.py -q -s
+Do per-layer alignment localization (not final output comparison)
+For same input, compare TP vs HF each layer hidden/attention output difference, find first diverging layer.
+Prioritize fixing DeepSeek-specific points
+rope_scaling/yarn (your this model config has it)
+MLA related q/k rope path and dtype
+attention scale/softmax numerical path
+Then fix MoE path
+router scores and top-k
+expert routing/aggregation and all_reduce semantics
+Final acceptance
+Without any HF-debug, 5 prompts output semantics stable
+Multiple re-runs results一致
+
+Fixed DeepSeek-specific RoPE path in engine/models/deepseek_v2.py:
+
+Changed RoPE rotation from neox style to更符合 DeepSeek's gptj/interleave style
+Added rope_scaling.type == "yarn" frequency correction logic (factor/beta_fast/beta_slow/original_max_position_embeddings)
+Added YaRN's mscale对 cos/sin的影响
+Added YaRN-related scaling correction to attention scaling
+DeepseekV2TPConfig added rope_scaling and read from HF config
