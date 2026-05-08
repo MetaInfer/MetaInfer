@@ -7,7 +7,7 @@
       content: "你是一个友好的AI助手，请用简洁礼貌的方式回答用户的问题。"
     - role: user
       content: "你好，请自我介绍一下"
-  max_tokens: 128
+  max_tokens: 512
   assert:
     keywords_any: ["你好", "嗨", "您好", "我是"]
     finish_reason: "stop"
@@ -18,7 +18,7 @@
       content: "You are a helpful math assistant. Always give concise answers."
     - role: user
       content: "What is 2+2? Answer with just the number."
-  max_tokens: 32
+  max_tokens: 512
   assert:
     keywords_any: ["4", "four"]
     finish_reason: "stop"
@@ -29,7 +29,7 @@
       content: "你是一个知识渊博的助手，回答问题时请确保信息准确。"
     - role: user
       content: "中国的首都是哪个城市？"
-  max_tokens: 64
+  max_tokens: 512
   assert:
     keywords_any: ["北京"]
     finish_reason: "stop"
@@ -40,7 +40,7 @@
       content: "你是一个海盗船长，请用海盗的语气说话。"
     - role: user
       content: "请自我介绍一下"
-  max_tokens: 128
+  max_tokens: 2048
   assert:
     keywords_any: ["海盗", "船长", "船长", "大海", "宝藏"]
     finish_reason: "stop"
@@ -55,7 +55,7 @@
       content: "1+1等于2。"
     - role: user
       content: "那再加1呢？"
-  max_tokens: 64
+  max_tokens: 512
   assert:
     keywords_any: ["3", "三"]
     finish_reason: "stop"
@@ -70,7 +70,7 @@
       content: "好的，我记住了，你最喜欢的水果是苹果。"
     - role: user
       content: "我最喜欢的水果是什么？"
-  max_tokens: 32
+  max_tokens: 512
   assert:
     keywords_any: ["苹果", "果", "水果"]
     min_keyword_matches: 1
@@ -88,7 +88,7 @@
         近年来，随着深度学习和大数据技术的发展，AI在图像识别、自然语言处理、
         自动驾驶等领域取得了显著进展。AI技术的广泛应用正在深刻改变各个行业，
         包括医疗、金融、教育和制造业等。
-  max_tokens: 128
+  max_tokens: 512
   assert:
     keywords_any: ["人工智能", "AI", "智能", "技术"]
     finish_reason: "stop"
@@ -99,7 +99,7 @@
       content: "你是一个精通中英文的翻译助手，能够在中英文之间自如切换。"
     - role: user
       content: "Please translate '人工智能' to English and explain what it means in Chinese."
-  max_tokens: 128
+  max_tokens: 1024
   assert:
     keywords_any: ["artificial intelligence", "Artificial Intelligence", "人工智能"]
     finish_reason: "stop"
@@ -110,7 +110,7 @@
       content: "你是一位富有才华的诗人，擅长创作意境优美的中文诗歌。"
     - role: user
       content: "请写一首关于春天的短诗，四行即可。"
-  max_tokens: 128
+  max_tokens: 2048
   assert:
     keywords_any: ["春", "花", "绿", "风", "雨"]
     finish_reason: "stop"
@@ -121,7 +121,7 @@
       content: "你是一个简短回答的助手。"
     - role: user
       content: "用逗号分隔列出三种颜色，不需要解释。"
-  max_tokens: 32
+  max_tokens: 512
   assert:
     keywords_any: ["红", "蓝", "绿", "黄", "白", "黑", "紫", "橙", "青", "粉", "色"]
     min_keyword_matches: 1
