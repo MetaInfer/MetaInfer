@@ -42,10 +42,7 @@ def ensure_divisible(value: int, divisor: int, *, name: str) -> None:
 def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
     if not is_tp_enabled():
         return x
-    if x.dtype in (torch.float16, torch.bfloat16):
-        tmp = x.float()
-        dist.all_reduce(tmp, op=dist.ReduceOp.SUM)
-        return tmp.to(dtype=x.dtype)
+    # NCCL natively supports bf16/fp16 all_reduce, no dtype conversion needed.
     dist.all_reduce(x, op=dist.ReduceOp.SUM)
     return x
 

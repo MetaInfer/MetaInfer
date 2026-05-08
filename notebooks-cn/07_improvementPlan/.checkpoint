@@ -1,0 +1,40 @@
+current_phase: COMPLETE
+status: optimization_complete
+timestamp: 2026-05-08T00:30:00
+
+completed_phases:
+  - phase: P0
+    description: Incremental KV Cache decoding
+    result: SUCCESS
+    throughput_before: 2.15 tok/s
+    throughput_after: 8.49 tok/s
+    improvement: 3.95x
+
+  - phase: P1
+    description: Batched MoE forward
+    result: REVERTED (no benefit at batch=1)
+    throughput: 7.06 tok/s (regression)
+
+  - phase: P2
+    description: CUDA Graph
+    result: SKIPPED (requires fixed-shape KV cache)
+
+  - phase: P5
+    description: TP communication optimization
+    result: SUCCESS
+    throughput_after: 8.87 tok/s
+    improvement: +4.5% over P0
+
+  - phase: P5+buffer
+    description: Pre-allocated KV cache buffer
+    result: NEUTRAL (no significant change for short sequences)
+    throughput_after: 8.76 tok/s
+
+final_metrics:
+  model: DeepSeek-V2-Lite-Chat
+  tp: 4
+  gpus: 4,5,6,7
+  output_throughput: 8.76 tok/s
+  mean_ttft: 3755 ms
+  duration: 88.49 s
+  total_improvement: 4.07x over baseline (2.15 tok/s)

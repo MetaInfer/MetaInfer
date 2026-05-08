@@ -145,7 +145,18 @@ class QwenAttentionTP(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
 
-    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        past_key_values: tuple[torch.Tensor, torch.Tensor, int] | None = None,
+        max_seq_len: int = 512,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, int]]:
+        """Forward with pre-allocated KV cache buffer.
+
+        past_key_values: (k_buf, v_buf, kv_len) with pre-allocated buffers [B, max_seq_len, num_kv_heads, head_dim]
+        Returns: (output, new_cache)
+        """
         bsz, seqlen, _ = hidden_states.shape
         q = self.q_proj(hidden_states).view(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -155,17 +166,38 @@ class QwenAttentionTP(nn.Module):
         k = self.k_norm(k)
         q, k = _apply_rope(q, k, positions, self.rope_theta)
 
+        if past_key_values is None:
+            # Prefill: allocate buffers
+            k_buf = torch.zeros(bsz, max_seq_len, self.num_kv_heads, self.head_dim, device=k.device, dtype=k.dtype)
+            v_buf = torch.zeros(bsz, max_seq_len, self.num_kv_heads, self.head_dim, device=v.device, dtype=v.dtype)
+            k_buf[:, :seqlen] = k
+            v_buf[:, :seqlen] = v
+            kv_len = seqlen
+        else:
+            # Decode: write into pre-allocated buffer
+            k_buf, v_buf, kv_len = past_key_values
+            k_buf[:, kv_len:kv_len + seqlen] = k
+            v_buf[:, kv_len:kv_len + seqlen] = v
+            kv_len = kv_len + seqlen
+
+        k_valid = k_buf[:, :kv_len]
+        v_valid = v_buf[:, :kv_len]
+
+        new_cache = (k_buf, v_buf, kv_len)
+
+        # GQA broadcast
         if self.num_kv_heads != self.num_heads:
             repeat = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeat, dim=2)
-            v = v.repeat_interleave(repeat, dim=2)
+            k_valid = k_valid.repeat_interleave(repeat, dim=2)
+            v_valid = v_valid.repeat_interleave(repeat, dim=2)
 
         q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True, scale=self.scaling)
+        k_valid = k_valid.permute(0, 2, 1, 3)
+        v_valid = v_valid.permute(0, 2, 1, 3)
+        is_causal = (past_key_values is None)
+        out = F.scaled_dot_product_attention(q, k_valid, v_valid, dropout_p=0.0, is_causal=is_causal, scale=self.scaling)
         out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.q_size)
-        return self.o_proj(out)
+        return self.o_proj(out), new_cache
 
 
 class QwenMLPTP(nn.Module):
@@ -193,13 +225,19 @@ class QwenDecoderLayerTP(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = QwenMLPTP(cfg)
 
-    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        past_key_values: tuple | None = None,
+        max_seq_len: int = 512,
+    ) -> tuple[torch.Tensor, tuple]:
         h = self.input_layernorm(hidden_states)
-        h = self.self_attn(h, positions)
+        h, new_cache = self.self_attn(h, positions, past_key_values, max_seq_len=max_seq_len)
         hidden_states = hidden_states + h
         h2 = self.post_attention_layernorm(hidden_states)
         h2 = self.mlp(h2)
-        return hidden_states + h2
+        return hidden_states + h2, new_cache
 
 
 class QwenForCausalLMTP(nn.Module):
@@ -216,17 +254,36 @@ class QwenForCausalLMTP(nn.Module):
         self.to(device=device, dtype=dtype)
 
     @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: list[tuple | None] | None = None,
+        position_offset: int = 0,
+        max_seq_len: int = 512,
+    ) -> tuple[torch.Tensor, list[tuple]]:
+        """Forward with optional KV cache.
+
+        Args:
+            input_ids: [B, seq_len] token ids
+            past_key_values: list of per-layer cache tuples, or None for prefill
+            position_offset: starting position for the tokens
+        Returns:
+            (logits, new_past_key_values)
+        """
         rank = get_tp_rank()
-        print(f"[QwenTP] Rank [{rank}] is computing on [Device {input_ids.device}]...")
         hidden_states = self.embed_tokens(input_ids)
-        pos = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, pos)
+        seq_len = input_ids.shape[1]
+        pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
+
+        new_past_key_values = []
+        for i, layer in enumerate(self.layers):
+            layer_cache = past_key_values[i] if past_key_values is not None else None
+            hidden_states, new_cache = layer(hidden_states, pos, layer_cache, max_seq_len=max_seq_len)
+            new_past_key_values.append(new_cache)
+
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
-        print(f"[QwenTP] Rank [{rank}] logits device={logits.device} shape={tuple(logits.shape)}")
-        return logits
+        return logits, new_past_key_values
 
     def _resolve_weight_map(self) -> dict[str, str]:
         index_file = self.cfg.model_dir / "model.safetensors.index.json"
@@ -380,14 +437,25 @@ class QwenTPModelRunner:
     ) -> list[int]:
         if not seqs:
             return []
-        # 为避免左 padding 的位置编码/掩码偏差，逐序列前向取最后位置 logits。
-        # 该路径更慢，但可与 HF baseline 对齐，便于 TP 正确性验证。
         next_tokens: list[int] = []
         for seq in seqs:
-            ids = torch.tensor([seq.token_ids], dtype=torch.long, device=self.device)
-            logits = self.model(ids)[0, -1, :].unsqueeze(0)
-            tok = int(sample_next_tokens(logits, temperature=temperature, top_p=top_p).item())
-            next_tokens.append(tok)
+            max_tokens = int(seq.sampling_params.get("max_tokens", 32))
+            max_seq_len = len(seq.input_ids) + max_tokens + 16
+            if is_prefill:
+                ids = torch.tensor([seq.token_ids], dtype=torch.long, device=self.device)
+                logits, past_kv = self.model(ids, past_key_values=None, position_offset=0, max_seq_len=max_seq_len)
+                seq.past_key_values = past_kv
+                logits = logits[0, -1, :].unsqueeze(0)
+            else:
+                new_token = seq.token_ids[-1:]
+                ids = torch.tensor([new_token], dtype=torch.long, device=self.device)
+                position_offset = len(seq.token_ids) - 1
+                logits, past_kv = self.model(
+                    ids, past_key_values=seq.past_key_values, position_offset=position_offset, max_seq_len=max_seq_len
+                )
+                seq.past_key_values = past_kv
+                logits = logits[0, -1, :].unsqueeze(0)
+            next_tokens.append(int(sample_next_tokens(logits, temperature=temperature, top_p=top_p).item()))
         return next_tokens
 
 

@@ -327,6 +327,7 @@ class LLMEngine:
         if seq in self.scheduler.running:
             self.scheduler.running.remove(seq)
         self.memory_pool.free_sequence(seq)
+        seq.past_key_values = None  # free cached KV tensors
         if _should_log():
             print(
                 f"[LLMEngine] finish {seq.request_id}: gen_len={gen_len}, "

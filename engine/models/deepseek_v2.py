@@ -229,7 +229,22 @@ class DeepseekAttentionTP(nn.Module):
         b, t, _ = x.shape
         return x.view(b, t, self.local_heads, head_dim)
 
-    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        past_key_values: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None = None,
+        max_seq_len: int = 512,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]:
+        """Forward with pre-allocated KV cache buffer.
+
+        past_key_values: (k_nope_buf, v_buf, raw_k_pe_buf, kv_len) where
+          - k_nope_buf: [B, max_seq_len, num_kv_heads, qk_nope_head_dim] (pre-allocated)
+          - v_buf: [B, max_seq_len, num_kv_heads, v_head_dim] (pre-allocated)
+          - raw_k_pe_buf: [B, max_seq_len, 1, qk_rope_head_dim] (pre-allocated)
+          - kv_len: int (number of valid cached tokens)
+        Returns: (output, new_cache)
+        """
         bsz, seqlen, _ = hidden_states.shape
         if self.cfg.q_lora_rank is None:
             q_full = self.q_b_proj(hidden_states)
@@ -246,21 +261,53 @@ class DeepseekAttentionTP(nn.Module):
         kv_full = self.kv_b_proj_with_mqa(c_kv)
         kv_full = self._local_slice_heads(kv_full, self.cfg.qk_nope_head_dim + self.cfg.v_head_dim)
         k_nope, v = torch.split(kv_full, [self.cfg.qk_nope_head_dim, self.cfg.v_head_dim], dim=-1)
+        raw_k_pe = k_pe.view(bsz, seqlen, 1, self.cfg.qk_rope_head_dim)
 
+        if past_key_values is None:
+            # Prefill: allocate buffers and write
+            k_nope_buf = torch.zeros(bsz, max_seq_len, k_nope.shape[2], k_nope.shape[3], device=k_nope.device, dtype=k_nope.dtype)
+            v_buf = torch.zeros(bsz, max_seq_len, v.shape[2], v.shape[3], device=v.device, dtype=v.dtype)
+            raw_k_pe_buf = torch.zeros(bsz, max_seq_len, 1, raw_k_pe.shape[3], device=raw_k_pe.device, dtype=raw_k_pe.dtype)
+            k_nope_buf[:, :seqlen] = k_nope
+            v_buf[:, :seqlen] = v
+            raw_k_pe_buf[:, :seqlen] = raw_k_pe
+            kv_len = seqlen
+        else:
+            # Decode: write new KV into pre-allocated buffer
+            k_nope_buf, v_buf, raw_k_pe_buf, kv_len = past_key_values
+            k_nope_buf[:, kv_len:kv_len + seqlen] = k_nope
+            v_buf[:, kv_len:kv_len + seqlen] = v
+            raw_k_pe_buf[:, kv_len:kv_len + seqlen] = raw_k_pe
+            kv_len = kv_len + seqlen
+
+        # Slice valid portion
+        k_nope_valid = k_nope_buf[:, :kv_len]
+        v_valid = v_buf[:, :kv_len]
+        raw_k_pe_valid = raw_k_pe_buf[:, :kv_len]
+
+        # Apply RoPE to Q
         q_pe = _apply_rope_gptj(q_pe, positions, self.cfg.rope_theta, self.cfg.rope_scaling)
-        # k_pe shared across heads, then broadcast to local heads.
-        k_pe = k_pe.view(bsz, seqlen, 1, self.cfg.qk_rope_head_dim)
-        k_pe = _apply_rope_gptj(k_pe, positions, self.cfg.rope_theta, self.cfg.rope_scaling).expand(
-            -1, -1, self.local_heads, -1
-        )
+
+        # Apply RoPE to K_pe for ALL positions
+        all_positions = torch.arange(kv_len, device=hidden_states.device, dtype=torch.long)
+        k_pe_rope = _apply_rope_gptj(raw_k_pe_valid, all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+        k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
+
+        # Expand k_nope for GQA
+        if k_nope_valid.shape[2] != self.local_heads:
+            repeat = self.local_heads // k_nope_valid.shape[2]
+            k_nope_valid = k_nope_valid.repeat_interleave(repeat, dim=2)
 
         q_cat = torch.cat([q_nope, q_pe], dim=-1).permute(0, 2, 1, 3)
-        k_cat = torch.cat([k_nope, k_pe], dim=-1).permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+        k_cat = torch.cat([k_nope_valid, k_pe_rope], dim=-1).permute(0, 2, 1, 3)
+        v_perm = v_valid.permute(0, 2, 1, 3)
 
-        out = F.scaled_dot_product_attention(q_cat, k_cat, v, dropout_p=0.0, is_causal=True, scale=self.scaling)
+        is_causal = (past_key_values is None)
+        out = F.scaled_dot_product_attention(q_cat, k_cat, v_perm, dropout_p=0.0, is_causal=is_causal, scale=self.scaling)
         out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
-        return self.o_proj(out)
+
+        new_cache = (k_nope_buf, v_buf, raw_k_pe_buf, kv_len)
+        return self.o_proj(out), new_cache
 
 
 class DeepseekMLPTP(nn.Module):
@@ -315,13 +362,19 @@ class DeepseekDecoderLayerTP(nn.Module):
         else:
             self.mlp = DeepseekMLPTP(cfg)
 
-    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        past_key_values: tuple | None = None,
+        max_seq_len: int = 512,
+    ) -> tuple[torch.Tensor, tuple]:
         h = self.input_layernorm(hidden_states)
-        h = self.self_attn(h, positions)
+        h, new_cache = self.self_attn(h, positions, past_key_values, max_seq_len=max_seq_len)
         hidden_states = hidden_states + h
         h2 = self.post_attention_layernorm(hidden_states)
         h2 = self.mlp(h2)
-        return hidden_states + h2
+        return hidden_states + h2, new_cache
 
 
 class DeepseekForCausalLMTP(nn.Module):
@@ -492,7 +545,22 @@ class DeepseekForCausalLMTP(nn.Module):
             print(f"[DeepseekTP] load_weights done rank={r} cuda_allocated_mb={torch.cuda.memory_allocated() / 1024**2:.2f}")
 
     @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: list[tuple | None] | None = None,
+        position_offset: int = 0,
+        max_seq_len: int = 512,
+    ) -> tuple[torch.Tensor, list[tuple]]:
+        """Forward with optional KV cache.
+
+        Args:
+            input_ids: [B, seq_len] token ids (full sequence for prefill, or just new tokens for decode)
+            past_key_values: list of per-layer cache tuples, or None for prefill
+            position_offset: starting position for the tokens (0 for prefill, num_cached for decode)
+        Returns:
+            (logits, new_past_key_values)
+        """
         # 调试捷径：严格对齐测试优先走 HF 真值路径（rank0 计算并广播 logits）。
         if self._use_hf_logits_debug:
             if get_tp_rank() == 0:
@@ -509,14 +577,20 @@ class DeepseekForCausalLMTP(nn.Module):
                 )
             if get_tp_size() > 1:
                 torch.distributed.broadcast(logits, src=0)
-            return logits
+            return logits, []
 
         hidden_states = self.embed_tokens(input_ids)
-        pos = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, pos)
+        seq_len = input_ids.shape[1]
+        pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
+
+        new_past_key_values = []
+        for i, layer in enumerate(self.layers):
+            layer_cache = past_key_values[i] if past_key_values is not None else None
+            hidden_states, new_cache = layer(hidden_states, pos, layer_cache, max_seq_len=max_seq_len)
+            new_past_key_values.append(new_cache)
+
         hidden_states = self.norm(hidden_states)
-        return self.lm_head(hidden_states)
+        return self.lm_head(hidden_states), new_past_key_values
 
     @torch.inference_mode()
     def load_weights_from_hf_model(self, hf_model: nn.Module | None, *, use_hf_logits_debug: bool = False) -> None:
@@ -662,8 +736,22 @@ class DeepseekTPModelRunner:
             return []
         out: list[int] = []
         for seq in seqs:
-            ids = torch.tensor([seq.token_ids], dtype=torch.long, device=self.device)
-            logits = self.model(ids)[0, -1, :].unsqueeze(0)
+            max_tokens = int(seq.sampling_params.get("max_tokens", 32))
+            max_seq_len = len(seq.input_ids) + max_tokens + 16  # prompt + max_gen + margin
+            if is_prefill:
+                ids = torch.tensor([seq.token_ids], dtype=torch.long, device=self.device)
+                logits, past_kv = self.model(ids, past_key_values=None, position_offset=0, max_seq_len=max_seq_len)
+                seq.past_key_values = past_kv
+                logits = logits[0, -1, :].unsqueeze(0)
+            else:
+                new_token = seq.token_ids[-1:]
+                ids = torch.tensor([new_token], dtype=torch.long, device=self.device)
+                position_offset = len(seq.token_ids) - 1
+                logits, past_kv = self.model(
+                    ids, past_key_values=seq.past_key_values, position_offset=position_offset, max_seq_len=max_seq_len
+                )
+                seq.past_key_values = past_kv
+                logits = logits[0, -1, :].unsqueeze(0)
             out.append(int(sample_next_tokens(logits, temperature=temperature, top_p=top_p).item()))
         return out
 
