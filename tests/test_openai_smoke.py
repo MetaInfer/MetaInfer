@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -21,10 +22,23 @@ import yaml
 
 _HERE = Path(__file__).parent
 
+_ENV_MAP = {
+    "base_url": "OPENAI_SMOKE_BASE_URL",
+    "model": "OPENAI_SMOKE_MODEL",
+    "timeout": "OPENAI_SMOKE_TIMEOUT",
+}
+
 
 def _load_config() -> dict:
     with open(_HERE / "openai_smoke_config.yaml") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    for key, env_var in _ENV_MAP.items():
+        val = os.environ.get(env_var)
+        if val is not None:
+            if key == "timeout":
+                val = int(val)
+            cfg[key] = val
+    return cfg
 
 
 def _load_cases() -> list[dict]:

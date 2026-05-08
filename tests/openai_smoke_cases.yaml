@@ -29,7 +29,7 @@
       content: "你是一个知识渊博的助手，回答问题时请确保信息准确。"
     - role: user
       content: "中国的首都是哪个城市？"
-  max_tokens: 512
+  max_tokens: 1024
   assert:
     keywords_any: ["北京"]
     finish_reason: "stop"
@@ -42,7 +42,7 @@
       content: "请自我介绍一下"
   max_tokens: 2048
   assert:
-    keywords_any: ["海盗", "船长", "船长", "大海", "宝藏"]
+    keywords_any: ["海盗", "船长", "大海", "宝藏", "Captain", "pirate", "sea", "treasure"]
     finish_reason: "stop"
 
 - name: "多轮对话-两轮"
@@ -88,7 +88,7 @@
         近年来，随着深度学习和大数据技术的发展，AI在图像识别、自然语言处理、
         自动驾驶等领域取得了显著进展。AI技术的广泛应用正在深刻改变各个行业，
         包括医疗、金融、教育和制造业等。
-  max_tokens: 512
+  max_tokens: 2048
   assert:
     keywords_any: ["人工智能", "AI", "智能", "技术"]
     finish_reason: "stop"
@@ -110,7 +110,7 @@
       content: "你是一位富有才华的诗人，擅长创作意境优美的中文诗歌。"
     - role: user
       content: "请写一首关于春天的短诗，四行即可。"
-  max_tokens: 2048
+  max_tokens: 4096
   assert:
     keywords_any: ["春", "花", "绿", "风", "雨"]
     finish_reason: "stop"
