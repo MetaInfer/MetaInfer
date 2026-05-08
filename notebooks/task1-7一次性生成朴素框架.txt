@@ -1,0 +1,39 @@
+Please act as "Chief System Architect" and "Agent Collaboration Expert". We need to solidify the current system design and write a strict execution specification for future code-generating Sub-agents.
+Please carefully read the following core background documents:
+1. Global task and goals: @tasks.md
+2. Knowledge base overview: @MEMORY.md and its corresponding @README.md
+3. Current implemented simple framework summary: @real_inference_framework.md
+4. Current code directory: @engine/ and @llm_engine.py
+Based on all the above context, please generate two files for me: inference_blueprint.json and AGENT_SKILL.md. Store them under ./cursor/skills
+
+File 1: inference_blueprint.json (System Specification and Interface Contract)
+Please extract the most precise structured data from existing code and documentation, strictly no placeholders:
+1. project_context: Brief description of the core background in @tasks.md (solving bloated framework problem, doing small and beautiful customization).
+2. components: List core components (Scheduler, KVMemoryPool, ModelRunner, Sampler, Sequence, LLMEngine). For each component标注:
+role: Core responsibility.
+ref_docs: Related knowledge base path (e.g., @01_framework_design/02_scheduler.md).
+ref_code: Reference source code path (e.g., nano-vllm/nanovllm/engine/block_manager.py).
+Note: Reference documents are stored in @notebooks/01_framework_design, find corresponding reference source code in @ref_projects according to the knowledge documents, write into inference_blueprint.json
+3. data_flow_contracts: (Core) Strictly define Tensor specifications when handing off between layers and components.
+Must also include DeepSeek V2 MLA dimensionality reduction KV dimension and physical block index对接 Shape, Dtype, Device requirements.
+4. logic_constraints: Focus on recording specific constraints of current implementation.
+
+File 2: AGENT_SKILL.md (Sub-agents Execution SOP)
+This is an operation manual written for future AI Agents. Use imperative tone to guide Agent how to read the above JSON and execute closed-loop development:
+1. Prime Directives:
+• Create agents-infer under current meta-infer, write generated files here
+• Must follow TDD (Test-Driven Development), write tests before implementation.
+• Must随时 read inference_blueprint.json to verify Tensor shapes, no脑补.
+2. Workflow:
+• Step 1: Contract alignment: Before developing each new component, parse data_flow_contracts in JSON.
+• Step 2: Reference tracing: Use Bash sub-agent to查看 implementation logic in ref_code specified in JSON (e.g., nano-vllm or mini-sglang).
+• Step 3: Write and test: Generate code and immediately call pytest.
+• Step 4: Instant unit test: After writing/modifying each component, must immediately generate and run corresponding tests/ unit tests. Tests must not pass before integration: If current component's unit tests are not 100% passed, strictly prohibit modifying other components or doing overall串联
+3. Troubleshooting Guide:
+• If encounter Shape mismatch, require Agent to revert查看 real model's config.json or this framework's JSON contract.
+• If encounter OOM (Out of Memory), require Agent to check KVMemoryPool's dynamic allocation logic.
+• If forgotten, or have multiple unresolvable bugs, read knowledge base overview: @MEMORY.md and its corresponding @README.md and inference_blueprint.json corresponding component's ref_docs ref_code
+4. Definition of Done:
+• Task only counts as真正完成 when successfully running python -m pytest tests/test_real_inference.py and capturing real 16B model text output in terminal (e.g., correct answer to "The capital of France is").
+5. Human-AI Collaboration and Debug:
+• Log retention: Agent must保留 detailed print logs in generated framework (including Tensor Shape, KV Cache hit rate, scheduling latency, etc.) for manual二次 verification after task completion.

@@ -220,8 +220,10 @@
           "tp_size": "dist.get_world_size() or env WORLD_SIZE"
         },
         "collectives": {
-          "all_reduce_sum": "输入输出同 shape；fp16/bf16 先转 fp32 归约再 cast 回",
-          "all_gather_last_dim": "输入 [..., local_dim] -> 输出 [..., local_dim * tp_size]"
+          "all_reduce_sum": "输入输出同 shape；fp16/bf16 先转 fp32 归约再 cast 回。严禁 bf16 直接 all_reduce（数值溢出/精度丢失）。",
+          "all_reduce_sum_implementation": "if x.dtype in (float16, bfloat16): tmp = x.float(); dist.all_reduce(tmp, SUM); return tmp.to(x.dtype)",
+          "all_gather_last_dim": "输入 [..., local_dim] -> 输出 [..., local_dim * tp_size]",
+          "init_tp_distributed": "使用 dist.init_process_group(backend, init_method='env://')，不创建自定义进程组。必须调用 torch.cuda.set_device(LOCAL_RANK)。"
         }
       },
       "tp_embedding_and_lm_head": {
@@ -457,12 +459,18 @@
     "architecture_knowledge_base": {
     "global_primitives_constraints": {
       "rmsnorm_precision_law": {
-        "directive": "RMSNorm 在 fp16/bf16 下计算方差前必须先转 float32，归一化后再 cast 回输入 dtype。",
-        "reference_pattern": "x_fp32 = x.float(); var = x_fp32.pow(2).mean(-1, keepdim=True); out = (x_fp32 * rsqrt(var + eps) * weight).to(x.dtype)",
-        "why": "避免半精度方差计算溢出与 logits 漂移。",
+        "directive": "RMSNorm 在 fp16/bf16 下计算方差前必须先转 float32，归一化后再 cast 回输入 dtype。weight 乘法也必须在 fp32 下进行。",
+        "reference_pattern": "x_fp32 = x.float(); var = x_fp32.pow(2).mean(-1, keepdim=True); out = (x_fp32 * rsqrt(var + eps) * weight.float()).to(x.dtype)",
+        "wrong_patterns": [
+          "out = (x_fp32 * rsqrt(var + eps)).to(x.dtype).mul_(weight)  # bf16 乘法放大误差 3x",
+          "out = (x_fp32 * rsqrt(var + eps) * weight).to(x.dtype)     # weight 是 bf16 Parameter，乘法在 bf16 下"
+        ],
+        "failure_cascade": "bf16 weight 乘法 → RMSNorm 放大 all_reduce 误差 ~3x (0.008→0.023) → MoE gate top-k 路由改变 → 26 层 MoE 级联放大 → 输出完全偏离",
+        "why": "bf16 乘法对微小输入扰动敏感。RowParallelLinear 的 all_reduce 在 bf16 下产生 ~0.008 元素级误差，bf16 乘法放大该误差改变 MoE 路由。",
         "source_refs": [
-          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-          "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md"
+          "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md",
+          "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md"
         ]
       },
       "tp_linear_load_no_double_shard": {
@@ -473,8 +481,8 @@
         ],
         "why": "磁盘惰性加载（safe_open.get_slice）常已预切分；再次切分会导致双重切片和权重错乱。",
         "source_refs": [
-          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+          "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks/08_history_prompt/task10从QwenTP到dsTP验证.txt"
         ]
       },
       "hf_baseline_test_oom_guard": {
@@ -486,8 +494,8 @@
         ],
         "why": "避免 N 进程重复占用全量显存导致 OOM。",
         "source_refs": [
-          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
-          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+          "notebooks/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+          "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
         ]
       },
       "debug_evidence_before_guessing": {
@@ -498,14 +506,38 @@
           "NaN/Inf 健康检查"
         ],
         "source_refs": [
-          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+          "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ]
+      },
+      "model_construction_cpu_first": {
+        "directive": "模型必须在 CPU 上创建，加载权重后再移至 GPU。",
+        "hard_rule": [
+          "使用 torch.set_default_dtype(torch.bfloat16) 创建模型，创建后立即恢复 torch.set_default_dtype(torch.float32)",
+          "严禁使用 torch.set_default_device('cuda:rank') 在 GPU 上直接创建 8B+ 参数模型（OOM）",
+          "顺序：CPU 创建模型 → load_weights() → model.cuda()"
+        ],
+        "why": "8B+ 参数在 GPU 上直接创建导致 OOM；先 cuda() 再 load_weights 时 GPU 显存已满无法加载。",
+        "source_refs": [
+          "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md",
+          "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md"
+        ]
+      },
+      "safetensors_lazy_loading": {
+        "directive": "使用 safe_open + get_slice 惰性加载，避免全量权重加载到 CPU 内存。",
+        "hard_rule": [
+          "使用 safetensors.safe_open(fp, framework='pt', device='cpu') 打开文件",
+          "需要切分时用 get_slice(key) 获取切片对象，按 split_dim 和 tp_rank 计算索引",
+          "严禁使用 load_file 一次性加载全量权重（8B 模型 ~16GB CPU 内存）"
+        ],
+        "source_refs": [
+          "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md"
         ]
       }
     },
     "qwen_series_dense": {
       "source_refs": [
-        "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md",
-        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md"
+        "notebooks/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md",
+        "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md"
       ],
       "architectures": [
         "Qwen2ForCausalLM",
@@ -545,19 +577,40 @@
       "rope_routing": {
         "style": "Neox half-half rotate",
         "hard_rule": "严禁使用 GPT-J 奇偶交错 rotate，Qwen 系列必须使用前后分半 rotate_half。",
-        "risk_if_violated": "常见表现为短句重复、局部复读、退化输出。",
+        "rotate_half_implementation": "d = x.shape[-1] // 2; x1, x2 = x[..., :d], x[..., d:]; return torch.cat((-x2, x1), dim=-1)",
+        "cos_sin_dtype_rule": "cos/sin 在 fp32 下计算后必须 .to(input_dtype) 转回 bf16。cos/sin 保持 fp32 会导致小角度 cos(θ) 在 fp32≈1.0 vs bf16≈1.0 的差异级联 36 层。",
+        "risk_if_violated": "常见表现为短句重复、局部复读、退化输出。cos/sin dtype 不匹配导致首 token 偏差。",
         "source_refs": [
-          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-          "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md"
+          "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks/06_experience/03_task12_qwen_tp_debug_bf16_precision.md",
+          "notebooks/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md"
+        ]
+      },
+      "gqa_kv_head_repeat": {
+        "required_when": "num_kv_heads != num_heads",
+        "correct_method": "k = k.repeat_interleave(repeat, dim=2); v = v.repeat_interleave(repeat, dim=2)",
+        "wrong_method": "k.unsqueeze(2).expand(...).reshape(...) — 产生交错布局 [kv0,kv1,kv0,kv1] 而非分组布局 [kv0,kv0,kv1,kv1]",
+        "why": "expand 沿新增维度复制整个张量，reshape 合并维度时交错排列。Q head 0-3 应关注 KV head 0，但错误布局使 Q head 关注错误的 KV head。",
+        "risk_if_violated": "GQA 模型（Qwen3-8B: num_heads=32, num_kv_heads=8）输出乱码。DeepSeek-V2 不受影响（num_heads == num_kv_heads）。",
+        "source_refs": [
+          "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md",
+          "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md"
+        ]
+      },
+      "kv_head_replication": {
+        "required_when": "num_kv_heads < tp_size（例如 4 KV heads，8 GPUs）",
+        "rule": "每 rank 只有 1 个 KV head，多 rank 共享同一 KV head 权重。权重加载时使用 allow_kv_replication=True，计算 shard_rank = rank // (tp_size // num_kv_heads)。",
+        "source_refs": [
+          "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md"
         ]
       }
     },
     "deepseek_v2_v3_mla_moe": {
       "source_refs": [
-        "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
-        "notebooks-cn/04_parallel_strategies/04_vllm_tp4_deepseekv2_index.md",
-        "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
-        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        "notebooks/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+        "notebooks/04_parallel_strategies/04_vllm_tp4_deepseekv2_index.md",
+        "notebooks/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+        "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
       ],
       "architectures": [
         "DeepseekV2ForCausalLM",
@@ -590,21 +643,32 @@
           }
         },
         "source_refs": [
-          "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
-          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
-          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+          "notebooks/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+          "notebooks/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+          "notebooks/08_history_prompt/task10从QwenTP到dsTP验证.txt"
         ]
       },
-      "yarn_rope_scaling_patch": {
-        "required": true,
-        "hard_rule": [
+      "rope_routing": {
+        "style": "GPT-J 奇偶交错 rotate",
+        "rotate_half_implementation": "x1 = x[..., ::2]; x2 = x[..., 1::2]; return torch.cat((-x2, x1), dim=-1)",
+        "hard_rule": "DeepSeek-V2 必须使用 GPT-J 奇偶交错 rotate_half，严禁使用 Qwen3 的前一半/后一半 split。",
+        "cos_sin_dtype_rule": "cos/sin 在 fp32 下计算后必须 .to(input_dtype) 转回 bf16。",
+        "yarn_required": true,
+        "yarn_hard_rule": [
           "Attention scaling 不仅是 dim ** -0.5。",
-          "当 rope_scaling.type == yarn 时，必须乘上 YaRN mscale 的平方修正。"
+          "当 rope_scaling.type == yarn 时，必须乘上 YaRN mscale 的平方修正。",
+          "必须实现 _compute_inv_freq 中的 YaRN 频率插值（inv_interp 与 inv_freq 的线性混合）。"
         ],
-        "risk_if_violated": "注意力失焦，输出乱码或异常退化。",
+        "yarn_implementation_details": {
+          "inv_freq_formula": "inv_interp * (1.0 - inv_mask) + inv_freq * inv_mask",
+          "mscale_formula": "rope_mscale = _yarn_get_mscale(factor, mscale) / _yarn_get_mscale(factor, mscale_all_dim)",
+          "required_functions": ["_yarn_find_correction_dim", "_yarn_find_correction_range", "_yarn_linear_ramp_mask", "_yarn_get_mscale"]
+        },
+        "risk_if_violated": "注意力失焦，输出乱码或异常退化。遗漏 YaRN 频率插值导致长序列位置编码错误。",
         "source_refs": [
-          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
-          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
+          "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+          "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md",
+          "notebooks/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
         ]
       },
       "moe_routing_hybrid_parallel": {
@@ -615,13 +679,17 @@
         "routed_experts": {
           "strategy": "Simplified EP via AllReduce",
           "router_gate": "全卡复制（Replicated）",
+          "router_fp32_rule": "Router logits 和 softmax/sigmoid 必须在 fp32 下计算（logits = F.linear(x.float(), gate.weight.float())）。bf16 精度不足导致路由抖动。",
           "expert_instantiation": "各 rank 仅实例化 local_expert_ids",
-          "aggregation": "本地专家输出加权求和后做 dist.all_reduce_sum"
+          "aggregation": "本地专家输出加权求和后做 dist.all_reduce_sum",
+          "input_dimension_rule": "ExpertParallelMoE.forward() 期望 3D 输入 [B, T, H]。Decoder layer 传递 2D [N, H] 时需 unsqueeze(0) 转 3D，forward 返回后 squeeze(0) 回 2D。",
+          "routed_scaling_factor": "topk 后必须乘以 routed_scaling_factor，否则 FFN 信号衰减。"
         },
         "source_refs": [
-          "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
-          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
-          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+          "notebooks/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+          "notebooks/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+          "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md",
+          "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md"
         ]
       },
       "routed_probability_patch": {
@@ -629,16 +697,16 @@
         "hard_rule": "若开启 norm_topk_prob，top-k 路由权重必须除以权重和做重归一化。",
         "risk_if_violated": "FFN 信号衰减，语义能力显著下降。",
         "source_refs": [
-          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
+          "notebooks/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
         ]
       }
     },
     "lazy_loader_synthesis_rules": {
       "backend": "safetensors.safe_open",
       "source_refs": [
-        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
-        "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+        "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+        "notebooks/08_history_prompt/task10从QwenTP到dsTP验证.txt"
       ],
       "generic_strategy": [
         "优先读取 model.safetensors.index.json 的 weight_map 定位分片文件。",
@@ -677,8 +745,8 @@
     "engine_routing_contract": {
       "entrypoint": "LLMEngine/RealModelRunner",
       "source_refs": [
-        "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
-        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        "notebooks/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+        "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
       ],
       "hard_rule": [
         "必须读取 model_dir/config.json。",
@@ -696,9 +764,9 @@
     },
     "alignment_and_validation_contracts": {
       "source_refs": [
-        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
-        "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+        "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+        "notebooks/08_history_prompt/task10从QwenTP到dsTP验证.txt"
       ],
       "realtime_tp_test_style": {
         "required_pattern": [
@@ -727,8 +795,8 @@
         "check": "确认 load_weight_shard 是否对已切片权重再次按 rank 切片。",
         "fix": "加 shape 拦截，local shard 直接 copy。",
         "source_refs": [
-          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+          "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks/08_history_prompt/task10从QwenTP到dsTP验证.txt"
         ]
       },
       "rope_style_mismatch": {
@@ -736,8 +804,8 @@
         "check": "确认目标模型需要 Neox 还是 GPT-J rotate。",
         "fix": "按模型族切换 rotate_half 风格并对齐 cos/sin 展布。",
         "source_refs": [
-          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+          "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
         ]
       },
       "missing_yarn_scaling": {
@@ -745,8 +813,8 @@
         "check": "确认 rope_scaling.type == yarn 时是否做 mscale 与 attention scaling 修正。",
         "fix": "补齐 YaRN 频率与缩放补丁。",
         "source_refs": [
-          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
-          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
+          "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+          "notebooks/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
         ]
       },
       "hf_multirank_oom": {
@@ -754,42 +822,96 @@
         "check": "HF baseline 是否被每个 rank .to(cuda)。",
         "fix": "HF 模型留 CPU，只搬输入，必要时 empty_cache。",
         "source_refs": [
-          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
-          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+          "notebooks/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+          "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ]
+      },
+      "rmsnorm_bf16_weight_amplification": {
+        "symptom": "DeepSeek-V2 TP 输出乱码，首 token 与 HF 真值差异巨大（如 12350 vs 185）。",
+        "check": "RMSNorm.forward 中 weight 乘法是否在 fp32 下进行。错误模式：x.to(dtype).mul_(weight) 或 (x * weight).to(dtype)（weight 是 bf16 Parameter）。",
+        "fix": "改为 (x * self.weight.float()).to(input_dtype)。weight 必须先 .float() 再乘。",
+        "failure_cascade": "bf16 weight 乘法放大 all_reduce 误差 3x (0.008→0.023) → MoE gate top-k 路由改变 → 26 层 MoE 级联放大 → 输出完全偏离",
+        "source_refs": [
+          "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md",
+          "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md"
+        ]
+      },
+      "gqa_expand_reshape_layout_bug": {
+        "symptom": "GQA 模型（Qwen3-8B: num_heads=32, num_kv_heads=8）TP 输出乱码。DeepSeek-V2 不受影响（num_heads == num_kv_heads）。",
+        "check": "KV head repeat 是否使用 expand+reshape 而非 repeat_interleave。",
+        "fix": "改用 k.repeat_interleave(n_rep, dim=2)。expand+reshape 产生交错布局 [kv0,kv1,kv0,kv1]，repeat_interleave 产生正确分组布局 [kv0,kv0,kv1,kv1]。",
+        "source_refs": [
+          "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md",
+          "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md"
+        ]
+      },
+      "moe_2d_input_error": {
+        "symptom": "RuntimeError: not enough values to unpack (expected 3, got 2) at ExpertParallelMoE.forward。",
+        "check": "ExpertParallelMoE.forward() 期望 3D [B, T, H]，但 decoder layer 传递 2D [N, H]。",
+        "fix": "在 MoE wrapper 的 forward 中添加维度处理：if hidden_states.dim() == 2: hidden_states = hidden_states.unsqueeze(0); ... squeeze(0)。",
+        "source_refs": [
+          "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md"
+        ]
+      },
+      "model_cuda_construction_oom": {
+        "symptom": "CUDA out of memory 在模型创建阶段（非推理阶段）。",
+        "check": "是否使用 torch.set_default_device('cuda') 在 GPU 上直接创建模型。8B+ 参数直接创建在 GPU 上 OOM。",
+        "fix": "CPU 上创建模型 → load_weights() → model.cuda()。使用 torch.set_default_dtype(torch.bfloat16) 控制 dtype。",
+        "source_refs": [
+          "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md",
+          "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md"
+        ]
+      },
+      "router_bf16_precision_jitter": {
+        "symptom": "MoE 模型输出不稳定，相同输入多次推理结果不同。",
+        "check": "Router logits 和 softmax 是否在 bf16 下计算。",
+        "fix": "Router logits 使用 F.linear(x.float(), gate.weight.float())，softmax 使用 dtype=torch.float32。",
+        "source_refs": [
+          "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md"
         ]
       }
     },
     "knowledge_source_index": {
       "global_primitives_constraints": [
-        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+        "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md",
+        "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md"
       ],
       "qwen_series_dense": [
-        "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md",
-        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md"
+        "notebooks/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md",
+        "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks/06_experience/03_task12_qwen_tp_debug_bf16_precision.md",
+        "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md"
       ],
       "deepseek_v2_v3_mla_moe": [
-        "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
-        "notebooks-cn/04_parallel_strategies/04_vllm_tp4_deepseekv2_index.md",
-        "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
-        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        "notebooks/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+        "notebooks/04_parallel_strategies/04_vllm_tp4_deepseekv2_index.md",
+        "notebooks/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+        "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+        "notebooks/06_experience/03_task12_deepseek_ep_memory_fix.md",
+        "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md"
       ],
       "lazy_loader_synthesis_rules": [
-        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+        "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md"
       ],
       "engine_routing_contract": [
-        "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
-        "notebooks-cn/07_agentPlan/task10_deepseekv2_tp_stage1_stage2_plan.md"
+        "notebooks/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+        "notebooks/07_agentPlan/task10_deepseekv2_tp_stage1_stage2_plan.md"
       ],
       "alignment_and_validation_contracts": [
-        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+        "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md"
       ],
       "failure_mode_library": [
-        "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
-        "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
-        "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+        "notebooks/06_experience/01_task10_tp_qwen_debug_experience.md",
+        "notebooks/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+        "notebooks/06_experience/04_task13_tp_correctness_fix_rmsnorm.md",
+        "notebooks/06_experience/05_task13_one_shot_tp_build_guide.md",
+        "notebooks/08_history_prompt/task10从QwenTP到dsTP验证.txt"
       ]
     }
     }
@@ -809,26 +931,26 @@
     ],
     "acceptance_test_targets": {
       "qwen3_tp": {
-        "model_dir": "/data/xinference/cache/Qwen3-8B",
+        "model_dir": "/home/honglin/models/qwen/Qwen3-8B",
         "suggested_test": "tests/test_qwen_tp_real.py"
       },
       "deepseek_v2_tp": {
-        "model_dir": "/data/xinference/cache/deepseek-v2-chat-pytorch-16b",
+        "model_dir": "/home/honglin/models/deepseek-ai/DeepSeek-V2-Lite-Chat",
         "suggested_test": "tests/test_deepseek_tp_real.py"
       }
     }
   },
   "knowledge_source_policy": {
-    "rule": "每条核心知识必须能回溯到 notebooks-cn的原始文档。",
+    "rule": "每条核心知识必须能回溯到 notebooks的原始文档。",
     "primary_dirs": [
-      "notebooks-cn/01_framework_design",
-      "notebooks-cn/02_model_specifics",
-      "notebooks-cn/03_operators",
-      "notebooks-cn/04_parallel_strategies",
-      "notebooks-cn/05_memory_pool",
-      "notebooks-cn/06_request_lifecycle",
-      "notebooks-cn/07_agentPlan",
-      "notebooks-cn/08_history_prompt"
+      "notebooks/01_framework_design",
+      "notebooks/02_model_specifics",
+      "notebooks/03_operators",
+      "notebooks/04_parallel_strategies",
+      "notebooks/05_memory_pool",
+      "notebooks/06_request_lifecycle",
+      "notebooks/07_agentPlan",
+      "notebooks/08_history_prompt"
     ]
   }
 }
