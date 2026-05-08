@@ -54,4 +54,6 @@
 ## 06 Implementation Patterns
 
 - [Code Patterns](06_implementation_patterns/01_code_patterns.md) — Proven patterns: global context, merged proj, fused ops
+- [Debugging War Stories](06_implementation_patterns/02_debugging_war_stories.md) — Qwen3.5 混合注意力引擎 15 个 bug 的完整调试记录
 - [Anti-Patterns](06_implementation_patterns/03_anti_patterns.md) — Complexity traps to avoid in generated code
+- [MPS Optimization Guide](06_implementation_patterns/04_mps_optimization_guide.md) — Apple Silicon MPS 推理引擎优化实录（23→47 tok/s）
