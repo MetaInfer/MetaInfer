@@ -185,17 +185,16 @@ class QwenAttentionTP(nn.Module):
 
         new_cache = (k_buf, v_buf, kv_len)
 
-        # GQA broadcast
-        if self.num_kv_heads != self.num_heads:
-            repeat = self.num_heads // self.num_kv_heads
-            k_valid = k_valid.repeat_interleave(repeat, dim=2)
-            v_valid = v_valid.repeat_interleave(repeat, dim=2)
-
+        # Permute to [B, H, S, D] for SDPA — skip GQA broadcast, use enable_gqa=True
         q = q.permute(0, 2, 1, 3)
         k_valid = k_valid.permute(0, 2, 1, 3)
         v_valid = v_valid.permute(0, 2, 1, 3)
         is_causal = (past_key_values is None)
-        out = F.scaled_dot_product_attention(q, k_valid, v_valid, dropout_p=0.0, is_causal=is_causal, scale=self.scaling)
+        use_gqa = (self.num_kv_heads != self.num_heads)
+        out = F.scaled_dot_product_attention(
+            q, k_valid, v_valid, dropout_p=0.0, is_causal=is_causal,
+            scale=self.scaling, enable_gqa=use_gqa,
+        )
         out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.q_size)
         return self.o_proj(out), new_cache
 

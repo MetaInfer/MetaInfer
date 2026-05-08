@@ -291,13 +291,10 @@ class DeepseekAttentionTP(nn.Module):
         # Apply RoPE to K_pe for ALL positions
         all_positions = torch.arange(kv_len, device=hidden_states.device, dtype=torch.long)
         k_pe_rope = _apply_rope_gptj(raw_k_pe_valid, all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+        # Expand k_pe from 1 head to local_heads (view, no copy)
         k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
 
-        # Expand k_nope for GQA
-        if k_nope_valid.shape[2] != self.local_heads:
-            repeat = self.local_heads // k_nope_valid.shape[2]
-            k_nope_valid = k_nope_valid.repeat_interleave(repeat, dim=2)
-
+        # No GQA broadcast needed for DeepSeek MLA (num_kv_heads == num_heads per rank)
         q_cat = torch.cat([q_nope, q_pe], dim=-1).permute(0, 2, 1, 3)
         k_cat = torch.cat([k_nope_valid, k_pe_rope], dim=-1).permute(0, 2, 1, 3)
         v_perm = v_valid.permute(0, 2, 1, 3)
