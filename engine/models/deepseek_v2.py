@@ -272,36 +272,46 @@ class DeepseekAttentionTP(nn.Module):
             v_buf[:, :seqlen] = v
             raw_k_pe_buf[:, :seqlen] = raw_k_pe
             kv_len = seqlen
+
+            # Prefill path: slice valid portion (shape = seqlen, efficient)
+            k_nope_valid = k_nope_buf[:, :kv_len]
+            v_valid = v_buf[:, :kv_len]
+            raw_k_pe_valid = raw_k_pe_buf[:, :kv_len]
+
+            q_pe = _apply_rope_gptj(q_pe, positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+            all_positions = torch.arange(kv_len, device=hidden_states.device, dtype=torch.long)
+            k_pe_rope = _apply_rope_gptj(raw_k_pe_valid, all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+            k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
+
+            q_cat = torch.cat([q_nope, q_pe], dim=-1).permute(0, 2, 1, 3)
+            k_cat = torch.cat([k_nope_valid, k_pe_rope], dim=-1).permute(0, 2, 1, 3)
+            v_perm = v_valid.permute(0, 2, 1, 3)
+            out = F.scaled_dot_product_attention(q_cat, k_cat, v_perm, dropout_p=0.0, is_causal=True, scale=self.scaling)
+            out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
         else:
-            # Decode: write new KV into pre-allocated buffer
+            # Decode path: use full buffer with mask (fixed shapes for CUDA Graph compat)
             k_nope_buf, v_buf, raw_k_pe_buf, kv_len = past_key_values
             k_nope_buf[:, kv_len:kv_len + seqlen] = k_nope
             v_buf[:, kv_len:kv_len + seqlen] = v
             raw_k_pe_buf[:, kv_len:kv_len + seqlen] = raw_k_pe
             kv_len = kv_len + seqlen
 
-        # Slice valid portion
-        k_nope_valid = k_nope_buf[:, :kv_len]
-        v_valid = v_buf[:, :kv_len]
-        raw_k_pe_valid = raw_k_pe_buf[:, :kv_len]
+            # Use full buffer (no slicing — fixed shape)
+            q_pe = _apply_rope_gptj(q_pe, positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+            all_positions = torch.arange(max_seq_len, device=hidden_states.device, dtype=torch.long)
+            k_pe_rope = _apply_rope_gptj(raw_k_pe_buf, all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+            k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
 
-        # Apply RoPE to Q
-        q_pe = _apply_rope_gptj(q_pe, positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+            q_cat = torch.cat([q_nope, q_pe], dim=-1).permute(0, 2, 1, 3)  # [B, H, 1, D]
+            k_cat = torch.cat([k_nope_buf, k_pe_rope], dim=-1).permute(0, 2, 1, 3)  # [B, H, max_seq_len, D]
+            v_perm = v_buf.permute(0, 2, 1, 3)  # [B, H, max_seq_len, D]
 
-        # Apply RoPE to K_pe for ALL positions
-        all_positions = torch.arange(kv_len, device=hidden_states.device, dtype=torch.long)
-        k_pe_rope = _apply_rope_gptj(raw_k_pe_valid, all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
-        # Expand k_pe from 1 head to local_heads (view, no copy)
-        k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
+            # Attention mask: 0 for valid positions, -inf for padding
+            attn_mask = torch.zeros(1, 1, 1, max_seq_len, device=hidden_states.device, dtype=q_cat.dtype)
+            attn_mask[:, :, :, kv_len:] = float('-inf')
 
-        # No GQA broadcast needed for DeepSeek MLA (num_kv_heads == num_heads per rank)
-        q_cat = torch.cat([q_nope, q_pe], dim=-1).permute(0, 2, 1, 3)
-        k_cat = torch.cat([k_nope_valid, k_pe_rope], dim=-1).permute(0, 2, 1, 3)
-        v_perm = v_valid.permute(0, 2, 1, 3)
-
-        is_causal = (past_key_values is None)
-        out = F.scaled_dot_product_attention(q_cat, k_cat, v_perm, dropout_p=0.0, is_causal=is_causal, scale=self.scaling)
-        out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
+            out = F.scaled_dot_product_attention(q_cat, k_cat, v_perm, dropout_p=0.0, is_causal=False, scale=self.scaling, attn_mask=attn_mask)
+            out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
 
         new_cache = (k_nope_buf, v_buf, raw_k_pe_buf, kv_len)
         return self.o_proj(out), new_cache
@@ -719,6 +729,11 @@ class DeepseekTPModelRunner:
         self.model = DeepseekForCausalLMTP(self.cfg, device=device, dtype=dtype)
         self.model.load_weights()
         self.model.eval()
+        # P2: compile attention and dense MLP modules for kernel fusion
+        for layer in self.model.layers:
+            layer.self_attn = torch.compile(layer.self_attn)
+            if not isinstance(layer.mlp, DeepseekMoETP):
+                layer.mlp = torch.compile(layer.mlp)
 
     @torch.inference_mode()
     def run(

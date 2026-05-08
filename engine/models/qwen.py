@@ -166,36 +166,46 @@ class QwenAttentionTP(nn.Module):
         k = self.k_norm(k)
         q, k = _apply_rope(q, k, positions, self.rope_theta)
 
+        use_gqa = (self.num_kv_heads != self.num_heads)
+
         if past_key_values is None:
-            # Prefill: allocate buffers
+            # Prefill: allocate buffers and slice (efficient for long prompts)
             k_buf = torch.zeros(bsz, max_seq_len, self.num_kv_heads, self.head_dim, device=k.device, dtype=k.dtype)
             v_buf = torch.zeros(bsz, max_seq_len, self.num_kv_heads, self.head_dim, device=v.device, dtype=v.dtype)
             k_buf[:, :seqlen] = k
             v_buf[:, :seqlen] = v
             kv_len = seqlen
+
+            q_p = q.permute(0, 2, 1, 3)
+            k_p = k_buf[:, :kv_len].permute(0, 2, 1, 3)
+            v_p = v_buf[:, :kv_len].permute(0, 2, 1, 3)
+            out = F.scaled_dot_product_attention(
+                q_p, k_p, v_p, dropout_p=0.0, is_causal=True,
+                scale=self.scaling, enable_gqa=use_gqa,
+            )
+            out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.q_size)
         else:
-            # Decode: write into pre-allocated buffer
+            # Decode: use full buffer with mask (fixed shapes for CUDA Graph compat)
             k_buf, v_buf, kv_len = past_key_values
             k_buf[:, kv_len:kv_len + seqlen] = k
             v_buf[:, kv_len:kv_len + seqlen] = v
             kv_len = kv_len + seqlen
 
-        k_valid = k_buf[:, :kv_len]
-        v_valid = v_buf[:, :kv_len]
+            q_p = q.permute(0, 2, 1, 3)  # [B, H, 1, D]
+            k_p = k_buf.permute(0, 2, 1, 3)  # [B, KV_H, max_seq_len, D]
+            v_p = v_buf.permute(0, 2, 1, 3)  # [B, KV_H, max_seq_len, D]
+
+            # Attention mask: 0 for valid, -inf for padding
+            attn_mask = torch.zeros(1, 1, 1, max_seq_len, device=hidden_states.device, dtype=q_p.dtype)
+            attn_mask[:, :, :, kv_len:] = float('-inf')
+
+            out = F.scaled_dot_product_attention(
+                q_p, k_p, v_p, dropout_p=0.0, is_causal=False,
+                scale=self.scaling, enable_gqa=use_gqa, attn_mask=attn_mask,
+            )
+            out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.q_size)
 
         new_cache = (k_buf, v_buf, kv_len)
-
-        # Permute to [B, H, S, D] for SDPA — skip GQA broadcast, use enable_gqa=True
-        q = q.permute(0, 2, 1, 3)
-        k_valid = k_valid.permute(0, 2, 1, 3)
-        v_valid = v_valid.permute(0, 2, 1, 3)
-        is_causal = (past_key_values is None)
-        use_gqa = (self.num_kv_heads != self.num_heads)
-        out = F.scaled_dot_product_attention(
-            q, k_valid, v_valid, dropout_p=0.0, is_causal=is_causal,
-            scale=self.scaling, enable_gqa=use_gqa,
-        )
-        out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.q_size)
         return self.o_proj(out), new_cache
 
 
@@ -424,6 +434,10 @@ class QwenTPModelRunner:
         self.model = QwenForCausalLMTP(self.cfg, device=device, dtype=dtype)
         self.model.load_weights()
         self.model.eval()
+        # P2: compile attention and MLP modules for kernel fusion
+        for layer in self.model.layers:
+            layer.self_attn = torch.compile(layer.self_attn)
+            layer.mlp = torch.compile(layer.mlp)
 
     @torch.inference_mode()
     def run(
