@@ -311,19 +311,70 @@ def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 
 **结论**: P1 仅在 batch_size > 1 时有效。当前 batch=1 场景下跳过，待 P4 (continuous batching) 实现后重新评估。
 
+#### P1 第二次尝试（P2 之后）
+
+**时间**: 2026-05-08
+**前置**: P0 + P2 (torch.compile) 已完成
+
+**实现方式**: 与第一次相同——按 expert 分组 batched forward，用 `nonzero` + `index_add_` 替代逐 token 循环。
+
+**性能验证** (DeepSeek-V2-Lite-Chat, TP=4):
+
+| 指标 | P2 | P2+P1 | 变化 |
+|------|-----|-------|------|
+| Output throughput (tok/s) | 12.75 | 9.56 | **-25.0%** |
+
+**分析**: batch=1 时，`nonzero()` 和 `index_add_()` 的开销仍然大于收益。torch.compile 已经优化了逐 token 循环的 kernel launch overhead，使得 batched 方式的额外 tensor 操作成为净负面。
+
+**结论**: 回滚。P1 需要 batch>1（通过 P4 continuous batching）才能生效。
+
 ---
 
-### P2: 引入 CUDA Graph
+### P2: CUDA Graph 兼容 + torch.compile kernel fusion
 
 **预期提升**: 2-5x
-**难度**: 中高
-**影响范围**: 新增 `engine/cuda_graph_runner.py`, 修改 model runner
+**难度**: 中
+**影响范围**: `engine/models/deepseek_v2.py`, `engine/models/qwen.py`
 
-**实现要点**:
-1. 预录制常用 batch size (1, 2, 4, 8, 16) 的 decode forward graph
-2. 静态 input/output buffer，graph replay 时只更新 input 数据
-3. Prefill 不使用 CUDA Graph（shape 不固定）
-4. 需要 P0（增量 KV Cache）作为前置，否则每次 forward shape 都不同
+**实现方式**: 两部分优化——固定形状 attention + torch.compile 编译子模块
+
+**具体改动**:
+1. **固定形状 decode attention**（CUDA Graph 兼容）:
+   - Prefill 路径保持切片（`k_buf[:, :kv_len]`）+ `is_causal=True`（高效，shape 随 prompt 长度变化）
+   - Decode 路径改为全 buffer + `attn_mask`：使用 `k_buf[:, :max_seq_len]`（固定形状），通过 `attn_mask[:, :, :, kv_len:] = -inf` 屏蔽 padding 位置
+   - 参考: vLLM 的 paged attention 思路（固定 buffer + mask）
+2. **torch.compile 编译子模块**:
+   - 编译每个 decoder layer 的 `self_attn`（attention 模块）
+   - 编译 dense MLP 模块（Qwen 全部层，DeepSeek 的前 `first_k_dense_replace` 层）
+   - **不编译 MoE 模块**（有 `.item()` GPU→CPU 同步，导致 graph breaks）
+   - 使用 `mode='default'`（kernel fusion only，不用 CUDA Graph，避免与 KV cache buffer 复用冲突）
+
+**遇到的问题与解决**:
+- **问题 1**: `torch.compile(mode='reduce-overhead')` 和 `mode='max-autotune'` 使用内部 CUDA Graph，与 KV cache buffer 跨步复用冲突
+- **错误**: `RuntimeError: accessing tensor output of CUDAGraphs that has been subsequent run`
+- **解决**: 使用 `mode='default'`（纯 kernel fusion，不使用 CUDA Graph）
+- **问题 2**: 之前 attention 使用动态切片 `k[:, :kv_len]`，形状每步变化，无法 CUDA Graph capture
+- **解决**: decode 路径改为全 buffer + attn_mask，保持固定形状
+
+**性能验证** (DeepSeek-V2-Lite-Chat, TP=4, GPU 4,5,6,7):
+
+| 指标 | P0+P5 | P2 | 提升 |
+|------|-------|-----|------|
+| Output throughput (tok/s) | 8.76 | 12.75 | **+45.5%** |
+| Duration (s) | ~88 | 60.4 | **-31.4%** |
+
+**微基准测试** (单请求, 20 decode steps):
+- 无 compile: 124.1 ms/step
+- 有 compile: 88.7 ms/step
+- **加速: 1.40x**
+
+**正确性验证**:
+- DeepSeek TP=4 PASSED（输出与基准语义一致）
+- Qwen TP=4 PASSED（输出与基准高度一致）
+
+**参考代码路径**:
+- `torch.compile` 文档: `torch.compiler` API
+- SDPA `attn_mask`: `torch.nn.functional.scaled_dot_product_attention`
 
 ---
 
@@ -402,18 +453,59 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 
 ---
 
+### P3: Flash Attention / SDPA 优化
+
+**预期提升**: 2-3x
+**难度**: 低
+**影响范围**: `engine/models/deepseek_v2.py`, `engine/models/qwen.py`
+
+**实现方式**: 利用 PyTorch 2.9.1 内置的 flash SDPA 后端，无需额外安装 `flash-attn` 包。
+
+**具体改动**:
+1. `engine/models/qwen.py`:
+   - 移除 `repeat_interleave` GQA broadcast（Qwen3-8B 有 32 Q heads / 8 KV heads，GQA 4:1）
+   - 改用 `F.scaled_dot_product_attention(..., enable_gqa=True)` 让 SDPA 内核原生处理 GQA
+   - 参考: PyTorch 2.9 `torch.nn.functional.scaled_dot_product_attention` 的 `enable_gqa` 参数
+2. `engine/models/deepseek_v2.py`:
+   - 移除无效的 GQA broadcast 代码块（DeepSeek-V2 MLA 每 rank 的 KV heads == Q heads，无 GQA）
+   - `k_pe.expand(-1, -1, self.local_heads, -1)` 保持不变（view，无拷贝）
+
+**遇到的问题与解决**:
+- **问题 1**: `flash-attn` 包无法安装（编译失败，PyTorch 2.9.1+cu128 兼容性问题）
+- **解决**: 使用 PyTorch 内置 flash SDPA 后端。验证 `torch.backends.cuda.flash_sdp_enabled()=True`，`F.scaled_dot_product_attention` 自动调度到 flash 内核
+- **问题 2**: `enable_gqa=True` 需要 PyTorch 2.9+，旧版本不支持
+- **解决**: 当前环境 PyTorch 2.9.1，直接可用
+
+**性能基准测试**:
+- `repeat_interleave` vs `expand+reshape`: 0.128ms vs 0.024ms (**5.3x** 加速)
+- Flash SDPA 自动调度: prefill 和 decode 均确认使用 flash 后端
+- GQA 直接传递（不 broadcast）+ `enable_gqa=True`: 通过 SDPA 内核原生处理
+
+**正确性验证**:
+- DeepSeek TP=4 PASSED（输出与基准语义一致，微小措辞差异为浮点累积）
+- Qwen TP=4 PASSED（输出与基准完全一致）
+
+**性能验证**: 由于 GPU 4-7 上有其他进程竞争（~28GB/卡），无法获得公平的性能对比数据。P3 改动对 DeepSeek 是纯清理（移除死代码），对 Qwen 省去了 `repeat_interleave` 拷贝，理论上 decode 每步节省 ~0.1ms。
+
+**参考代码路径**:
+- PyTorch SDPA 文档: `torch.nn.functional.scaled_dot_product_attention`
+- `enable_gqa` 参数: PyTorch 2.9+ 新增，原生支持 GQA 不同 head 数
+
+---
+
 ## 4. 优化进展总结
 
 | Phase | 状态 | 吞吐 (tok/s) | 相对基准提升 | 说明 |
 |-------|------|-------------|-------------|------|
 | 基准 | - | 2.15 | 1.0x | 全量重算，无 KV cache |
 | P0 | 完成 | 8.49 | **3.95x** | 增量 KV Cache 解码 |
-| P1 | 回滚 | 7.06 | - | batch=1 无收益，MoE 循环非主要瓶颈 |
-| P2 | 跳过 | - | - | 需固定 shape KV cache，当前不适用 |
+| P1 | 回滚(2次) | 7.06/9.56 | - | batch=1 无收益，需要 P4 连续批处理 |
+| P2 | 完成 | 12.75 | **5.93x** | torch.compile kernel fusion + 固定形状 attention |
+| P3 | 完成 | - | - | SDPA enable_gqa=True，省去 repeat_interleave 拷贝 |
 | P5 | 完成 | 8.87 | **4.13x** | TP 通信去 dtype 转换 |
 | P5+buffer | 中性 | 8.76 | **4.07x** | 预分配 KV buffer（短序列无显著收益） |
 
-**当前总提升**: 2.15 → 8.76 tok/s (**4.07x**)
+**当前总提升**: 2.15 → 12.75 tok/s (**5.93x**)
 
 **剩余瓶颈分析**:
 1. **MoE 逐 token Python 循环 + `.item()` GPU→CPU 同步** — batch>1 时可通过 batched MoE 优化，当前 batch=1 无效

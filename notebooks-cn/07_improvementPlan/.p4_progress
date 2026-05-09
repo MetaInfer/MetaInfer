@@ -1,0 +1,45 @@
+# P4 Continuous Batching 实施进度 (2026-05-09)
+
+## 当前状态: 实现中，NCCL 死锁问题待验证修复
+
+## 已完成的修改
+
+### 1. openai_tp_server.py - 完全重写
+- HTTP handler 将请求放入 queue（不再直接处理）
+- worker_loop 从 queue 收集请求，形成 batch
+- process_batch: 在 request_lock 内调用 broadcast_obj + engine.generate
+- 非 rank-0 接收 batch 命令，用**相同的 prompts** 调用 engine.generate
+- **关键修复**: 广播包含实际 prompts（而非 dummy），确保所有 rank 的 scheduler 行为一致
+
+### 2. P3 (已完成, commit e887856)
+- DeepSeek: 移除无效 GQA broadcast 代码
+- Qwen: 用 enable_gqa=True 替代 repeat_interleave
+
+### 3. P2 (已完成, commit a339817)
+- decode 路径: 全 buffer + attn_mask（固定形状，CUDA Graph 兼容）
+- torch.compile 编译 attention 和 dense MLP 子模块
+- **性能**: 8.76 → 12.75 tok/s (+45.5%)
+
+### 4. P1 (已回滚)
+- batched MoE 在 batch=1 时性能回退 (12.75 → 9.56)
+- 需要 P4 先实现 batch>1 才有意义
+
+## 未解决问题
+
+### NCCL 死锁
+- **现象**: 服务处理几个请求后死锁，480s 后 NCCL watchdog timeout
+- **根因**: 非 rank-0 使用空 dummy prompts（prompt_len=1），rank-0 使用真实 prompts（prompt_len=9），导致 scheduler 内存分配不一致，模型 forward 形状不同
+- **修复方案**: broadcast 包含完整 prompts（已实现，待验证）
+- **验证命令**: `SKIP_VLLM=1 CUDA_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 ROUNDS=25 STEPS=32 REQUEST_RATE=4 MAX_CONCURRENCY=1 bash run_compare_metainfer_vllm.sh dsv2`
+
+## Git 状态
+- 分支: feature/tp-implementation
+- 最新 commit: a339817 (P2)
+- 未提交: openai_tp_server.py (P4 重写)
+- 未提交: engine/tp_layers/moe.py (无变化，P1 已回滚)
+
+## 下一步
+1. 验证 prompts broadcast 修复是否解决 NCCL 死锁
+2. 跑 benchmark 对比 P4 性能
+3. 记录结果到 improvement_plan.md 和 .checkpoint
+4. commit P4

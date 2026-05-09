@@ -19,6 +19,18 @@ completed_phases:
     description: CUDA Graph
     result: SKIPPED (requires fixed-shape KV cache)
 
+  - phase: P3
+    description: SDPA enable_gqa=True, remove repeat_interleave
+    result: SUCCESS (correctness verified, perf not measurable due to GPU contention)
+    commit: e887856
+
+  - phase: P2
+    description: CUDA Graph compat + torch.compile kernel fusion
+    result: SUCCESS
+    throughput_after: 12.75 tok/s
+    improvement: +45.5% over P0+P5 (8.76 -> 12.75)
+    commit: a339817
+
   - phase: P5
     description: TP communication optimization
     result: SUCCESS
@@ -34,7 +46,7 @@ final_metrics:
   model: DeepSeek-V2-Lite-Chat
   tp: 4
   gpus: 4,5,6,7
-  output_throughput: 8.76 tok/s
-  mean_ttft: 3755 ms
-  duration: 88.49 s
-  total_improvement: 4.07x over baseline (2.15 tok/s)
+  output_throughput: 12.75 tok/s
+  p99_ttft_ms: 4362 ms
+  duration: 60.38 s
+  total_improvement: 5.93x over baseline (2.15 tok/s)
