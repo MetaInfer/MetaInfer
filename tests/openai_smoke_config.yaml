@@ -1,0 +1,9 @@
+# OpenAI Smoke Test Configuration
+# Override via environment variables:
+#   OPENAI_SMOKE_BASE_URL  (default: http://localhost:8000)
+#   OPENAI_SMOKE_MODEL     (default: qwen)
+#   OPENAI_SMOKE_TIMEOUT   (default: 60)
+
+base_url: "http://localhost:8000"
+model: "qwen"
+timeout: 60

@@ -152,17 +152,20 @@ while next_batch is not None:
 ## Key Interaction Points
 
 ### Scheduler ↔ KV Cache Manager
+
 - **At schedule time**: "Can I fit this request?" → Check free blocks/tokens
 - **At prefill**: "Allocate N blocks for this request" → Reserve physical memory
 - **At each decode step**: "Allocate 1 more slot" → Extend allocation
 - **At finish**: "Free this request's memory" → Return blocks to pool
 
 ### Model Runner ↔ KV Cache
+
 - **At forward time**: Model Runner provides `slot_mapping` to attention layers
 - Attention layers use `slot_mapping` to **write** new KV data
 - Attention layers use `block_tables` to **read** existing KV data
 
 ### Scheduler ↔ Radix Cache
+
 - **At schedule time**: "What prefix does this request share?" → `match_prefix()`
 - **At schedule time**: Increment `ref_count` on matched nodes → Prevent eviction
 - **At finish**: "Insert this request's tokens into cache" → `insert()`
@@ -172,6 +175,7 @@ while next_batch is not None:
 ## Termination Conditions
 
 A request finishes when any of these are true:
+
 1. **EOS token**: Model generates the end-of-sequence token
 2. **Max tokens**: Generated `output_len >= max_tokens` from sampling params
 3. **Stop string**: Generated text contains a user-specified stop string
@@ -180,6 +184,7 @@ A request finishes when any of these are true:
 ## Streaming Output
 
 For streaming responses, tokens are sent incrementally:
+
 ```python
 # nano-sglang: After each decode step
 if req.stream:
@@ -192,6 +197,7 @@ if req.stream:
 ## Design Template
 
 To implement the full lifecycle:
+
 1. **Tokenization**: Use HuggingFace tokenizer (or custom)
 2. **Request creation**: Create typed object with state tracking
 3. **Queue management**: Waiting + running queues
@@ -200,3 +206,4 @@ To implement the full lifecycle:
 6. **Finish detection**: Check EOS, max_tokens, stop strings
 7. **Cleanup**: Free memory, optionally cache for reuse
 8. **Detokenization**: Convert tokens back to text
+

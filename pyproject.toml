@@ -10,13 +10,18 @@ readme = "notebooks/00_overview/README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "KonghaYao" }]
-dependencies = []
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.36",
+    "safetensors>=0.4",
+    "psutil>=7.2.2",
+]
 
 [project.optional-dependencies]
-dev = ["ruff", "pre-commit"]
+dev = ["ruff", "pre-commit", "pytest"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/meta_infer"]
+packages = ["engine"]
 
 [tool.ruff]
 target-version = "py310"
@@ -27,3 +32,7 @@ select = ["E", "F", "I", "W"]
 
 [tool.ruff.format]
 quote-style = "double"
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
