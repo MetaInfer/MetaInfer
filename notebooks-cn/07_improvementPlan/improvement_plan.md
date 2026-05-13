@@ -403,15 +403,34 @@ def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 **难度**: 高
 **影响范围**: `openai_tp_server.py`, `engine/scheduler.py`, `llm_engine.py`
 
+**实现方式**: 参考 nano-vllm 的调度模式，worker 循环收集请求后批量调用 `engine.generate(prompts)`。
+
 **具体改动**:
-1. **移除 `request_lock`**: 改为异步 request queue
-2. **Scheduler 支持 decode batch 多请求**:
-   - `_schedule_decode()` 返回多个 running 序列
-   - Model runner 将多序列组 batch 做 forward
-3. **Interleaved prefill/decode**:
-   - 每 N 步 decode 后插入一次 prefill batch
-   - 平衡 TTFT 和 TPOT
-4. **TP 同步重构**:
+1. `openai_tp_server.py`: HTTP handler 将请求放入 queue，worker 线程收集后批量处理
+2. `llm_engine.py`: `_enqueue` 支持 `request_ids` 参数；`step()` 返回已完成序列列表；`has_unfinished_requests()` 检查 scheduler 队列
+3. TP 同步: broadcast 包含实际 prompts（非 dummy），避免 scheduler 分配不一致导致 NCCL 死锁
+
+**遇到的问题与解决**:
+- **问题 1**: NCCL 死锁 — 非 rank-0 使用空 dummy prompts，导致 scheduler 内存分配不一致
+- **解决**: broadcast 包含完整 prompts
+- **问题 2**: batch 始终为 1 — worker 循环被 `process_batch` 阻塞，无法收集后续请求
+- **解决**: 改为非阻塞 drain + 持续 step 循环（多次尝试，最终发现根本原因是请求到达率不足）
+- **问题 3**: 高 RPS 下吞吐率下降 — prefill-first 策略频繁打断 decode
+- **解决**: 尝试 decode-first 策略，但效果有限
+
+**性能验证** (Qwen3-0.6B, TP=2, GPU 4,5):
+
+| 配置 | P2 基线 | P4 | 变化 |
+|------|---------|-----|------|
+| ROUNDS=50, STEPS=64, RPS=8, MAX_CONCURRENCY=1 | 5.98 tok/s | 4.60 tok/s | -23% |
+| ROUNDS=20, STEPS=32, RPS=8, MAX_CONCURRENCY=4 | 5.49 tok/s | 5.23 tok/s | -5% |
+
+**分析**: P4 在单请求场景下有 ~20% 回归，原因是：
+1. batch 处理增加了 scheduler 循环和 NCCL 广播开销
+2. prefill-first 策略导致 batch 间 decode 被打断
+3. Qwen3-0.6B 模型太小，batch 收益不明显（kernel launch overhead 已被 torch.compile 优化）
+
+**结论**: P4 代码功能正确（支持 batch > 1），但在当前测试条件下（小模型、低并发）未能展示预期的 2-5x 提升。需要在更大模型（DeepSeek-V2-Lite）和更高并发下验证。
    - 用 `broadcast_object_list` 传递完整的 batch metadata（而非逐请求）
    - 所有 rank 执行相同的 batch forward
 
@@ -502,6 +521,7 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 | P1 | 回滚(2次) | 7.06/9.56 | - | batch=1 无收益，需要 P4 连续批处理 |
 | P2 | 完成 | 12.75 | **5.93x** | torch.compile kernel fusion + 固定形状 attention |
 | P3 | 完成 | - | - | SDPA enable_gqa=True，省去 repeat_interleave 拷贝 |
+| P4 | 完成(部分) | ~5.2 | ~2.4x | batch 处理 + TP 同步，小模型下无明显提升 |
 | P5 | 完成 | 8.87 | **4.13x** | TP 通信去 dtype 转换 |
 | P5+buffer | 中性 | 8.76 | **4.07x** | 预分配 KV buffer（短序列无显著收益） |
 

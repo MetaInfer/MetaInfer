@@ -1,6 +1,6 @@
-current_phase: COMPLETE
-status: optimization_complete
-timestamp: 2026-05-08T00:30:00
+current_phase: P4
+status: awaiting_gpu_for_benchmark
+timestamp: 2026-05-09T16:45:00
 
 completed_phases:
   - phase: P0
@@ -41,6 +41,15 @@ completed_phases:
     description: Pre-allocated KV cache buffer
     result: NEUTRAL (no significant change for short sequences)
     throughput_after: 8.76 tok/s
+
+  - phase: P4
+    description: Continuous Batching - queue-based batch processing with TP sync
+    result: PARTIAL (code works, no throughput gain on small model)
+    commit: e295447
+    code_verified: Qwen3-0.6B TP=1 PASSED, TP=2 benchmarked
+    key_fix: broadcast includes full prompts to avoid NCCL deadlock
+    benchmark: Qwen3-0.6B TP=2: P2=5.98 tok/s, P4=4.60 tok/s (-23%)
+    note: batch processing overhead > batch benefit on small model
 
 final_metrics:
   model: DeepSeek-V2-Lite-Chat

@@ -297,12 +297,14 @@ class LLMEngine:
         max_new_tokens: int,
         temperature: float,
         top_p: float | None,
+        request_ids: list[str] | None = None,
     ) -> list[Sequence]:
         seqs: list[Sequence] = []
         for i, prompt in enumerate(prompts):
             token_ids = self.runner.tokenizer.encode(prompt, add_special_tokens=True)
+            rid = request_ids[i] if request_ids else f"req-{i}"
             seq = Sequence(
-                request_id=f"req-{i}",
+                request_id=rid,
                 input_ids=token_ids,
                 sampling_params={"max_tokens": max_new_tokens, "temperature": temperature, "top_p": top_p},
             )
@@ -406,16 +408,17 @@ class LLMEngine:
         self._gen_step = 0
 
     def has_unfinished_requests(self) -> bool:
-        if not self._active_gen_seqs:
-            return False
-        return not self._all_finished(self._active_gen_seqs)
+        # Check scheduler queues directly (supports continuous batching)
+        if self.scheduler.waiting or self.scheduler.running:
+            return True
+        if self._active_gen_seqs and not self._all_finished(self._active_gen_seqs):
+            return True
+        return False
 
-    def step(self, temperature: float = 0.0, top_p: float | None = None) -> None:
-        """单步推进调度（与 `generate` 内层循环一致）。"""
-        if not self._active_gen_seqs:
-            return
-        seqs = self._active_gen_seqs
+    def step(self, temperature: float = 0.0, top_p: float | None = None) -> list[Sequence]:
+        """单步推进调度。返回本步完成的序列列表。"""
         self._gen_step += 1
+        finished: list[Sequence] = []
         batch, is_prefill = self.scheduler.schedule()
         if _should_log():
             print(
@@ -424,17 +427,13 @@ class LLMEngine:
                 f"free_blocks={self.memory_pool.num_free_blocks}"
             )
         if not batch:
-            if self._all_finished(seqs):
-                return
-            for seq in seqs:
-                if (
-                    seq.status != SequenceStatus.FINISHED
-                    and len(seq.output_ids) >= int(seq.sampling_params.get("max_tokens", 0))
-                ):
+            # Clean up any sequences that reached max_tokens
+            for seq in list(self.scheduler.running):
+                max_tokens = int(seq.sampling_params.get("max_tokens", 0))
+                if len(seq.output_ids) >= max_tokens:
                     self._finish_check_and_cleanup(seq)
-            if self._all_finished(seqs):
-                return
-            raise RuntimeError("Scheduler returned empty batch before all sequences finished")
+                    finished.append(seq)
+            return finished
 
         if is_prefill:
             first_tokens = self.runner.run(
@@ -448,7 +447,9 @@ class LLMEngine:
             self.scheduler.postprocess(batch, is_prefill=False, generated_tokens=next_tokens)
             for seq in batch:
                 if seq.status == SequenceStatus.RUNNING_DECODE:
-                    self._finish_check_and_cleanup(seq)
+                    if self._finish_check_and_cleanup(seq):
+                        finished.append(seq)
+        return finished
 
     def get_generation_outputs(self) -> list[str]:
         if not self._active_gen_seqs:

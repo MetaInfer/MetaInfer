@@ -3,10 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import queue
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,14 +16,16 @@ import torch.distributed as dist
 from llm_engine import LLMEngine
 
 
+# 终端1： TP_SIZE=4 PORT=9000 bash /data/whl-test/meta-infer/start_tp_infer_service.sh dsv2
+# 终端2： export PYTHONPATH=/workspace/vllm-v0.15.1-dev:$PYTHONPATH
+# PORT=9000 NUM_PROMPTS=50 REQUEST_RATE=1 MAX_CONCURRENCY=1 bash /data/whl-test/meta-infer/run_myengine_benchmark.sh dsv2
+
 @dataclass
-class PendingRequest:
+class GenerateTask:
     prompt: str
     max_tokens: int
     temperature: float
     top_p: float | None
-    result_event: threading.Event = field(default_factory=threading.Event)
-    result_text: str = ""
 
 
 def is_rank0() -> bool:
@@ -54,82 +55,43 @@ def broadcast_obj(obj: dict[str, Any]) -> dict[str, Any]:
 def run_tp_generation_loop(
     engine: LLMEngine, host: str, port: int, max_new_tokens_cap: int
 ) -> None:
-    request_queue: queue.Queue[PendingRequest] = queue.Queue()
+    # Important: for TP collectives, all ranks must execute in strict same order.
+    # If HTTP requests are handled concurrently, collective order can diverge
+    # across ranks and cause NCCL/RCCL timeouts. Serialize request execution.
     request_lock = threading.Lock()
+    rank_logged_once = False
 
-    # --- Non-rank-0: wait for commands from rank 0 ---
+    def generate_once(task: GenerateTask) -> str:
+        output = engine.generate(
+            task.prompt,
+            max_new_tokens=task.max_tokens,
+            temperature=task.temperature,
+            top_p=task.top_p,
+        )
+        if isinstance(output, list):
+            return output[0]
+        return output
+
     if dist_ready() and not is_rank0():
         while True:
             cmd = broadcast_obj({})
             action = cmd.get("action")
             if action == "shutdown":
                 break
-            if action == "generate":
-                # Process the same batch as rank 0 with identical prompts
-                prompts = cmd["prompts"]
-                engine.generate(
-                    prompts,
-                    max_new_tokens=cmd["max_tokens"],
-                    temperature=cmd["temperature"],
-                    top_p=cmd.get("top_p"),
-                )
-            else:
+            if action != "generate":
                 raise RuntimeError(f"Unknown action: {action}")
+            if not rank_logged_once:
+                rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
+                print(f"[meta-infer][rank={rank}] received first generate broadcast")
+                rank_logged_once = True
+            task = GenerateTask(
+                prompt=str(cmd["prompt"]),
+                max_tokens=int(cmd["max_tokens"]),
+                temperature=float(cmd["temperature"]),
+                top_p=None if cmd.get("top_p") is None else float(cmd["top_p"]),
+            )
+            _ = generate_once(task)
         return
-
-    # --- Rank-0: HTTP server + request processing ---
-    def process_batch(reqs: list[PendingRequest]) -> None:
-        """Process a batch of requests. Called with request_lock held."""
-        prompts = [r.prompt for r in reqs]
-        max_tokens = reqs[0].max_tokens
-        temperature = reqs[0].temperature
-        top_p = reqs[0].top_p
-
-        # Broadcast batch to non-rank-0 (including prompts for correct scheduling)
-        if dist_ready():
-            cmd = {
-                "action": "generate",
-                "prompts": prompts,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-            }
-            _ = broadcast_obj(cmd)
-
-        # All ranks process together
-        results = engine.generate(
-            prompts, max_new_tokens=max_tokens,
-            temperature=temperature, top_p=top_p,
-        )
-        if isinstance(results, str):
-            results = [results]
-        for req, text in zip(reqs, results):
-            req.result_text = text
-            req.result_event.set()
-
-    def worker_loop() -> None:
-        """Collect requests from queue and process in batches."""
-        while True:
-            # Wait for at least one request
-            try:
-                first = request_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            with request_lock:
-                # Collect more requests (up to max_num_seqs)
-                batch_reqs = [first]
-                max_batch = engine.scheduler.max_num_seqs
-                while len(batch_reqs) < max_batch:
-                    try:
-                        req = request_queue.get_nowait()
-                        batch_reqs.append(req)
-                    except queue.Empty:
-                        break
-                process_batch(batch_reqs)
-
-    worker = threading.Thread(target=worker_loop, daemon=True)
-    worker.start()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MetaInferOpenAI/0.1"
@@ -169,6 +131,7 @@ def run_tp_generation_loop(
                 return
 
             max_tokens = int(req.get("max_tokens", 16))
+            # Guardrail: avoid unexpectedly long decode from client-side params.
             if max_tokens > max_new_tokens_cap:
                 max_tokens = max_new_tokens_cap
             temperature = float(req.get("temperature", 0.0))
@@ -178,14 +141,24 @@ def run_tp_generation_loop(
             model_name = str(req.get("model", "meta-infer-tp"))
             req_id = str(req.get("request_id", f"cmpl-{uuid.uuid4().hex[:10]}"))
 
-            pending = PendingRequest(
-                prompt=prompt, max_tokens=max_tokens,
-                temperature=temperature, top_p=top_p,
-            )
-            request_queue.put(pending)
-            pending.result_event.wait()
-
-            text = pending.result_text
+            with request_lock:
+                cmd = {
+                    "action": "generate",
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                }
+                if dist_ready():
+                    _ = broadcast_obj(cmd)
+                text = generate_once(
+                    GenerateTask(
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                    )
+                )
             completion_tokens = len(
                 engine.runner.tokenizer.encode(text, add_special_tokens=False)
             )
@@ -196,23 +169,34 @@ def run_tp_generation_loop(
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
                 self.end_headers()
+
                 chunk = {
-                    "id": req_id, "object": "text_completion", "model": model_name,
+                    "id": req_id,
+                    "object": "text_completion",
+                    "model": model_name,
                     "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
                 }
                 usage = {
-                    "id": req_id, "object": "text_completion", "model": model_name,
+                    "id": req_id,
+                    "object": "text_completion",
+                    "model": model_name,
                     "choices": [],
                     "usage": {"completion_tokens": completion_tokens},
                 }
-                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-                self.wfile.write(f"data: {json.dumps(usage, ensure_ascii=False)}\n\n".encode())
+                self.wfile.write(
+                    f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                )
+                self.wfile.write(
+                    f"data: {json.dumps(usage, ensure_ascii=False)}\n\n".encode("utf-8")
+                )
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return
 
             body = {
-                "id": req_id, "object": "text_completion", "model": model_name,
+                "id": req_id,
+                "object": "text_completion",
+                "model": model_name,
                 "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
                 "usage": {"completion_tokens": completion_tokens},
             }
@@ -230,36 +214,54 @@ def run_tp_generation_loop(
     finally:
         server.server_close()
         if dist_ready():
-            with request_lock:
-                _ = broadcast_obj({"action": "shutdown"})
+            _ = broadcast_obj({"action": "shutdown"})
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Start a minimal OpenAI-compatible service for meta-infer TP engine."
     )
-    parser.add_argument("--model-dir", type=str, required=True)
-    parser.add_argument("--backend", type=str, default="tp",
-                        choices=["tp", "qwen_tp", "deepseek_tp", "hf"])
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        required=True,
+        help="Model path, e.g. /data/xinference/cache/Qwen3-8B",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="tp",
+        choices=["tp", "qwen_tp", "deepseek_tp", "hf"],
+    )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--max-num-batched-tokens", type=int, default=4096)
-    parser.add_argument("--max-new-tokens-cap", type=int, default=512)
+    parser.add_argument(
+        "--max-new-tokens-cap",
+        type=int,
+        default=512,
+        help="Upper bound for per-request max_tokens.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     init_dist_if_needed()
+
     engine = LLMEngine(
         model_dir=Path(args.model_dir),
         inference_backend=args.backend,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
     )
-    run_tp_generation_loop(engine, host=args.host, port=args.port,
-                           max_new_tokens_cap=args.max_new_tokens_cap)
+    run_tp_generation_loop(
+        engine,
+        host=args.host,
+        port=args.port,
+        max_new_tokens_cap=args.max_new_tokens_cap,
+    )
 
 
 if __name__ == "__main__":
