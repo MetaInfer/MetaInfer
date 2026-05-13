@@ -512,6 +512,54 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 
 ---
 
+### P3-FA: Flash Attention 集成
+
+**预期提升**: 1.2-1.5x（消除 attn_mask 分配 + flash kernel 加速）
+**难度**: 中
+**影响范围**: `engine/models/qwen.py`, `engine/models/deepseek_v2.py`
+
+**实现方式**: 分模型策略——Qwen 使用 `flash_attn_varlen_func` 直接调用，DeepSeek 使用 PyTorch SDPA 切片 KV（因 FA2 不支持 K/V 不同 headdim）。
+
+**具体改动**:
+
+1. `engine/models/qwen.py`:
+   - 导入 `from flash_attn import flash_attn_varlen_func`
+   - Prefill: `q.reshape(seqlen, H, D)` + `k_buf[0, :kv_len]` + `flash_attn_varlen_func(..., causal=True)`
+   - Decode: 切片到 `kv_len`，`flash_attn_varlen_func(..., causal=False)`
+   - 消除 `.permute(0,2,1,3)` 和反向 permute（flash-attn 接受 `[S, H, D]` 原生布局）
+   - 消除 `attn_mask` 分配
+
+2. `engine/models/deepseek_v2.py`:
+   - Prefill: 保持 PyTorch SDPA（`is_causal=True`，已可调度 flash）
+   - Decode: 切片 KV 到 `kv_len`，移除 `attn_mask`，使用 `is_causal=False`
+   - RoPE 只对有效 `kv_len` 位置计算（不再对 `max_seq_len` 全量计算）
+
+**遇到的问题与解决**:
+- **问题 1**: DeepSeek-V2 MLA 的 K headdim=192, V headdim=128，FA2 要求 K/V headdim 相同
+- **解决**: DeepSeek 改用 PyTorch SDPA（切片 + 去 attn_mask），PyTorch 会自动调度到 flash/cuDNN 后端
+- **问题 2**: DeepSeek decode 路径重复行导致 `IndexError`
+- **解决**: 删除重复的 `out = out.permute(0, 2, 1, 3).contiguous().view(...)` 行
+
+**正确性验证**（meta conda env, GPU 0, 单进程）:
+- Qwen3-8B TP=1: PASSED（输出与 P2 基线一致）
+- DeepSeek-V2-Lite TP=1: PASSED（输出与 P2 基线一致）
+
+**性能验证**（meta conda env, GPU 4-5, TP=2, ROUNDS=12, STEPS=32）:
+
+| 指标 | P3-FA |
+|------|-------|
+| Output throughput (tok/s) | 9.37 |
+| Mean TTFT (ms) | 3,309 |
+| P99 TTFT (ms) | 10,168 |
+| Duration (s) | 39.71 |
+
+**参考**:
+- flash_attn 2.8.3 最大 headdim=256（FA2 限制）
+- vLLM 在 A800 上对 MLA 使用 FA2 标准模式（拼接 rope/nope），但 vLLM 的 DeepSeek-V2 全量版 QK headdim=576 > 256，需 FA3/FlashMLA
+- DeepSeek-V2-Lite 的 QK headdim=192 < 256，理论上可用 FA2，但 K/V headdim 不同（192 vs 128）导致 FA2 报错
+
+---
+
 ## 4. 优化进展总结
 
 | Phase | 状态 | 吞吐 (tok/s) | 相对基准提升 | 说明 |
@@ -521,6 +569,7 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 | P1 | 回滚(2次) | 7.06/9.56 | - | batch=1 无收益，需要 P4 连续批处理 |
 | P2 | 完成 | 12.75 | **5.93x** | torch.compile kernel fusion + 固定形状 attention |
 | P3 | 完成 | - | - | SDPA enable_gqa=True，省去 repeat_interleave 拷贝 |
+| P3-FA | 完成 | 9.37 | - | Flash Attention 集成（Qwen: flash_attn_varlen_func, DeepSeek: SDPA sliced KV） |
 | P4 | 完成(部分) | ~5.2 | ~2.4x | batch 处理 + TP 同步，小模型下无明显提升 |
 | P5 | 完成 | 8.87 | **4.13x** | TP 通信去 dtype 转换 |
 | P5+buffer | 中性 | 8.76 | **4.07x** | 预分配 KV buffer（短序列无显著收益） |

@@ -283,34 +283,31 @@ class DeepseekAttentionTP(nn.Module):
             k_pe_rope = _apply_rope_gptj(raw_k_pe_valid, all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
             k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
 
+            # FA2 不支持 headdim > 256（MLA QK headdim=576），用 PyTorch SDPA
             q_cat = torch.cat([q_nope, q_pe], dim=-1).permute(0, 2, 1, 3)
             k_cat = torch.cat([k_nope_valid, k_pe_rope], dim=-1).permute(0, 2, 1, 3)
             v_perm = v_valid.permute(0, 2, 1, 3)
             out = F.scaled_dot_product_attention(q_cat, k_cat, v_perm, dropout_p=0.0, is_causal=True, scale=self.scaling)
             out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
         else:
-            # Decode path: use full buffer with mask (fixed shapes for CUDA Graph compat)
+            # Decode path: slice to actual kv_len, no attn_mask -> flash SDPA dispatches
             k_nope_buf, v_buf, raw_k_pe_buf, kv_len = past_key_values
             k_nope_buf[:, kv_len:kv_len + seqlen] = k_nope
             v_buf[:, kv_len:kv_len + seqlen] = v
             raw_k_pe_buf[:, kv_len:kv_len + seqlen] = raw_k_pe
             kv_len = kv_len + seqlen
 
-            # Use full buffer (no slicing — fixed shape)
+            # RoPE only on valid portion
             q_pe = _apply_rope_gptj(q_pe, positions, self.cfg.rope_theta, self.cfg.rope_scaling)
-            all_positions = torch.arange(max_seq_len, device=hidden_states.device, dtype=torch.long)
-            k_pe_rope = _apply_rope_gptj(raw_k_pe_buf, all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+            all_positions = torch.arange(kv_len, device=hidden_states.device, dtype=torch.long)
+            k_pe_rope = _apply_rope_gptj(raw_k_pe_buf[:, :kv_len], all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
             k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
 
-            q_cat = torch.cat([q_nope, q_pe], dim=-1).permute(0, 2, 1, 3)  # [B, H, 1, D]
-            k_cat = torch.cat([k_nope_buf, k_pe_rope], dim=-1).permute(0, 2, 1, 3)  # [B, H, max_seq_len, D]
-            v_perm = v_buf.permute(0, 2, 1, 3)  # [B, H, max_seq_len, D]
-
-            # Attention mask: 0 for valid positions, -inf for padding
-            attn_mask = torch.zeros(1, 1, 1, max_seq_len, device=hidden_states.device, dtype=q_cat.dtype)
-            attn_mask[:, :, :, kv_len:] = float('-inf')
-
-            out = F.scaled_dot_product_attention(q_cat, k_cat, v_perm, dropout_p=0.0, is_causal=False, scale=self.scaling, attn_mask=attn_mask)
+            # Slice to actual kv_len (no padding, no mask) -> PyTorch SDPA dispatches to flash
+            q_cat = torch.cat([q_nope, q_pe], dim=-1).permute(0, 2, 1, 3)
+            k_cat = torch.cat([k_nope_buf[:, :kv_len], k_pe_rope], dim=-1).permute(0, 2, 1, 3)
+            v_perm = v_buf[:, :kv_len].permute(0, 2, 1, 3)
+            out = F.scaled_dot_product_attention(q_cat, k_cat, v_perm, dropout_p=0.0, is_causal=False, scale=self.scaling)
             out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
 
         new_cache = (k_nope_buf, v_buf, raw_k_pe_buf, kv_len)

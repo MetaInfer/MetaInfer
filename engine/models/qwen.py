@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_varlen_func
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
@@ -176,34 +177,38 @@ class QwenAttentionTP(nn.Module):
             v_buf[:, :seqlen] = v
             kv_len = seqlen
 
-            q_p = q.permute(0, 2, 1, 3)
-            k_p = k_buf[:, :kv_len].permute(0, 2, 1, 3)
-            v_p = v_buf[:, :kv_len].permute(0, 2, 1, 3)
-            out = F.scaled_dot_product_attention(
-                q_p, k_p, v_p, dropout_p=0.0, is_causal=True,
-                scale=self.scaling, enable_gqa=use_gqa,
+            # flash-attn: reshape to (total, heads, headdim)
+            q_fa = q.reshape(seqlen, self.num_heads, self.head_dim)
+            k_fa = k_buf[0, :kv_len]
+            v_fa = v_buf[0, :kv_len]
+            cu = torch.tensor([0, seqlen], dtype=torch.int32, device=q.device)
+            out = flash_attn_varlen_func(
+                q_fa, k_fa, v_fa,
+                cu_seqlens_q=cu, cu_seqlens_k=cu,
+                max_seqlen_q=seqlen, max_seqlen_k=kv_len,
+                causal=True, softmax_scale=self.scaling,
             )
-            out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.q_size)
+            out = out.reshape(bsz, seqlen, self.q_size)
         else:
-            # Decode: use full buffer with mask (fixed shapes for CUDA Graph compat)
+            # Decode: append new KV, then use flash-attn on valid portion only
             k_buf, v_buf, kv_len = past_key_values
             k_buf[:, kv_len:kv_len + seqlen] = k
             v_buf[:, kv_len:kv_len + seqlen] = v
             kv_len = kv_len + seqlen
 
-            q_p = q.permute(0, 2, 1, 3)  # [B, H, 1, D]
-            k_p = k_buf.permute(0, 2, 1, 3)  # [B, KV_H, max_seq_len, D]
-            v_p = v_buf.permute(0, 2, 1, 3)  # [B, KV_H, max_seq_len, D]
-
-            # Attention mask: 0 for valid, -inf for padding
-            attn_mask = torch.zeros(1, 1, 1, max_seq_len, device=hidden_states.device, dtype=q_p.dtype)
-            attn_mask[:, :, :, kv_len:] = float('-inf')
-
-            out = F.scaled_dot_product_attention(
-                q_p, k_p, v_p, dropout_p=0.0, is_causal=False,
-                scale=self.scaling, enable_gqa=use_gqa, attn_mask=attn_mask,
+            # flash-attn: 只传有效 KV 部分，无需 attn_mask
+            q_fa = q.reshape(seqlen, self.num_heads, self.head_dim)
+            k_fa = k_buf[0, :kv_len]
+            v_fa = v_buf[0, :kv_len]
+            cu_q = torch.tensor([0, seqlen], dtype=torch.int32, device=q.device)
+            cu_k = torch.tensor([0, kv_len], dtype=torch.int32, device=q.device)
+            out = flash_attn_varlen_func(
+                q_fa, k_fa, v_fa,
+                cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                max_seqlen_q=seqlen, max_seqlen_k=kv_len,
+                causal=False, softmax_scale=self.scaling,
             )
-            out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.q_size)
+            out = out.reshape(bsz, seqlen, self.q_size)
 
         new_cache = (k_buf, v_buf, kv_len)
         return self.o_proj(out), new_cache
