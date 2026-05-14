@@ -46,6 +46,7 @@ SHAREGPT_JSON="${SHAREGPT_JSON:-}"
 VLLM_PORT="${VLLM_PORT:-8001}"
 MY_PORT="${MY_PORT:-9000}"
 VLLM_BIN="${VLLM_BIN:-vllm}"
+VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.9}"
 RESULT_DIR="${RESULT_DIR:-${ROOT_DIR}/tests}"
 PERCENTILE_METRICS="${PERCENTILE_METRICS:-ttft,tpot,e2el}"
 METRIC_PERCENTILES="${METRIC_PERCENTILES:-99}"
@@ -211,6 +212,7 @@ if [[ "${SKIP_VLLM:-0}" != "1" ]]; then
     --host 0.0.0.0 \
     --port "$VLLM_PORT" \
     --trust-remote-code \
+    --gpu-memory-utilization "$VLLM_GPU_MEM_UTIL" \
     >"${RESULT_DIR}/vllm_serve_${TS}.log" 2>&1 &
   echo $! > "$VLLM_PIDF"
   wait_http "vllm" 300 \

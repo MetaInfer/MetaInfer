@@ -518,7 +518,7 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 **难度**: 中
 **影响范围**: `engine/models/qwen.py`, `engine/models/deepseek_v2.py`
 
-**实现方式**: 分模型策略——Qwen 使用 `flash_attn_varlen_func` 直接调用，DeepSeek 使用 PyTorch SDPA 切片 KV（因 FA2 不支持 K/V 不同 headdim）。
+**实现方式**: 分模型策略——Qwen 使用 `flash_attn_varlen_func` 直接调用，DeepSeek 使用 V-padding + `flash_attn_varlen_func`。
 
 **具体改动**:
 
@@ -529,34 +529,49 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
    - 消除 `.permute(0,2,1,3)` 和反向 permute（flash-attn 接受 `[S, H, D]` 原生布局）
    - 消除 `attn_mask` 分配
 
-2. `engine/models/deepseek_v2.py`:
-   - Prefill: 保持 PyTorch SDPA（`is_causal=True`，已可调度 flash）
-   - Decode: 切片 KV 到 `kv_len`，移除 `attn_mask`，使用 `is_causal=False`
-   - RoPE 只对有效 `kv_len` 位置计算（不再对 `max_seq_len` 全量计算）
+2. `engine/models/deepseek_v2.py`（当前版本：V-padding 方案）:
+   - 导入 `from flash_attn import flash_attn_varlen_func`
+   - Prefill: `flash_attn_varlen_func(..., causal=True)` + V-padding（`F.pad(v, [0, qk_head_dim - v_head_dim])`）
+   - Decode: full buffer + `flash_attn_varlen_func` + `cu_seqlens_k` 标记有效边界 + V-padding
+   - 输出 unpad: `out[:, :, :v_head_dim]`
+   - 保持 torch.compile（fixed shape，无重编译）
+
+**尝试过的方案**:
+
+| 方案 | 策略 | 结果 | 原因 |
+|------|------|------|------|
+| 方案 A | 切片 KV + SDPA 无 mask | -20% 回退 | torch.compile 动态 shape 重编译 |
+| 方案 B | 切片 KV + SDPA + 去 attn compile | -12% 回退 | 切片开销 > 消除 attn_mask 收益 |
+| 方案 C | V-padding + flash_attn_varlen_func | -15% 回退 | F.pad/unpad 开销 + full buffer 浪费 |
 
 **遇到的问题与解决**:
 - **问题 1**: DeepSeek-V2 MLA 的 K headdim=192, V headdim=128，FA2 要求 K/V headdim 相同
-- **解决**: DeepSeek 改用 PyTorch SDPA（切片 + 去 attn_mask），PyTorch 会自动调度到 flash/cuDNN 后端
-- **问题 2**: DeepSeek decode 路径重复行导致 `IndexError`
-- **解决**: 删除重复的 `out = out.permute(0, 2, 1, 3).contiguous().view(...)` 行
+- **解决**: V-padding（`F.pad(v, [0, 192-128])`）+ 输出 unpad（`out[:, :, :128]`）
+- **问题 2**: 切片 KV 导致 torch.compile 动态 shape 重编译
+- **解决**: 改用 full buffer + `cu_seqlens_k` 标记有效边界（值变化但 shape 固定，不触发重编译）
+- **问题 3**: DeepSeek decode 路径重复行导致 `IndexError`
+- **解决**: 删除重复的 `out = out.permute(...).contiguous().view(...)` 行
 
-**正确性验证**（meta conda env, GPU 0, 单进程）:
-- Qwen3-8B TP=1: PASSED（输出与 P2 基线一致）
-- DeepSeek-V2-Lite TP=1: PASSED（输出与 P2 基线一致）
+**正确性验证**:
+- Qwen3-8B TP=4 (meta conda env): PASSED
+- DeepSeek-V2-Lite TP=4 (meta conda env): PASSED
 
-**性能验证**（meta conda env, GPU 4-5, TP=2, ROUNDS=12, STEPS=32）:
+**性能验证**（DeepSeek-V2-Lite, TP=4, ROUNDS=10, STEPS=8）:
 
-| 指标 | P3-FA |
-|------|-------|
-| Output throughput (tok/s) | 9.37 |
-| Mean TTFT (ms) | 3,309 |
-| P99 TTFT (ms) | 10,168 |
-| Duration (s) | 39.71 |
+| 版本 | GPU | 空闲显存 | 吞吐 (tok/s) | 变化 |
+|------|-----|---------|-------------|------|
+| P2 基线 | GPU 4-7 | 30GB | 9.12 | 基准 |
+| P3-FA 方案 A (切片) | GPU 4-7 | 30GB | 7.29 | -20% |
+| P2 基线 | GPU 0-3 | 20GB | 0.82 | 基准 |
+| P3-FA 方案 C (V-pad) | GPU 0-3 | 20GB | 0.70 | -15% |
+
+**结论**: P3-FA 正确性验证通过，但性能在当前 GPU 环境下有 15-20% 回退。需要 GPU 有 30GB+ 空闲时重新测试 V-padding 方案。
 
 **参考**:
 - flash_attn 2.8.3 最大 headdim=256（FA2 限制）
-- vLLM 在 A800 上对 MLA 使用 FA2 标准模式（拼接 rope/nope），但 vLLM 的 DeepSeek-V2 全量版 QK headdim=576 > 256，需 FA3/FlashMLA
-- DeepSeek-V2-Lite 的 QK headdim=192 < 256，理论上可用 FA2，但 K/V headdim 不同（192 vs 128）导致 FA2 报错
+- vLLM 在 A800 上对 MLA 使用 FA2 标准模式（拼接 rope/nope），但 DeepSeek-V2 全量版 QK headdim=576 > 256，需 FA3/FlashMLA
+- DeepSeek-V2-Lite 的 QK headdim=192 < 256，可用 FA2，但 K/V headdim 不同（192 vs 128）需 V-padding
+- vLLM 参考: `cu_seqlens_k` 标记有效边界，值变化但 shape 固定 `[2]`，不触发 torch.compile 重编译
 
 ---
 
@@ -569,7 +584,7 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 | P1 | 回滚(2次) | 7.06/9.56 | - | batch=1 无收益，需要 P4 连续批处理 |
 | P2 | 完成 | 12.75 | **5.93x** | torch.compile kernel fusion + 固定形状 attention |
 | P3 | 完成 | - | - | SDPA enable_gqa=True，省去 repeat_interleave 拷贝 |
-| P3-FA | 完成 | 9.37 | - | Flash Attention 集成（Qwen: flash_attn_varlen_func, DeepSeek: SDPA sliced KV） |
+| P3-FA | 部分完成 | 0.70-9.37 | - | Flash Attention（Qwen: flash_attn_varlen_func, DeepSeek: V-padding + FA2），正确性通过，性能待验证 |
 | P4 | 完成(部分) | ~5.2 | ~2.4x | batch 处理 + TP 同步，小模型下无明显提升 |
 | P5 | 完成 | 8.87 | **4.13x** | TP 通信去 dtype 转换 |
 | P5+buffer | 中性 | 8.76 | **4.07x** | 预分配 KV buffer（短序列无显著收益） |

@@ -1,6 +1,6 @@
 current_phase: P3-FA
-status: completed
-timestamp: 2026-05-09T16:45:00
+status: completed (correctness verified, perf pending GPU availability)
+timestamp: 2026-05-14T11:00:00
 
 completed_phases:
   - phase: P0
@@ -50,6 +50,21 @@ completed_phases:
     key_fix: broadcast includes full prompts to avoid NCCL deadlock
     benchmark: Qwen3-0.6B TP=2: P2=5.98 tok/s, P4=4.60 tok/s (-23%)
     note: batch processing overhead > batch benefit on small model
+
+  - phase: P3-FA
+    description: Flash Attention 集成
+    result: PARTIAL (correctness verified, perf regression on limited GPU)
+    commit: bb7689d
+    strategies_tested:
+      - Qwen: flash_attn_varlen_func direct call (SUCCESS, no regression)
+      - DeepSeek sliced KV + no attn_mask: -20% regression (torch.compile recompilation)
+      - DeepSeek V-padding + flash_attn_varlen_func: -15% regression (pad/unpad overhead)
+    key_finding: "FA2 max headdim=256, DeepSeek-V2-Lite QK headdim=192 < 256 but K/V headdim mismatch (192 vs 128)"
+    current_code: "DeepSeek uses V-padding + flash_attn_varlen_func + cu_seqlens_k"
+    correctness:
+      - Qwen3-8B TP=4: PASSED
+      - DeepSeek-V2-Lite TP=4: PASSED
+    perf_note: "GPU memory too limited (6-20GB free) for fair comparison. Need GPU 4-7 with 30GB+ free."
 
 final_metrics:
   model: DeepSeek-V2-Lite-Chat

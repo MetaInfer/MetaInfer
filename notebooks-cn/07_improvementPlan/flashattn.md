@@ -203,9 +203,9 @@ out = out.reshape(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
 **MLA 注意事项**：
 - DeepSeek-V2 的 MLA 将 K 分为 `k_nope`（无位置编码）和 `k_pe`（RoPE 部分），拼接后形成完整 K
 - FA2 不支持 `q_v` 参数（那是 FA3 的 MLA 原生支持），所以仍需拼接完整 Q/K 向量
-- FA2 最大 head dim = 256，**DeepSeek-V2-Lite 的 QK headdim = 192（128+64）在限制内** ✅
-- ⚠️ DeepSeek-V2 全量版 QK headdim = 576（512+64）超出限制，需改用 SDPA 优化方案
-- 拼接后 V headdim = `v_head_dim`（128），也在限制内
+- ⚠️ **FA2 要求 Q/K/V 三者 headdim 完全相同**，而 DeepSeek-V2-Lite 的 QK=192, V=128 不等，**FA2 无法使用**
+- 验证：`flash_attn_varlen_func(q[192], k[192], v[128])` → 报错 "v must have shape (total_k, num_heads_k, head_size)"
+- **DeepSeek-V2 改用 SDPA 切片优化**（去掉 attn_mask，只传有效 KV 部分），详见第 5 节
 
 #### 3.2.2 Decode 路径 (line 305-314)
 
@@ -304,9 +304,15 @@ vllm 有两种 MLA 后端：
 
 通过 `block_table` (batch_size, max_blocks_per_seq) 映射逻辑位置到物理块。Phase 3 将参考此设计。
 
-## 5. DeepSeek-V2 全量版兼容方案
+## 5. DeepSeek-V2 SDPA 优化方案
 
-DeepSeek-V2 全量版（以及 V2.5、V3）的 QK headdim = 576，超出 FA2 限制（256）。如果未来需要支持这些模型，有两种方案：
+**所有 DeepSeek-V2 变体（Lite/全量/V3）都无法使用 FA2**，原因不是 head dim 超限，而是 FA2 要求 Q/K/V headdim 完全相同，而 MLA 的 QK headdim ≠ V headdim：
+
+| 模型 | QK headdim | V headdim | FA2 |
+|------|-----------|----------|-----|
+| DeepSeek-V2-Lite | 192 | 128 | ❌ 不等 |
+| DeepSeek-V2 全量 | 576 | 128 | ❌ 不等+超限 |
+| DeepSeek-V3 | 576 | 128 | ❌ 不等+超限 |
 
 ### 方案 A: SDPA 去 mask 优化（推荐）
 

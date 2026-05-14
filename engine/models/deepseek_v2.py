@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_varlen_func
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
@@ -273,42 +274,54 @@ class DeepseekAttentionTP(nn.Module):
             raw_k_pe_buf[:, :seqlen] = raw_k_pe
             kv_len = seqlen
 
-            # Prefill path: slice valid portion (shape = seqlen, efficient)
-            k_nope_valid = k_nope_buf[:, :kv_len]
-            v_valid = v_buf[:, :kv_len]
-            raw_k_pe_valid = raw_k_pe_buf[:, :kv_len]
-
+            # Prefill: flash_attn_varlen_func with V-padding
             q_pe = _apply_rope_gptj(q_pe, positions, self.cfg.rope_theta, self.cfg.rope_scaling)
             all_positions = torch.arange(kv_len, device=hidden_states.device, dtype=torch.long)
-            k_pe_rope = _apply_rope_gptj(raw_k_pe_valid, all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+            k_pe_rope = _apply_rope_gptj(raw_k_pe_buf[:, :kv_len], all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
             k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
 
-            # FA2 不支持 headdim > 256（MLA QK headdim=576），用 PyTorch SDPA
-            q_cat = torch.cat([q_nope, q_pe], dim=-1).permute(0, 2, 1, 3)
-            k_cat = torch.cat([k_nope_valid, k_pe_rope], dim=-1).permute(0, 2, 1, 3)
-            v_perm = v_valid.permute(0, 2, 1, 3)
-            out = F.scaled_dot_product_attention(q_cat, k_cat, v_perm, dropout_p=0.0, is_causal=True, scale=self.scaling)
-            out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
+            q_fa = torch.cat([q_nope, q_pe], dim=-1).reshape(seqlen, self.local_heads, -1)
+            k_fa = torch.cat([k_nope_buf[0, :kv_len], k_pe_rope[0]], dim=-1)
+            # Pad V to match K headdim (v_head_dim -> qk_head_dim)
+            v_fa = F.pad(v_buf[0, :kv_len], [0, self.cfg.qk_head_dim - self.cfg.v_head_dim])
+            cu = torch.tensor([0, seqlen], dtype=torch.int32, device=q_fa.device)
+            out = flash_attn_varlen_func(
+                q_fa, k_fa, v_fa,
+                cu_seqlens_q=cu, cu_seqlens_k=cu,
+                max_seqlen_q=seqlen, max_seqlen_k=kv_len,
+                causal=True, softmax_scale=self.scaling,
+            )
+            # Unpad V output: discard padding dimensions
+            out = out[:, :, :self.cfg.v_head_dim].reshape(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
         else:
-            # Decode path: slice to actual kv_len, no attn_mask -> flash SDPA dispatches
+            # Decode: flash_attn_varlen_func with full buffer + V-padding + cu_seqlens_k
             k_nope_buf, v_buf, raw_k_pe_buf, kv_len = past_key_values
             k_nope_buf[:, kv_len:kv_len + seqlen] = k_nope
             v_buf[:, kv_len:kv_len + seqlen] = v
             raw_k_pe_buf[:, kv_len:kv_len + seqlen] = raw_k_pe
             kv_len = kv_len + seqlen
 
-            # RoPE only on valid portion
+            # Full buffer RoPE (fixed shape for torch.compile)
             q_pe = _apply_rope_gptj(q_pe, positions, self.cfg.rope_theta, self.cfg.rope_scaling)
-            all_positions = torch.arange(kv_len, device=hidden_states.device, dtype=torch.long)
-            k_pe_rope = _apply_rope_gptj(raw_k_pe_buf[:, :kv_len], all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+            all_positions = torch.arange(max_seq_len, device=hidden_states.device, dtype=torch.long)
+            k_pe_rope = _apply_rope_gptj(raw_k_pe_buf, all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
             k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
 
-            # Slice to actual kv_len (no padding, no mask) -> PyTorch SDPA dispatches to flash
-            q_cat = torch.cat([q_nope, q_pe], dim=-1).permute(0, 2, 1, 3)
-            k_cat = torch.cat([k_nope_buf[:, :kv_len], k_pe_rope], dim=-1).permute(0, 2, 1, 3)
-            v_perm = v_buf[:, :kv_len].permute(0, 2, 1, 3)
-            out = F.scaled_dot_product_attention(q_cat, k_cat, v_perm, dropout_p=0.0, is_causal=False, scale=self.scaling)
-            out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
+            # Build 3D tensors for flash_attn (full buffer, fixed shape)
+            q_fa = torch.cat([q_nope, q_pe], dim=-1).reshape(seqlen, self.local_heads, -1)
+            k_fa = torch.cat([k_nope_buf[0], k_pe_rope[0]], dim=-1)  # [max_seq_len, H, qk_head_dim]
+            # Pad V to match K headdim: [max_seq_len, H, v_head_dim] -> [max_seq_len, H, qk_head_dim]
+            v_fa = F.pad(v_buf[0], [0, self.cfg.qk_head_dim - self.cfg.v_head_dim])
+            cu_q = torch.tensor([0, seqlen], dtype=torch.int32, device=q_fa.device)
+            cu_k = torch.tensor([0, kv_len], dtype=torch.int32, device=q_fa.device)
+            out = flash_attn_varlen_func(
+                q_fa, k_fa, v_fa,
+                cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                max_seqlen_q=seqlen, max_seqlen_k=kv_len,
+                causal=False, softmax_scale=self.scaling,
+            )
+            # Unpad V output: discard padding dimensions
+            out = out[:, :, :self.cfg.v_head_dim].reshape(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
 
         new_cache = (k_nope_buf, v_buf, raw_k_pe_buf, kv_len)
         return self.o_proj(out), new_cache
