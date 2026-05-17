@@ -3,6 +3,10 @@
 # 用法:
 #   bash run_compare_metainfer_vllm.sh dsv2
 # 环境变量（与 run_myengine_benchmark.sh 对齐）:
+
+# Bypass proxy for localhost connections
+export no_proxy="${no_proxy:+$no_proxy,}127.0.0.1,localhost,0.0.0.0"
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost,0.0.0.0"
 #   TP_SIZE, CUDA_VISIBLE_DEVICES
 #   ROUNDS, STEPS, REQUEST_RATE, MAX_CONCURRENCY
 #   DATASET (zh-default | sharegpt-json), SHAREGPT_JSON

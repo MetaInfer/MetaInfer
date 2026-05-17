@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from flash_attn import flash_attn_varlen_func
 from safetensors import safe_open
+
+from engine.kernels.triton_mla_decode import triton_mla_decode
 from transformers import AutoConfig, AutoTokenizer
 
 from engine.sampler import sample_next_tokens
@@ -226,6 +228,79 @@ class DeepseekAttentionTP(nn.Module):
         )
         self.o_proj = RowParallelLinear(cfg.num_attention_heads * cfg.v_head_dim, cfg.hidden_size, bias=False)
 
+        # Triton MLA weights: W_UK_T projects q_nope to latent space, W_UV expands output
+        # These are extracted from kv_b_proj_with_mqa (no extra memory)
+        kv_lora_rank = cfg.kv_lora_rank
+        nope_d = cfg.qk_nope_head_dim
+        v_d = cfg.v_head_dim
+        # W_UK_T: [H, kv_lora_rank, qk_nope] for q_nope @ W_UK_T
+        # W_UV: [H, kv_lora_rank, v_head_dim] for out_latent @ W_UV
+        # These will be initialized after load_weights() when kv_b_proj is available
+        self.W_UK_T: torch.Tensor | None = None
+        self.W_UV: torch.Tensor | None = None
+
+        # Unified KV cache buffer for Triton MLA: [B, max_seq_len, 1, kv_lora_rank + rope_dim]
+        self._kv_cache_buf: torch.Tensor | None = None
+        self._buf_max_seq_len = 0
+
+        # FA2 pre-allocated buffers (for prefill path)
+        self._k_cat_buf: torch.Tensor | None = None
+        self._v_pad_buf: torch.Tensor | None = None
+        self._q_cat_buf: torch.Tensor | None = None
+        self._all_pos: torch.Tensor | None = None
+        self._cu_q: torch.Tensor | None = None
+        self._cu_k: torch.Tensor | None = None
+
+    def init_buffers(self, max_seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
+        """Pre-allocate decode buffers. Call before torch.compile."""
+        if max_seq_len <= self._buf_max_seq_len:
+            return
+        self._buf_max_seq_len = max_seq_len
+        H, D = self.local_heads, self.cfg.qk_head_dim
+        kv_lora_rank = self.cfg.kv_lora_rank
+        rope_d = self.cfg.qk_rope_head_dim
+
+        # FA2 buffers (for prefill)
+        self._k_cat_buf = torch.zeros(1, max_seq_len, H, D, device=device, dtype=dtype)
+        self._v_pad_buf = torch.zeros(1, max_seq_len, H, D, device=device, dtype=dtype)
+        self._q_cat_buf = torch.zeros(1, max_seq_len, H, D, device=device, dtype=dtype)
+        self._all_pos = torch.arange(max_seq_len, device=device, dtype=torch.long)
+        self._cu_q = torch.tensor([0, 0], dtype=torch.int32, device=device)
+        self._cu_k = torch.tensor([0, 0], dtype=torch.int32, device=device)
+
+        # Triton MLA unified KV cache: [1, max_seq_len, 1, kv_lora_rank + rope_dim]
+        self._kv_cache_buf = torch.zeros(
+            1, max_seq_len, 1, kv_lora_rank + rope_d,
+            device=device, dtype=dtype,
+        )
+
+    def _init_mla_weights(self) -> None:
+        """Extract W_UK_T and W_UV from kv_b_proj_with_mqa. Call after load_weights.
+
+        Follows vLLM's approach:
+        - kv_b_proj weight: [out_features, in_features] = [H*(P+V), Lkv]
+        - .T → [Lkv, H*(P+V)]
+        - view → [Lkv, H, P+V]
+        - split → W_UK [Lkv, H, P], W_UV [Lkv, H, V]
+        - W_UK_T = W_UK.permute(1, 2, 0) → [H, P, Lkv]
+        - W_UV = W_UV.transpose(0, 1) → [H, Lkv, V]
+        """
+        nope_d = self.cfg.qk_nope_head_dim
+        v_d = self.cfg.v_head_dim
+        kv_lora_rank = self.cfg.kv_lora_rank
+        H = self.local_heads
+
+        # Transpose weight: [H*(P+V), Lkv] → [Lkv, H*(P+V)]
+        W = self.kv_b_proj_with_mqa.weight.data.T
+        # Reshape: [Lkv, H, P+V]
+        W = W.view(kv_lora_rank, H, nope_d + v_d)
+        # Split into W_UK and W_UV
+        W_UK, W_UV = W.split([nope_d, v_d], dim=-1)
+        # W_UK_T: [H, P, Lkv] — for q_nope @ W_UK_T → [H, 1, Lkv]
+        self.W_UK_T = W_UK.permute(1, 2, 0).contiguous()
+        # W_UV: [H, Lkv, V] — for out_latent @ W_UV → [H, 1, V]
+        self.W_UV = W_UV.transpose(0, 1).contiguous()
+
     def _local_slice_heads(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
         b, t, _ = x.shape
         return x.view(b, t, self.local_heads, head_dim)
@@ -236,6 +311,7 @@ class DeepseekAttentionTP(nn.Module):
         positions: torch.Tensor,
         past_key_values: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None = None,
         max_seq_len: int = 512,
+        layer_idx: int = -1,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]:
         """Forward with pre-allocated KV cache buffer.
 
@@ -247,6 +323,7 @@ class DeepseekAttentionTP(nn.Module):
         Returns: (output, new_cache)
         """
         bsz, seqlen, _ = hidden_states.shape
+
         if self.cfg.q_lora_rank is None:
             q_full = self.q_b_proj(hidden_states)
         else:
@@ -259,71 +336,104 @@ class DeepseekAttentionTP(nn.Module):
         kv_latent_plus_pe = self.kv_a_proj_with_mqa(hidden_states)
         c_kv, k_pe = torch.split(kv_latent_plus_pe, [self.cfg.kv_lora_rank, self.cfg.qk_rope_head_dim], dim=-1)
         c_kv = self.kv_a_layernorm(c_kv)
-        kv_full = self.kv_b_proj_with_mqa(c_kv)
-        kv_full = self._local_slice_heads(kv_full, self.cfg.qk_nope_head_dim + self.cfg.v_head_dim)
-        k_nope, v = torch.split(kv_full, [self.cfg.qk_nope_head_dim, self.cfg.v_head_dim], dim=-1)
         raw_k_pe = k_pe.view(bsz, seqlen, 1, self.cfg.qk_rope_head_dim)
 
         if past_key_values is None:
-            # Prefill: allocate buffers and write
-            k_nope_buf = torch.zeros(bsz, max_seq_len, k_nope.shape[2], k_nope.shape[3], device=k_nope.device, dtype=k_nope.dtype)
-            v_buf = torch.zeros(bsz, max_seq_len, v.shape[2], v.shape[3], device=v.device, dtype=v.dtype)
-            raw_k_pe_buf = torch.zeros(bsz, max_seq_len, 1, raw_k_pe.shape[3], device=raw_k_pe.device, dtype=raw_k_pe.dtype)
-            k_nope_buf[:, :seqlen] = k_nope
-            v_buf[:, :seqlen] = v
-            raw_k_pe_buf[:, :seqlen] = raw_k_pe
+            # ===== PREFILL: FA2 + V-padding + write unified KV cache =====
+            # Expand c_kv to per-head via kv_b_proj for FA2
+            kv_full = self.kv_b_proj_with_mqa(c_kv)
+            kv_full = self._local_slice_heads(kv_full, self.cfg.qk_nope_head_dim + self.cfg.v_head_dim)
+            k_nope, v = torch.split(kv_full, [self.cfg.qk_nope_head_dim, self.cfg.v_head_dim], dim=-1)
+
+            # Allocate unified KV cache buffer
+            kv_cache_buf = torch.zeros(
+                bsz, max_seq_len, 1, self.cfg.kv_lora_rank + self.cfg.qk_rope_head_dim,
+                device=hidden_states.device, dtype=hidden_states.dtype,
+            )
             kv_len = seqlen
 
-            # Prefill: flash_attn_varlen_func with V-padding
+            # FA2 attention (prefill only)
             q_pe = _apply_rope_gptj(q_pe, positions, self.cfg.rope_theta, self.cfg.rope_scaling)
-            all_positions = torch.arange(kv_len, device=hidden_states.device, dtype=torch.long)
-            k_pe_rope = _apply_rope_gptj(raw_k_pe_buf[:, :kv_len], all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
+            k_pe_rope = _apply_rope_gptj(
+                raw_k_pe[:, :kv_len], self._all_pos[:kv_len],
+                self.cfg.rope_theta, self.cfg.rope_scaling,
+            )
             k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
 
-            q_fa = torch.cat([q_nope, q_pe], dim=-1).reshape(seqlen, self.local_heads, -1)
-            k_fa = torch.cat([k_nope_buf[0, :kv_len], k_pe_rope[0]], dim=-1)
-            # Pad V to match K headdim (v_head_dim -> qk_head_dim)
-            v_fa = F.pad(v_buf[0, :kv_len], [0, self.cfg.qk_head_dim - self.cfg.v_head_dim])
-            cu = torch.tensor([0, seqlen], dtype=torch.int32, device=q_fa.device)
+            # Write c_kv (latent) and k_pe_rope (with RoPE applied) into unified cache
+            # vLLM stores RoPE'd k_pe in cache — the kernel expects it
+            kv_cache_buf[:, :kv_len, :, :self.cfg.kv_lora_rank] = c_kv.unsqueeze(2)
+            kv_cache_buf[:, :kv_len, :, self.cfg.kv_lora_rank:] = k_pe_rope[:, :, :1, :]
+
+            nope_d = self.cfg.qk_nope_head_dim
+            self._q_cat_buf[:, :seqlen] = torch.cat([q_nope, q_pe], dim=-1)
+            q_fa = self._q_cat_buf[0, :seqlen]
+            self._k_cat_buf[0, :kv_len, :, :nope_d] = k_nope[0, :kv_len]
+            self._k_cat_buf[0, :kv_len, :, nope_d:] = k_pe_rope[0]
+            k_fa = self._k_cat_buf[0, :kv_len]
+            self._v_pad_buf[0, :kv_len, :, :self.cfg.v_head_dim] = v[0, :kv_len]
+            v_fa = self._v_pad_buf[0, :kv_len]
+            self._cu_q[1] = seqlen
             out = flash_attn_varlen_func(
                 q_fa, k_fa, v_fa,
-                cu_seqlens_q=cu, cu_seqlens_k=cu,
+                cu_seqlens_q=self._cu_q, cu_seqlens_k=self._cu_q,
                 max_seqlen_q=seqlen, max_seqlen_k=kv_len,
                 causal=True, softmax_scale=self.scaling,
             )
-            # Unpad V output: discard padding dimensions
             out = out[:, :, :self.cfg.v_head_dim].reshape(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
         else:
-            # Decode: flash_attn_varlen_func with full buffer + V-padding + cu_seqlens_k
-            k_nope_buf, v_buf, raw_k_pe_buf, kv_len = past_key_values
-            k_nope_buf[:, kv_len:kv_len + seqlen] = k_nope
-            v_buf[:, kv_len:kv_len + seqlen] = v
-            raw_k_pe_buf[:, kv_len:kv_len + seqlen] = raw_k_pe
+            # ===== DECODE: Triton MLA kernel =====
+            kv_cache_buf, kv_len = past_key_values
+
+            # Write new token's c_kv and k_pe (with RoPE) into unified cache
+            kv_cache_buf[:, kv_len:kv_len + seqlen, :, :self.cfg.kv_lora_rank] = c_kv.unsqueeze(2)
+            # Apply RoPE to k_pe before storing (vLLM stores RoPE'd k_pe)
+            k_pe_rope_new = _apply_rope_gptj(
+                raw_k_pe, positions,
+                self.cfg.rope_theta, self.cfg.rope_scaling,
+            )
+            kv_cache_buf[:, kv_len:kv_len + seqlen, :, self.cfg.kv_lora_rank:] = k_pe_rope_new
             kv_len = kv_len + seqlen
 
-            # Full buffer RoPE (fixed shape for torch.compile)
+            # Project q_nope to latent space (vLLM approach)
+            # q_nope: [1, 1, H, P] → [1, H, P]
+            q_nope_2d = q_nope.squeeze(1)  # [1, H, P]
+            # Transpose to [H, 1, P] for bmm
+            q_nope_t = q_nope_2d.transpose(0, 1)  # [H, 1, P]
+            # bmm: [H, 1, P] @ [H, P, Lkv] → [H, 1, Lkv]
+            q_nope_proj = torch.bmm(q_nope_t, self.W_UK_T)  # [H, 1, Lkv]
+            # Transpose back to [1, H, Lkv]
+            q_nope_latent = q_nope_proj.transpose(0, 1)  # [1, H, Lkv]
+
+            # Apply RoPE to q_pe
             q_pe = _apply_rope_gptj(q_pe, positions, self.cfg.rope_theta, self.cfg.rope_scaling)
-            all_positions = torch.arange(max_seq_len, device=hidden_states.device, dtype=torch.long)
-            k_pe_rope = _apply_rope_gptj(raw_k_pe_buf, all_positions, self.cfg.rope_theta, self.cfg.rope_scaling)
-            k_pe_rope = k_pe_rope.expand(-1, -1, self.local_heads, -1)
+            # q_pe: [1, 1, H, R] → [1, H, R]
+            q_pe_2d = q_pe.squeeze(1)  # [1, H, R]
 
-            # Build 3D tensors for flash_attn (full buffer, fixed shape)
-            q_fa = torch.cat([q_nope, q_pe], dim=-1).reshape(seqlen, self.local_heads, -1)
-            k_fa = torch.cat([k_nope_buf[0], k_pe_rope[0]], dim=-1)  # [max_seq_len, H, qk_head_dim]
-            # Pad V to match K headdim: [max_seq_len, H, v_head_dim] -> [max_seq_len, H, qk_head_dim]
-            v_fa = F.pad(v_buf[0], [0, self.cfg.qk_head_dim - self.cfg.v_head_dim])
-            cu_q = torch.tensor([0, seqlen], dtype=torch.int32, device=q_fa.device)
-            cu_k = torch.tensor([0, kv_len], dtype=torch.int32, device=q_fa.device)
-            out = flash_attn_varlen_func(
-                q_fa, k_fa, v_fa,
-                cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
-                max_seqlen_q=seqlen, max_seqlen_k=kv_len,
-                causal=False, softmax_scale=self.scaling,
-            )
-            # Unpad V output: discard padding dimensions
-            out = out[:, :, :self.cfg.v_head_dim].reshape(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
+            # Concatenate: [1, H, Lkv+R] = [1, H, 576]
+            q_mla = torch.cat([q_nope_latent, q_pe_2d], dim=-1)
 
-        new_cache = (k_nope_buf, v_buf, raw_k_pe_buf, kv_len)
+            # Triton MLA kernel
+            # q_mla: [1, H, Lkv+R=576], kv_cache: [1, max_seq_len, 1, Lkv+R=576]
+            # Scaling: vLLM uses 1/sqrt(qk_head_dim) = 1/sqrt(192), NOT 1/sqrt(576)
+            out_latent = triton_mla_decode(
+                q=q_mla,
+                kv_cache=kv_cache_buf,
+                kv_len=kv_len,
+                num_kv_splits=8,
+                sm_scale=self.scaling,
+                lv=self.cfg.kv_lora_rank,
+            )  # [1, H, Lkv=512]
+
+            # Expand output from latent space via W_UV (vLLM _v_up_proj approach)
+            # out_latent: [1, H, Lkv] → [H, 1, Lkv] for bmm
+            out_latent_t = out_latent.transpose(0, 1)  # [H, 1, Lkv]
+            # bmm: [H, 1, Lkv] @ [H, Lkv, V] → [H, 1, V]
+            out = torch.bmm(out_latent_t, self.W_UV)  # [H, 1, V]
+            # Reshape to [1, 1, H*V]
+            out = out.transpose(0, 1).reshape(bsz, seqlen, self.local_heads * self.cfg.v_head_dim)
+
+        new_cache = (kv_cache_buf, kv_len)
         return self.o_proj(out), new_cache
 
 
@@ -385,9 +495,10 @@ class DeepseekDecoderLayerTP(nn.Module):
         positions: torch.Tensor,
         past_key_values: tuple | None = None,
         max_seq_len: int = 512,
+        layer_idx: int = -1,
     ) -> tuple[torch.Tensor, tuple]:
         h = self.input_layernorm(hidden_states)
-        h, new_cache = self.self_attn(h, positions, past_key_values, max_seq_len=max_seq_len)
+        h, new_cache = self.self_attn(h, positions, past_key_values, max_seq_len=max_seq_len, layer_idx=layer_idx)
         hidden_states = hidden_states + h
         h2 = self.post_attention_layernorm(hidden_states)
         h2 = self.mlp(h2)
@@ -603,7 +714,7 @@ class DeepseekForCausalLMTP(nn.Module):
         new_past_key_values = []
         for i, layer in enumerate(self.layers):
             layer_cache = past_key_values[i] if past_key_values is not None else None
-            hidden_states, new_cache = layer(hidden_states, pos, layer_cache, max_seq_len=max_seq_len)
+            hidden_states, new_cache = layer(hidden_states, pos, layer_cache, max_seq_len=max_seq_len, layer_idx=i)
             new_past_key_values.append(new_cache)
 
         hidden_states = self.norm(hidden_states)
@@ -739,9 +850,16 @@ class DeepseekTPModelRunner:
         self.model = DeepseekForCausalLMTP(self.cfg, device=device, dtype=dtype)
         self.model.load_weights()
         self.model.eval()
-        # P2: compile attention and dense MLP modules for kernel fusion
+        # Initialize MLA weights (W_UK_T, W_UV) from kv_b_proj after loading
         for layer in self.model.layers:
-            layer.self_attn = torch.compile(layer.self_attn)
+            layer.self_attn._init_mla_weights()
+        # Pre-allocate attention buffers before torch.compile (avoids stale references)
+        self._buf_max_seq_len = 512  # default; will be extended if needed
+        for layer in self.model.layers:
+            layer.self_attn.init_buffers(self._buf_max_seq_len, device, dtype)
+        # P2: compile dense MLP modules for kernel fusion
+        # Note: attention is NOT compiled because it calls Triton MLA kernel
+        for layer in self.model.layers:
             if not isinstance(layer.mlp, DeepseekMoETP):
                 layer.mlp = torch.compile(layer.mlp)
 

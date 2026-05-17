@@ -573,6 +573,159 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 - DeepSeek-V2-Lite 的 QK headdim=192 < 256，可用 FA2，但 K/V headdim 不同（192 vs 128）需 V-padding
 - vLLM 参考: `cu_seqlens_k` 标记有效边界，值变化但 shape 固定 `[2]`，不触发 torch.compile 重编译
 
+### P3-Triton: Triton MLA Decode Kernel
+
+**目标**: 用 Triton MLA kernel 替换 FA2 V-padding 方案，消除零填充浪费，利用 MLA 的 V=trans(K) 优化。
+
+**实现方式**: 从 vLLM 复制并简化 Triton MLA decode kernel，使用统一 KV cache 存储 [c_kv | k_pe_rope]。
+
+**具体改动**:
+
+1. **新文件** `engine/kernels/triton_mla_decode.py`:
+   - 从 vLLM `vllm/v1/attention/ops/triton_decode_attention.py` 复制并简化
+   - 只保留 `_fwd_grouped_kernel_stage1` + `_fwd_kernel_stage2` + Python wrapper
+   - 去掉 FP8、logit_cap、paged block_table，改用 contiguous buffer 索引
+   - MLA 路径: `v = tl.trans(k)` 复用 K 作为 V，无额外显存加载
+
+2. **修改** `engine/models/deepseek_v2.py`:
+   - `__init__`: 新增 W_UK_T、W_UV 权重（从 kv_b_proj 提取，无额外显存）
+   - `init_buffers()`: 预分配统一 KV cache `[B, max_seq_len, 1, kv_lora_rank + rope_dim]`
+   - `_init_mla_weights()`: 从 kv_b_proj_with_mqa.weight 提取 W_UK_T 和 W_UV
+   - Prefill: 仍用 FA2 + V-padding，同时写入统一 KV cache（k_pe 存储 RoPE 后的值）
+   - Decode: 改用 Triton MLA 路径（q_nope @ W_UK_T 投影 + Triton kernel + out @ W_UV 扩展）
+   - 去掉 attention 的 torch.compile（Triton kernel 无法被 compile 追踪）
+
+3. **修改** `engine/models/deepseek_v2.py` DeepseekTPModelRunner:
+   - `__init__`: 加载权重后调用 `_init_mla_weights()`，编译前调用 `init_buffers()`
+   - 只 compile MLP，不 compile attention
+
+**关键问题与修复**:
+
+| 问题 | 症状 | 根因 | 修复 |
+|------|------|------|------|
+| 多步 decode 退化 | 生成 "怎样的\n\n\n" 而非正确输出 | k_pe 存入 cache 时未应用 RoPE，导致 QK 计算中 q_pe_rope @ k_pe_raw^T 错误 | 存入 cache 前对 k_pe 应用 `_apply_rope_gptj()` |
+| Scaling factor | 怀疑 1/sqrt(576) vs 1/sqrt(192) | vLLM 使用 1/sqrt(qk_head_dim)=1/sqrt(192) | 保持 `self.scaling = qk_head_dim**-0.5` |
+| torch.compile 冲突 | RuntimeError: Triton kernel 无法被追踪 | torch.compile 尝试追踪 Triton kernel | 移除 attention 的 compile，只 compile MLP |
+
+**根因分析 (k_pe RoPE)**:
+
+vLLM 的 MLA 实现中，k_pe 在存入 KV cache **之前**就应用了 RoPE:
+```python
+new_k_pe = RoPE(h_t @ W_KR)  # vLLM mla_attention.py line 72
+```
+
+我们的代码之前存储 raw k_pe，但 Triton kernel 计算 QK 时 q_pe 已经应用了 RoPE。这导致:
+```
+QK = q_nope_proj @ c_kv^T + q_pe_rope @ k_pe_raw^T  ← 错误!
+```
+应该是:
+```
+QK = q_nope_proj @ c_kv^T + q_pe_rope @ k_pe_rope^T  ← 正确
+```
+
+**性能验证** (DeepSeek-V2-Lite, TP=4, GPU 0-3, ROUNDS=5, STEPS=8):
+
+| 版本 | 吞吐 (tok/s) | 变化 |
+|------|-------------|------|
+| P2 基线 (SDPA) | 12.75 | 基准 |
+| P3-Triton (MLA kernel) | 13.08 | **+2.6%** |
+
+**正确性验证**: 输出 `'怎样的？\n\n苏州园林的特点是怎样的？\n\n苏州园林是中国传统'` — 与预期完全匹配。
+
+**KV cache 显存节省**:
+- 旧格式: 3 个 buffer (k_nope 128 + v 128 + k_pe 64) × H=4 × 2 bytes = 2560 bytes/token/layer
+- 新格式: 1 个 buffer (c_kv 512 + k_pe_rope 64) × 1 head × 2 bytes = 1152 bytes/token/layer
+- **节省 55% KV cache 显存**
+
+#### P3-FA 问题分析与修复方案
+
+**Profiling 数据** (torch.profiler + CUDA events, DeepSeek-V2-Lite, 28 层平均):
+
+| 指标 | P2 (SDPA) | P3-FA (当前) | 差异 |
+|------|-----------|-------------|------|
+| Attention GPU kernel (单层) | 10.1 us (cutlass) | 8.3 us (flash_fwd) | **-18%** |
+| Total CPU op time | 68.89 ms | 74.33 ms | **+5.44 ms** |
+| module._call_impl | 8147 ms | 8414 ms | +266 ms |
+| dynamo.eval_frame | 680 ms | 773 ms | +92 ms |
+
+**结论**: FA2 GPU kernel 快 18%，但 Python 侧新增操作产生 +5.44ms CPU 开销，抵消 GPU 收益导致整体回退。
+
+**问题 1: Qwen decode 切片导致 torch.compile 动态 shape 重编译**
+
+位置: `engine/models/qwen.py:200-202`
+
+```python
+k_fa = k_buf[0, :kv_len]   # kv_len 每步+1 → 动态 shape → torch.compile 重编译
+v_fa = v_buf[0, :kv_len]   # 同上
+```
+
+修复: 去掉 `[:kv_len]` 切片，改用 full buffer + `cu_seqlens_k` 标记有效边界。FA2 内部用 `cu_seqlens_k=[0, kv_len]` 精确跳过 padding 位置，输出与切片方案完全一致（已验证 diff=0.000000）。
+
+```python
+k_fa = k_buf[0]    # [max_seq_len, H, D] — 固定 shape
+v_fa = v_buf[0]    # [max_seq_len, H, D] — 固定 shape
+# max_seqlen_k=max_seq_len（固定值，不随 kv_len 变化）
+```
+
+**问题 2: DeepSeek decode 每步分配新张量导致 CPU 开销**
+
+位置: `engine/models/deepseek_v2.py:306-316`
+
+```python
+torch.arange(max_seq_len, ...)          # 每步分配
+torch.cat([q_nope, q_pe], dim=-1)       # 每步分配
+torch.cat([k_nope_buf[0], ...])         # 每步分配
+F.pad(v_buf[0], [0, qk_head_dim - v_head_dim])  # 每步分配
+torch.tensor([0, seqlen], ...)          # 每步分配
+torch.tensor([0, kv_len], ...)          # 每步分配
+```
+
+6 处分配 × 600 次 decode 调用 = 大量 CPU 开销。
+
+修复: 在 `__init__` 中预分配缓冲区，forward 中复用：
+- `_v_pad_buf`: V-padding 缓冲区 `[max_seq_len, H, qk_head_dim]`
+- `_k_cat_buf`: K 拼接缓冲区 `[max_seq_len, H, qk_head_dim]`
+- `_cu_q_buf` / `_cu_k_buf`: cu_seqlens 缓冲区 `[2]` int32
+- `_arange_buf`: 位置索引 `[max_seq_len]` int64
+
+**问题 3: Contiguous 检查是否多余？**
+
+FA2 wrapper 内部调用 `maybe_contiguous`（检查 stride 后决定是否 `.contiguous()`）。在自研框架中 tensor 已经 contiguous，检查多余但开销仅 ~0.01us，**不是瓶颈，不需要优化**。
+
+**问题 4: FA2 最大 head dim 限制**
+
+| 模型 | QK headdim | V headdim | FA2 兼容 |
+|------|-----------|----------|---------|
+| Qwen3-8B | 128 | 128 | ✅ Q/K/V 相同 |
+| DeepSeek-V2-Lite | 192 | 128 | ✅ V-padding 方案 |
+| DeepSeek-V2 全量/V3 | 576 | 128 | ❌ 超出 256 限制 |
+
+**问题 5: vllm 在 A800 上的 MLA 策略**
+
+vllm 在 A800 (SM80) 上对 DeepSeek-V2 使用：
+- Prefill: FA2 + V-padding（与我们方案相同）
+- Decode: Triton MLA kernel（专为 decode 优化，不走 FA2）
+
+我们的 decode 仍用 FA2，可考虑后续替换为自定义 Triton kernel。
+
+**vllm FA2 kernel 耗时基准** (单层, CUDA events):
+
+| 场景 | vllm FA2 | 你的 FA2 (平均) |
+|------|----------|----------------|
+| Prefill seqlen=512 | 37.4 us | 8.3 us |
+| Decode Q=1, KV=512 | 34.6 us | - |
+| Prefill seqlen=2048 | 124.0 us | - |
+| Decode Q=1, KV=2048 | 119.7 us | - |
+
+**FA2 vs SDPA 耗时对比** (单层, CUDA events):
+
+| 场景 | FA2 | SDPA | 加速比 |
+|------|-----|------|--------|
+| Prefill seqlen=512 | 37.4 us | 36.2 us | 0.97x |
+| Decode Q=1, KV=512 | 34.6 us | 183.0 us | **5.3x** |
+
+FA2 在 decode 场景（Q=1 token）比 SDPA 快 5.3 倍，因为 `cu_seqlens_k` 精确跳过 padding，而 SDPA 用 `attn_mask` 对全量 `max_seq_len` 做 softmax。
+
 ---
 
 ## 4. 优化进展总结

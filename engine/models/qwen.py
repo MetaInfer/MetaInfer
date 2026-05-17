@@ -146,6 +146,10 @@ class QwenAttentionTP(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
 
+        # Pre-allocated cu_seqlens buffers (avoid per-step torch.tensor allocation)
+        self.register_buffer("_cu_q", torch.tensor([0, 0], dtype=torch.int32), persistent=False)
+        self.register_buffer("_cu_k", torch.tensor([0, 0], dtype=torch.int32), persistent=False)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -181,30 +185,30 @@ class QwenAttentionTP(nn.Module):
             q_fa = q.reshape(seqlen, self.num_heads, self.head_dim)
             k_fa = k_buf[0, :kv_len]
             v_fa = v_buf[0, :kv_len]
-            cu = torch.tensor([0, seqlen], dtype=torch.int32, device=q.device)
+            self._cu_q[1] = seqlen
             out = flash_attn_varlen_func(
                 q_fa, k_fa, v_fa,
-                cu_seqlens_q=cu, cu_seqlens_k=cu,
+                cu_seqlens_q=self._cu_q, cu_seqlens_k=self._cu_q,
                 max_seqlen_q=seqlen, max_seqlen_k=kv_len,
                 causal=True, softmax_scale=self.scaling,
             )
             out = out.reshape(bsz, seqlen, self.q_size)
         else:
-            # Decode: append new KV, then use flash-attn on valid portion only
+            # Decode: append new KV, then use flash-attn on full buffer (fixed shape for torch.compile)
             k_buf, v_buf, kv_len = past_key_values
             k_buf[:, kv_len:kv_len + seqlen] = k
             v_buf[:, kv_len:kv_len + seqlen] = v
             kv_len = kv_len + seqlen
 
-            # flash-attn: 只传有效 KV 部分，无需 attn_mask
+            # flash-attn: full buffer + cu_seqlens_k marks valid boundary (no dynamic slice)
             q_fa = q.reshape(seqlen, self.num_heads, self.head_dim)
-            k_fa = k_buf[0, :kv_len]
-            v_fa = v_buf[0, :kv_len]
-            cu_q = torch.tensor([0, seqlen], dtype=torch.int32, device=q.device)
-            cu_k = torch.tensor([0, kv_len], dtype=torch.int32, device=q.device)
+            k_fa = k_buf[0]  # [max_seq_len, H, D] — fixed shape
+            v_fa = v_buf[0]  # [max_seq_len, H, D] — fixed shape
+            self._cu_q[1] = seqlen
+            self._cu_k[1] = kv_len
             out = flash_attn_varlen_func(
                 q_fa, k_fa, v_fa,
-                cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                cu_seqlens_q=self._cu_q, cu_seqlens_k=self._cu_k,
                 max_seqlen_q=seqlen, max_seqlen_k=kv_len,
                 causal=False, softmax_scale=self.scaling,
             )
