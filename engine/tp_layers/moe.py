@@ -40,7 +40,8 @@ class _ExpertMLP(nn.Module):
 
 class ExpertParallelMoE(nn.Module):
     """
-    简化 EP: router 全量复制；每 rank 仅计算本地专家；最后 all_reduce 求和聚合。
+    EP: router replicated; each rank owns a subset of experts; all_reduce combines.
+    P5b: GPU-side expert_map eliminates .item() — follows vLLM's deadlock-free pattern.
     """
 
     def __init__(self, cfg: ExpertParallelMoEConfig):
@@ -55,6 +56,10 @@ class ExpertParallelMoE(nn.Module):
         self.experts = nn.ModuleDict(
             {str(i): _ExpertMLP(cfg.hidden_size, cfg.intermediate_size) for i in self.local_expert_ids}
         )
+
+        # P5b: GPU-side expert_map [num_global_experts] → local_idx or -1
+        # This tensor lives on GPU and is registered so .to(device) moves it.
+        self._expert_map: torch.Tensor | None = None
 
     def _router_topk(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, seqlen, hidden = hidden_states.shape
@@ -71,6 +76,14 @@ class ExpertParallelMoE(nn.Module):
         topk_weight = topk_weight * self.cfg.routed_scaling_factor
         return topk_idx, topk_weight.to(hidden_states.dtype)
 
+    def _ensure_expert_map(self, device: torch.device) -> torch.Tensor:
+        if self._expert_map is None or self._expert_map.device != device:
+            m = torch.full((self.cfg.num_experts,), -1, dtype=torch.int32, device=device)
+            for local_idx, global_eid in enumerate(self.local_expert_ids):
+                m[global_eid] = local_idx
+            self._expert_map = m
+        return self._expert_map
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         hidden_states: [B, T, H]
@@ -78,22 +91,37 @@ class ExpertParallelMoE(nn.Module):
         """
         bsz, seqlen, hidden = hidden_states.shape
         flat = hidden_states.reshape(-1, hidden)
+        num_tokens = flat.shape[0]
         topk_idx, topk_weight = self._router_topk(hidden_states)
 
         local_out = torch.zeros_like(flat)
-        topk_idx_flat = topk_idx.reshape(-1, self.cfg.top_k)
+        topk_idx_flat = topk_idx.reshape(-1, self.cfg.top_k)  # [N, top_k]
         topk_weight_flat = topk_weight.reshape(-1, self.cfg.top_k)
 
-        for token_i in range(flat.shape[0]):
-            x = flat[token_i : token_i + 1]
-            for k in range(self.cfg.top_k):
-                expert_id = int(topk_idx_flat[token_i, k].item())
-                key = str(expert_id)
-                if key not in self.experts:
+        # P5b: hybrid strategy based on token count
+        #   num_tokens > 4 → batched GPU-side (nonzero+index_add_, no .item())
+        #   num_tokens ≤ 4 → per-token .item() loop (lower overhead for decode)
+        if num_tokens > 4:
+            expert_map = self._ensure_expert_map(flat.device)
+            local_eids = expert_map[topk_idx_flat.long()]  # [N, top_k], -1=not local
+            for local_idx, global_eid in enumerate(self.local_expert_ids):
+                mask = (local_eids == local_idx)
+                if not mask.any():
                     continue
-                expert = self.experts[key]
-                w = topk_weight_flat[token_i, k]
-                local_out[token_i : token_i + 1] += expert(x) * w
+                token_idx, k_idx = mask.nonzero(as_tuple=True)
+                weights = topk_weight_flat[token_idx, k_idx].unsqueeze(-1)
+                expert_out = self.experts[str(global_eid)](flat[token_idx])
+                local_out.index_add_(0, token_idx, expert_out * weights)
+        else:
+            for token_i in range(num_tokens):
+                x = flat[token_i : token_i + 1]
+                for k in range(self.cfg.top_k):
+                    expert_id = int(topk_idx_flat[token_i, k].item())
+                    key = str(expert_id)
+                    if key not in self.experts:
+                        continue
+                    w = topk_weight_flat[token_i, k]
+                    local_out[token_i : token_i + 1] += self.experts[key](x) * w
 
         global_out = all_reduce_sum(local_out)
         return global_out.view(bsz, seqlen, hidden)

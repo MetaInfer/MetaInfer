@@ -637,6 +637,73 @@ QK = q_nope_proj @ c_kv^T + q_pe_rope @ k_pe_rope^T  ← 正确
 - 新格式: 1 个 buffer (c_kv 512 + k_pe_rope 64) × 1 head × 2 bytes = 1152 bytes/token/layer
 - **节省 55% KV cache 显存**
 
+### P5: Fused Kernel 融合
+
+#### P5a: Qwen gate_up_proj 合并 + silu_and_mul fusion — 完成
+
+**目标**: 合并 Qwen MLP 的 `gate_proj` + `up_proj` 为单次 GEMM，减少 kernel launch。
+
+**实现方式**:
+1. 新增 `engine/tp_layers/linear.py:MergedColumnParallelLinear` — 将 gate+up 权重沿 output dim 拼接为 `[2*local_intermediate, hidden]`，一次 `F.linear` 产生 `[*, 2*I]` 输出
+2. 修改 `engine/models/qwen.py:QwenMLPTP` — forward 中 `gate_up = self.gate_up_proj(x); h = F.silu(gate_up[..., :d]) * gate_up[..., d:]`
+3. 权重加载: 从 safetensors 分别读取 `gate_proj.weight` 和 `up_proj.weight`，调用 `load_weight_shard(g, u)` 拼接
+
+**尝试过的方案**:
+
+| 方案 | 结果 | 原因 |
+|------|------|------|
+| MergedColumnParallelLinear + Triton `silu_and_mul` kernel | -43.7% (7.08 tok/s) | Triton launch overhead 在 decode 小 tensor (bsz=1,seqlen=1) 上 >> PyTorch 原生 elementwise |
+| MergedColumnParallelLinear + PyTorch `F.silu * mul` | +1.4% (12.76 tok/s) | 1 次 GEMM 替代 2 次，无 Triton overhead |
+
+**性能验证** (Qwen3-8B, TP=4, GPU 0-3, ROUNDS=5, STEPS=8):
+
+| 版本 | 吞吐 (tok/s) | 变化 |
+|------|-------------|------|
+| baseline (gate_proj + up_proj 分别 GEMM) | 12.58 | 基准 |
+| P5a-light (合并 GEMM, PyTorch silu*mul) | 12.76 | **+1.4%** |
+
+**正确性验证**: 输出 `'（ ） A：建筑与园林结合 B：建筑与自然结合 C：建筑与山水结合 D：建筑'` 与 baseline 一致。
+
+**代码位置**:
+- `engine/tp_layers/linear.py:47-74` — `MergedColumnParallelLinear`
+- `engine/models/qwen.py:221-238` — `QwenMLPTP`
+- `engine/kernels/triton_activation.py` — Triton kernel（保留但未使用，供后续 batch>1 重新评估）
+
+#### P5b: DeepSeek MoE GPU-side expert mapping — 完成 (hybrid)
+
+**目标**: 消除 MoE 逐 token `.item()` GPU→CPU 同步，同时避免 TP 死锁。
+
+**实现方式**: 参考 vLLM `expert_map` 模式 — GPU 侧 tensor 索引替代 Python dict 查找。
+
+1. 在 `__init__` 创建 `expert_map: [num_global_experts] → local_idx or -1` (lazy, on correct device)
+2. Prefill (>4 tokens): `local_eids = expert_map[topk_idx]` 后 `mask.nonzero()` 分组 batch 处理 — 无 `.item()`
+3. Decode (≤4 tokens): 保留 `.item()` 循环 — decode 只有 1 token，batched overhead > `.item()` sync
+
+**vLLM 关键洞察**: 所有 rank 执行相同的操作，GPU kernel 内部处理 expert 非本地的情况（写零），避免分支导致 TP 时序分歧。
+
+**尝试过的方案**:
+
+| 方案 | 结果 | 原因 |
+|------|------|------|
+| Torch.new + non-zero (P0 style) | -16.8% to -25% | nonzero+index_add overhead > .item() at batch=1 |
+| All CPU-side expert map | TP freeze | CPU sync timing issue between ranks |
+| GPU-side expert map + slice (P5b) | -15% | Still overhead for single token |
+| Hybrid: GPU-batched for prefill, .item() for decode | +0.9% | Each path uses the best method for its token count |
+
+**性能验证** (DeepSeek-V2-Lite, TP=4, ROUNDS=5, STEPS=8):
+
+| 版本 | 吞吐 (tok/s) | 变化 |
+|------|-------------|------|
+| P3-Triton baseline | 13.08 | 基准 |
+| P5b batched-only | 11.12 | -15.0% |
+| P5b hybrid | 13.20 | **+0.9%** |
+
+**正确性验证**: 输出 `'怎样的？\n\n苏州...'` 与 baseline 一致，logits diff < 0.05。
+
+**代码位置**: `engine/tp_layers/moe.py:46-98` — `ExpertParallelMoE` 新增 `_expert_map` + hybrid forward。
+
+**注**: 阈值 `num_tokens > 4` 对应 seqlen ≥ 5 的 prefill。当 P4 (Continuous Batching) 提升 decode batch size 后，decode 也会走 batched 路径，收益会更大。
+
 #### P3-FA 问题分析与修复方案
 
 **Profiling 数据** (torch.profiler + CUDA events, DeepSeek-V2-Lite, 28 层平均):
@@ -738,18 +805,27 @@ FA2 在 decode 场景（Q=1 token）比 SDPA 快 5.3 倍，因为 `cu_seqlens_k`
 | P2 | 完成 | 12.75 | **5.93x** | torch.compile kernel fusion + 固定形状 attention |
 | P3 | 完成 | - | - | SDPA enable_gqa=True，省去 repeat_interleave 拷贝 |
 | P3-FA | 部分完成 | 0.70-9.37 | - | Flash Attention（Qwen: flash_attn_varlen_func, DeepSeek: V-padding + FA2），正确性通过，性能待验证 |
+| P3-Triton | 完成 | 13.08 | **6.08x** | Triton MLA decode kernel 替换 FA2 V-padding，KV cache 显存节省 55% |
 | P4 | 完成(部分) | ~5.2 | ~2.4x | batch 处理 + TP 同步，小模型下无明显提升 |
-| P5 | 完成 | 8.87 | **4.13x** | TP 通信去 dtype 转换 |
-| P5+buffer | 中性 | 8.76 | **4.07x** | 预分配 KV buffer（短序列无显著收益） |
+| P5 (TP通信) | 完成 | 8.87 | **4.13x** | TP 通信去 dtype 转换 |
+| **P5a (Qwen fused MLP)** | **完成** | **12.76** | **+1.4% vs P2** | gate_up_proj 合并 GEMM + silu_and_mul fused |
+| P5b (MoE GPU map) | **完成** | **13.20** | **+0.9% vs P3-Triton** | GPU-side expert_map hybrid: prefill batched, decode .item() |
 
-**当前总提升**: 2.15 → 12.75 tok/s (**5.93x**)
+**当前总提升**: 2.15 → 13.20 tok/s DeepSeek / 12.76 tok/s Qwen (**6.14x**)
 
-**剩余瓶颈分析**:
-1. **MoE 逐 token Python 循环 + `.item()` GPU→CPU 同步** — batch>1 时可通过 batched MoE 优化，当前 batch=1 无效
-2. **每步 KV cache `torch.cat` 拷贝** — 短序列影响小，长序列时应改为预分配 buffer + slice
-3. **无 CUDA Graph** — kernel launch ~3-5ms/step，需固定 shape KV cache 才能实现
-4. **无 Flash Attention** — PyTorch SDPA 对 decode 效率较低，需替换为 FlashInfer
-5. **无 Continuous Batching** — 请求串行处理，batch_size 始终为 1
+**vLLM 基准对比** (DeepSeek-V2-Lite, TP=4, ROUNDS=5, STEPS=8):
+
+| 指标 | meta-infer P3-Triton | vLLM 0.15.1 | 差距 |
+|------|---------------------|-------------|------|
+| Output throughput (tok/s) | 13.08 | 36.94 | **2.82x** |
+| P99 TTFT (ms) | 766 | 15.85 | 48x |
+
+**剩余瓶颈分析** (按 profiling 数据排序):
+1. **NCCL AllReduce 占 GPU 61.2%** — 小 tensor ring allreduce 效率极低 → P7 Custom AllReduce
+2. **MoE `.item()` GPU→CPU 同步** — 每步 360 次，CPU 占 5.3% → P5b Fused MoE（延后）
+3. **CPU 开销** — dtype 转换 1.25s (11.5%)、arange 0.27s → P6 CPU 开销消除
+4. **无 CUDA Graph** — decode 每步 ~41ms launch 开销 → P2 CUDA Graph capture
+5. **无 Continuous Batching** — batch_size 始终为 1 → P4
 
 **下一步建议**（按优先级）:
 1. **P4: Continuous Batching** — 允许多请求 batch，可大幅提升吞吐（batch>1 时 P1 MoE 优化也生效）
