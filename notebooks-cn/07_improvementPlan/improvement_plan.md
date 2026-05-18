@@ -830,6 +830,7 @@ FA2 在 decode 场景（Q=1 token）比 SDPA 快 5.3 倍，因为 `cu_seqlens_k`
 | **P5a (Qwen fused MLP)** | **完成** | **12.76** | **+1.4% vs P2** | gate_up_proj 合并 GEMM + silu_and_mul fused |
 | P5b (MoE GPU map) | **完成** | **13.20** | **+0.9% vs P3-Triton** | GPU-side expert_map hybrid: prefill batched, decode .item() |
 | **P6 (CPU 开销消除)** | **完成** | **13.42** | **+1.7% vs P5b** | 预分配 position 索引 buffer，消除 per-step torch.arange |
+| **P2 (CUDA Graph)** | **阻塞** | — | — | MoE `.item()` + Triton 动态分配导致 `cudaErrorStreamCaptureUnsupported`，需 P5b 完整 Fused MoE 和 Triton buffer 预分配后才能做 |
 
 **当前总提升**: 2.15 → 13.42 tok/s DeepSeek / 13.03 tok/s Qwen (**6.24x**)
 
