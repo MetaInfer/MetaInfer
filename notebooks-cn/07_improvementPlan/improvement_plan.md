@@ -704,6 +704,25 @@ QK = q_nope_proj @ c_kv^T + q_pe_rope @ k_pe_rope^T  ← 正确
 
 **注**: 阈值 `num_tokens > 4` 对应 seqlen ≥ 5 的 prefill。当 P4 (Continuous Batching) 提升 decode batch size 后，decode 也会走 batched 路径，收益会更大。
 
+### P6: CPU 开销消除 — 完成
+
+**改动**: 预分配 position 索引 buffer，消除 per-step `torch.arange` 分配。
+
+**实现**:
+1. `DeepseekForCausalLMTP.__init__` 和 `QwenForCausalLMTP.__init__`: `register_buffer("_pos_buf", torch.arange(0, 4096))`
+2. forward 中 `torch.arange(position_offset, ...)` → `self._pos_buf[position_offset:position_offset+seq_len]` (zero-copy view)
+
+**未实施**: `repeat_interleave`→`expand` (GPT-J RoPE 特殊 layout 导致 shape 错误，且收益极小 ~36μs/call)
+
+**性能验证** (TP=4, ROUNDS=5, STEPS=8):
+
+| 模型 | P5 (before) | P6 (after) | 变化 |
+|------|-----------|-----------|------|
+| DeepSeek-V2-Lite | 13.20 | 13.42 | **+1.7%** |
+| Qwen3-8B | 12.76 | 13.03 | **+2.1%** |
+
+**正确性**: 两个模型输出与 P5 一致。
+
 #### P3-FA 问题分析与修复方案
 
 **Profiling 数据** (torch.profiler + CUDA events, DeepSeek-V2-Lite, 28 层平均):
@@ -810,8 +829,9 @@ FA2 在 decode 场景（Q=1 token）比 SDPA 快 5.3 倍，因为 `cu_seqlens_k`
 | P5 (TP通信) | 完成 | 8.87 | **4.13x** | TP 通信去 dtype 转换 |
 | **P5a (Qwen fused MLP)** | **完成** | **12.76** | **+1.4% vs P2** | gate_up_proj 合并 GEMM + silu_and_mul fused |
 | P5b (MoE GPU map) | **完成** | **13.20** | **+0.9% vs P3-Triton** | GPU-side expert_map hybrid: prefill batched, decode .item() |
+| **P6 (CPU 开销消除)** | **完成** | **13.42** | **+1.7% vs P5b** | 预分配 position 索引 buffer，消除 per-step torch.arange |
 
-**当前总提升**: 2.15 → 13.20 tok/s DeepSeek / 12.76 tok/s Qwen (**6.14x**)
+**当前总提升**: 2.15 → 13.42 tok/s DeepSeek / 13.03 tok/s Qwen (**6.24x**)
 
 **vLLM 基准对比** (DeepSeek-V2-Lite, TP=4, ROUNDS=5, STEPS=8):
 

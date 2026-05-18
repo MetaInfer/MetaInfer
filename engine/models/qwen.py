@@ -272,6 +272,8 @@ class QwenForCausalLMTP(nn.Module):
         self.layers = nn.ModuleList([QwenDecoderLayerTP(cfg) for _ in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head = ParallelLMHead(cfg.hidden_size, cfg.vocab_size, gather_output=True)
+        # P6: pre-allocated position index buffer, sliced in forward
+        self.register_buffer("_pos_buf", torch.arange(0, 4096, device=device, dtype=torch.long), persistent=False)
         self.to(device=device, dtype=dtype)
 
     @torch.inference_mode()
@@ -294,7 +296,8 @@ class QwenForCausalLMTP(nn.Module):
         rank = get_tp_rank()
         hidden_states = self.embed_tokens(input_ids)
         seq_len = input_ids.shape[1]
-        pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
+        # P6: slice pre-allocated buffer instead of torch.arange
+        pos = self._pos_buf[position_offset : position_offset + seq_len]
 
         new_past_key_values = []
         for i, layer in enumerate(self.layers):
