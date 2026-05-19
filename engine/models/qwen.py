@@ -194,25 +194,26 @@ class QwenAttentionTP(nn.Module):
             )
             out = out.reshape(bsz, seqlen, self.q_size)
         else:
-            # Decode: append new KV, then use flash-attn on full buffer (fixed shape for torch.compile)
+            # Decode: write KV, slice to valid length → SDPA auto-dispatch
             k_buf, v_buf, kv_len = past_key_values
             k_buf[:, kv_len:kv_len + seqlen] = k
             v_buf[:, kv_len:kv_len + seqlen] = v
             kv_len = kv_len + seqlen
 
-            # flash-attn: full buffer + cu_seqlens_k marks valid boundary (no dynamic slice)
-            q_fa = q.reshape(seqlen, self.num_heads, self.head_dim)
-            k_fa = k_buf[0]  # [max_seq_len, H, D] — fixed shape
-            v_fa = v_buf[0]  # [max_seq_len, H, D] — fixed shape
-            self._cu_q[1] = seqlen
-            self._cu_k[1] = kv_len
-            out = flash_attn_varlen_func(
-                q_fa, k_fa, v_fa,
-                cu_seqlens_q=self._cu_q, cu_seqlens_k=self._cu_k,
-                max_seqlen_q=seqlen, max_seqlen_k=kv_len,
-                causal=False, softmax_scale=self.scaling,
+            k_valid = k_buf[:, :kv_len]
+            v_valid = v_buf[:, :kv_len]
+            if self.num_kv_heads != self.num_heads:
+                r = self.num_heads // self.num_kv_heads
+                k_valid = k_valid.repeat_interleave(r, dim=2)
+                v_valid = v_valid.repeat_interleave(r, dim=2)
+            q_sdpa = q.permute(0, 2, 1, 3)
+            k_sdpa = k_valid.permute(0, 2, 1, 3)
+            v_sdpa = v_valid.permute(0, 2, 1, 3)
+            out = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                is_causal=False, scale=self.scaling,
             )
-            out = out.reshape(bsz, seqlen, self.q_size)
+            out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.q_size)
 
         new_cache = (k_buf, v_buf, kv_len)
         return self.o_proj(out), new_cache
@@ -224,17 +225,14 @@ class QwenMLPTP(nn.Module):
         self.tp = get_tp_size()
         ensure_divisible(cfg.intermediate_size, self.tp, name="intermediate_size")
         self.local_intermediate = cfg.intermediate_size // self.tp
-        # P5a: merge gate+up into single GEMM, silu_and_mul fused
-        from engine.tp_layers.linear import MergedColumnParallelLinear
-        self.gate_up_proj = MergedColumnParallelLinear(
-            cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False
-        )
+        self.gate_proj = ColumnParallelLinear(cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False)
+        self.up_proj = ColumnParallelLinear(cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False)
         self.down_proj = RowParallelLinear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up_proj(x)
-        d = gate_up.shape[-1] // 2
-        h = F.silu(gate_up[..., :d]) * gate_up[..., d:]
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        h = F.silu(gate) * up
         return self.down_proj(h)
 
 
@@ -272,8 +270,6 @@ class QwenForCausalLMTP(nn.Module):
         self.layers = nn.ModuleList([QwenDecoderLayerTP(cfg) for _ in range(cfg.num_hidden_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head = ParallelLMHead(cfg.hidden_size, cfg.vocab_size, gather_output=True)
-        # P6: pre-allocated position index buffer, sliced in forward
-        self.register_buffer("_pos_buf", torch.arange(0, 4096, device=device, dtype=torch.long), persistent=False)
         self.to(device=device, dtype=dtype)
 
     @torch.inference_mode()
@@ -296,8 +292,7 @@ class QwenForCausalLMTP(nn.Module):
         rank = get_tp_rank()
         hidden_states = self.embed_tokens(input_ids)
         seq_len = input_ids.shape[1]
-        # P6: slice pre-allocated buffer instead of torch.arange
-        pos = self._pos_buf[position_offset : position_offset + seq_len]
+        pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
 
         new_past_key_values = []
         for i, layer in enumerate(self.layers):
@@ -395,9 +390,12 @@ class QwenForCausalLMTP(nn.Module):
             layer.self_attn.o_proj.weight.data.copy_(
                 self._load_tensor(f"{pfx}.self_attn.o_proj.weight", split_dim=1).to(layer.self_attn.o_proj.weight)
             )
-            g = self._load_tensor(f"{pfx}.mlp.gate_proj.weight", split_dim=0)
-            u = self._load_tensor(f"{pfx}.mlp.up_proj.weight", split_dim=0)
-            layer.mlp.gate_up_proj.load_weight_shard(g, u)
+            layer.mlp.gate_proj.weight.data.copy_(
+                self._load_tensor(f"{pfx}.mlp.gate_proj.weight", split_dim=0).to(layer.mlp.gate_proj.weight)
+            )
+            layer.mlp.up_proj.weight.data.copy_(
+                self._load_tensor(f"{pfx}.mlp.up_proj.weight", split_dim=0).to(layer.mlp.up_proj.weight)
+            )
             layer.mlp.down_proj.weight.data.copy_(
                 self._load_tensor(f"{pfx}.mlp.down_proj.weight", split_dim=1).to(layer.mlp.down_proj.weight)
             )
@@ -416,16 +414,16 @@ class QwenForCausalLMTP(nn.Module):
             f"device={first.self_attn.q_proj.weight.device}"
         )
         print(
-            f"[TP-Probe] rank={rank} first gate_up shape={tuple(first.mlp.gate_up_proj.weight.shape)} "
-            f"device={first.mlp.gate_up_proj.weight.device}"
+            f"[TP-Probe] rank={rank} first gate_proj shape={tuple(first.mlp.gate_proj.weight.shape)} "
+            f"device={first.mlp.gate_proj.weight.device}"
         )
         print(
             f"[TP-Probe] rank={rank} last q_proj shape={tuple(last.self_attn.q_proj.weight.shape)} "
             f"device={last.self_attn.q_proj.weight.device}"
         )
         print(
-            f"[TP-Probe] rank={rank} last gate_up shape={tuple(last.mlp.gate_up_proj.weight.shape)} "
-            f"device={last.mlp.gate_up_proj.weight.device}"
+            f"[TP-Probe] rank={rank} last gate_proj shape={tuple(last.mlp.gate_proj.weight.shape)} "
+            f"device={last.mlp.gate_proj.weight.device}"
         )
         if torch.cuda.is_available():
             print(f"[TP-Probe] rank={rank} cuda_allocated_mb={torch.cuda.memory_allocated()/1024**2:.2f}")
@@ -446,10 +444,7 @@ class QwenTPModelRunner:
         self.model = QwenForCausalLMTP(self.cfg, device=device, dtype=dtype)
         self.model.load_weights()
         self.model.eval()
-        # P2: compile attention and MLP modules for kernel fusion
-        for layer in self.model.layers:
-            layer.self_attn = torch.compile(layer.self_attn)
-            layer.mlp = torch.compile(layer.mlp)
+        # P2: no torch.compile for Qwen (SDPA decode dynamic kv_len)
 
     @torch.inference_mode()
     def run(
