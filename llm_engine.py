@@ -393,6 +393,53 @@ class LLMEngine:
             print(f"[LLMEngine] generate done in {time.time()-t0:.2f}s")
         return out_texts[0] if isinstance(prompt, str) else out_texts
 
+    def generate_stream(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        top_p: float | None = None,
+    ):
+        """Token-by-token streaming generator for SSE output.
+
+        Yields each decoded token text as it's produced,
+        allowing the server to push SSE chunks in real time.
+        """
+        seqs = self._enqueue([prompt], max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p)
+        seq = seqs[0]
+        prev_len = 0
+
+        step = 0
+        while True:
+            step += 1
+            batch, is_prefill = self.scheduler.schedule()
+            if not batch:
+                if seq.status == SequenceStatus.FINISHED:
+                    break
+                if len(seq.output_ids) >= max_new_tokens:
+                    self._finish_check_and_cleanup(seq)
+                if seq.status == SequenceStatus.FINISHED:
+                    break
+                raise RuntimeError("Scheduler returned empty batch before sequence finished")
+
+            if is_prefill:
+                first_tokens = self.runner.run(batch, is_prefill=True, temperature=temperature, top_p=top_p)
+                self.scheduler.postprocess(batch, is_prefill=True, generated_tokens=first_tokens)
+                continue
+
+            next_tokens = self.runner.run(batch, is_prefill=False, temperature=temperature, top_p=top_p)
+            self.scheduler.postprocess(batch, is_prefill=False, generated_tokens=next_tokens)
+
+            # Yield any new tokens since last yield
+            new_ids = seq.output_ids[prev_len:]
+            for tid in new_ids:
+                yield self.runner.tokenizer.decode([tid], skip_special_tokens=True)
+            prev_len = len(seq.output_ids)
+
+            self._finish_check_and_cleanup(seq)
+            if seq.status == SequenceStatus.FINISHED:
+                break
+
     def begin_generation(
         self,
         prompts: list[str],

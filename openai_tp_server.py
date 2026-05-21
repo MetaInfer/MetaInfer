@@ -72,13 +72,23 @@ def run_tp_generation_loop(
             return output[0]
         return output
 
+    def generate_stream_drain(task: GenerateTask) -> None:
+        """Drain the streaming generator (for non-rank0 TP ranks)."""
+        for _ in engine.generate_stream(
+            task.prompt,
+            max_new_tokens=task.max_tokens,
+            temperature=task.temperature,
+            top_p=task.top_p,
+        ):
+            pass
+
     if dist_ready() and not is_rank0():
         while True:
             cmd = broadcast_obj({})
             action = cmd.get("action")
             if action == "shutdown":
                 break
-            if action != "generate":
+            if action not in ("generate", "generate_stream"):
                 raise RuntimeError(f"Unknown action: {action}")
             if not rank_logged_once:
                 rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
@@ -90,7 +100,10 @@ def run_tp_generation_loop(
                 temperature=float(cmd["temperature"]),
                 top_p=None if cmd.get("top_p") is None else float(cmd["top_p"]),
             )
-            _ = generate_once(task)
+            if action == "generate_stream":
+                generate_stream_drain(task)
+            else:
+                _ = generate_once(task)
         return
 
     class Handler(BaseHTTPRequestHandler):
@@ -141,6 +154,56 @@ def run_tp_generation_loop(
             model_name = str(req.get("model", "meta-infer-tp"))
             req_id = str(req.get("request_id", f"cmpl-{uuid.uuid4().hex[:10]}"))
 
+            if stream:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                with request_lock:
+                    cmd = {
+                        "action": "generate_stream",
+                        "prompt": prompt,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                    }
+                    if dist_ready():
+                        _ = broadcast_obj(cmd)
+
+                    completion_tokens = 0
+                    for token_text in engine.generate_stream(
+                        prompt, max_new_tokens=max_tokens,
+                        temperature=temperature, top_p=top_p,
+                    ):
+                        completion_tokens += 1
+                        chunk = {
+                            "id": req_id,
+                            "object": "text_completion",
+                            "model": model_name,
+                            "choices": [{"index": 0, "text": token_text, "logprobs": None, "finish_reason": None}],
+                        }
+                        self.wfile.write(
+                            f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                        )
+                        self.wfile.flush()
+
+                    # Final chunk with finish_reason
+                    final = {
+                        "id": req_id,
+                        "object": "text_completion",
+                        "model": model_name,
+                        "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+                        "usage": {"completion_tokens": completion_tokens},
+                    }
+                    self.wfile.write(
+                        f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode("utf-8")
+                    )
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                return
+
             with request_lock:
                 cmd = {
                     "action": "generate",
@@ -162,36 +225,6 @@ def run_tp_generation_loop(
             completion_tokens = len(
                 engine.runner.tokenizer.encode(text, add_special_tokens=False)
             )
-
-            if stream:
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                self.end_headers()
-
-                chunk = {
-                    "id": req_id,
-                    "object": "text_completion",
-                    "model": model_name,
-                    "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
-                }
-                usage = {
-                    "id": req_id,
-                    "object": "text_completion",
-                    "model": model_name,
-                    "choices": [],
-                    "usage": {"completion_tokens": completion_tokens},
-                }
-                self.wfile.write(
-                    f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
-                )
-                self.wfile.write(
-                    f"data: {json.dumps(usage, ensure_ascii=False)}\n\n".encode("utf-8")
-                )
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-                return
 
             body = {
                 "id": req_id,
