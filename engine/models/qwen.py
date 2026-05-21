@@ -256,18 +256,13 @@ class QwenAttentionTP(nn.Module):
             v_buf[:, kv_len:kv_len + seqlen] = v
             kv_len = kv_len + seqlen
 
-            k_valid = k_buf[:, :kv_len]
-            v_valid = v_buf[:, :kv_len]
-            if self.num_kv_heads != self.num_heads:
-                r = self.num_heads // self.num_kv_heads
-                k_valid = k_valid.repeat_interleave(r, dim=2)
-                v_valid = v_valid.repeat_interleave(r, dim=2)
-            q_sdpa = q.permute(0, 2, 1, 3)
-            k_sdpa = k_valid.permute(0, 2, 1, 3)
-            v_sdpa = v_valid.permute(0, 2, 1, 3)
+            q_sdpa = q.permute(0, 2, 1, 3)                    # [B, num_heads, S, D]
+            k_sdpa = k_buf[:, :kv_len].permute(0, 2, 1, 3)   # [B, num_kv_heads, kv_len, D]
+            v_sdpa = v_buf[:, :kv_len].permute(0, 2, 1, 3)   # [B, num_kv_heads, kv_len, D]
             out = F.scaled_dot_product_attention(
                 q_sdpa, k_sdpa, v_sdpa,
                 is_causal=False, scale=self.scaling,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
             )
             out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.q_size)
 
