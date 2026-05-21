@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_varlen_func
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
@@ -188,6 +189,17 @@ class QwenAttentionTP(nn.Module):
         self.register_buffer("_cu_q", torch.tensor([0, 0], dtype=torch.int32), persistent=False)
         self.register_buffer("_cu_k", torch.tensor([0, 0], dtype=torch.int32), persistent=False)
 
+        # Paged KV cache (vLLM flash layout: [num_blocks, block_size, Hk, D])
+        # block_size=256 required by flash_attn_with_kvcache
+        self._kv_block_size = 256
+        # KV cache allocated on first prefill; stored on module for graph access
+        self._key_cache: torch.Tensor | None = None
+        self._value_cache: torch.Tensor | None = None
+        self._block_table: torch.Tensor | None = None  # [1, max_blocks] int32
+        self._slot_mapping: torch.Tensor | None = None  # [seqlen] int64 for prefill, [1] for decode
+        self.register_buffer("_kv_len_gpu", torch.zeros(1, dtype=torch.int32), persistent=False)
+        self.register_buffer("_slot_mapping_decode", torch.zeros(1, dtype=torch.int64), persistent=False)
+
         # Shared RoPE cos/sin cache (de-duplicated across layers via module-level cache)
         self._cos_sin_cache_cpu = _get_cos_sin_cache(
             cfg.max_position_embeddings, self.head_dim, cfg.rope_theta,
@@ -231,18 +243,28 @@ class QwenAttentionTP(nn.Module):
         use_gqa = (self.num_kv_heads != self.num_heads)
 
         if past_key_values is None:
-            # Prefill: allocate buffers and slice (efficient for long prompts)
-            k_buf = torch.zeros(bsz, max_seq_len, self.num_kv_heads, self.head_dim, device=k.device, dtype=k.dtype)
-            v_buf = torch.zeros(bsz, max_seq_len, self.num_kv_heads, self.head_dim, device=v.device, dtype=v.dtype)
-            k_buf[:, :seqlen] = k
-            v_buf[:, :seqlen] = v
+            # Prefill: allocate paged KV cache + block table
+            num_blocks = max(1, (max_seq_len + self._kv_block_size - 1) // self._kv_block_size)
+            self._key_cache = torch.zeros(num_blocks, self._kv_block_size, self.num_kv_heads,
+                                          self.head_dim, device=k.device, dtype=k.dtype)
+            self._value_cache = torch.zeros(num_blocks, self._kv_block_size, self.num_kv_heads,
+                                            self.head_dim, device=v.device, dtype=v.dtype)
+            # block_table: [1, num_blocks] — sequential allocation
+            self._block_table = torch.arange(num_blocks, dtype=torch.int32, device=k.device).unsqueeze(0)
+
+            # Write prefill KV to paged cache via sequential slot_mapping
+            slot_mapping = torch.arange(seqlen, dtype=torch.int64, device=k.device)
+            k_flat = k.reshape(seqlen, self.num_kv_heads, self.head_dim)
+            v_flat = v.reshape(seqlen, self.num_kv_heads, self.head_dim)
+            self._key_cache.view(-1, self.num_kv_heads, self.head_dim)[slot_mapping] = k_flat
+            self._value_cache.view(-1, self.num_kv_heads, self.head_dim)[slot_mapping] = v_flat
             kv_len = seqlen
 
-            # flash-attn: reshape to (total, heads, headdim)
+            # Prefill attention with FA2 varlen
             q_fa = q.reshape(seqlen, self.num_heads, self.head_dim)
-            k_fa = k_buf[0, :kv_len]
-            v_fa = v_buf[0, :kv_len]
             self._cu_q[1] = seqlen
+            k_fa = self._key_cache.reshape(-1, self.num_kv_heads, self.head_dim)[:kv_len]
+            v_fa = self._value_cache.reshape(-1, self.num_kv_heads, self.head_dim)[:kv_len]
             out = flash_attn_varlen_func(
                 q_fa, k_fa, v_fa,
                 cu_seqlens_q=self._cu_q, cu_seqlens_k=self._cu_q,
@@ -251,23 +273,29 @@ class QwenAttentionTP(nn.Module):
             )
             out = out.reshape(bsz, seqlen, self.q_size)
         else:
-            # Decode: write KV, slice to valid length → SDPA auto-dispatch
-            k_buf, v_buf, kv_len = past_key_values
-            k_buf[:, kv_len:kv_len + seqlen] = k
-            v_buf[:, kv_len:kv_len + seqlen] = v
-            kv_len = kv_len + seqlen
+            # Decode: _kv_len_gpu pre-set externally (both eager and graph paths)
+            kv_len = past_key_values
 
-            q_sdpa = q.permute(0, 2, 1, 3)                    # [B, num_heads, S, D]
-            k_sdpa = k_buf[:, :kv_len].permute(0, 2, 1, 3)   # [B, num_kv_heads, kv_len, D]
-            v_sdpa = v_buf[:, :kv_len].permute(0, 2, 1, 3)   # [B, num_kv_heads, kv_len, D]
-            out = F.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa,
-                is_causal=False, scale=self.scaling,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
+            # Write KV using index_copy_ (graph-compatible)
+            self._slot_mapping_decode[0] = self._kv_len_gpu[0]
+            k_flat = k.reshape(1, self.num_kv_heads, self.head_dim)
+            v_flat = v.reshape(1, self.num_kv_heads, self.head_dim)
+            self._key_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
+                0, self._slot_mapping_decode, k_flat)
+            self._value_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
+                0, self._slot_mapping_decode, v_flat)
+            self._kv_len_gpu[0] += 1
+
+            # Decode attention (paged, graph-compatible — kv_len_gpu as 1D tensor)
+            q_kv = q.reshape(1, 1, self.num_heads, self.head_dim)
+            out = flash_attn_with_kvcache(
+                q_kv, self._key_cache, self._value_cache,
+                cache_seqlens=self._kv_len_gpu, block_table=self._block_table,
+                softmax_scale=self.scaling, causal=False,
             )
-            out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.q_size)
+            out = out.reshape(bsz, seqlen, self.q_size)
 
-        new_cache = (k_buf, v_buf, kv_len)
+        new_cache = kv_len + 1
         return self.o_proj(out), new_cache
 
 
@@ -332,6 +360,45 @@ class QwenForCausalLMTP(nn.Module):
         self.lm_head = ParallelLMHead(cfg.hidden_size, cfg.vocab_size, gather_output=True)
         self.to(device=device, dtype=dtype)
 
+        # CUDA Graph for decode
+        self._decode_graph: torch.cuda.CUDAGraph | None = None
+        self._graph_input_ids: torch.Tensor | None = None
+        self._graph_pos: torch.Tensor | None = None
+        self._graph_logits: torch.Tensor | None = None
+        self._cuda_graph_enabled = os.environ.get('META_INFER_CUDA_GRAPH', '1') == '1'
+
+    # ---- CUDA Graph support ----
+    def _set_kv_len_for_layers(self, kv_lens: list[int]) -> None:
+        for i, layer in enumerate(self.layers):
+            layer.self_attn._kv_len_gpu[0] = kv_lens[i]
+
+    @property
+    def has_decode_graph(self) -> bool:
+        return self._decode_graph is not None
+
+    def init_decode_graph(self, input_ids: torch.Tensor, pos: torch.Tensor, kv_lens: list[int], max_seq_len: int) -> None:
+        if not self._cuda_graph_enabled:
+            return
+        self._set_kv_len_for_layers(kv_lens)
+        self._graph_input_ids = input_ids.clone()
+        self._graph_pos = pos.clone()
+        position_offset = int(pos[0].item())
+
+        # Build past_key_values from per-layer kv_len
+        past_kv = kv_lens  # list of ints — the model forward expects this
+
+        self._decode_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._decode_graph):
+            logits, _ = self.forward(self._graph_input_ids, past_kv, position_offset, max_seq_len)
+            self._graph_logits = logits
+
+    def graph_replay(self, kv_lens: list[int], input_ids: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        self._set_kv_len_for_layers(kv_lens)
+        self._graph_input_ids.copy_(input_ids)
+        self._graph_pos.copy_(pos)
+        self._decode_graph.replay()
+        return self._graph_logits
+
     @torch.inference_mode()
     def forward(
         self,
@@ -352,7 +419,10 @@ class QwenForCausalLMTP(nn.Module):
         rank = get_tp_rank()
         hidden_states = self.embed_tokens(input_ids)
         seq_len = input_ids.shape[1]
-        pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
+        if self.has_decode_graph and torch.cuda.is_current_stream_capturing():
+            pos = self._graph_pos  # use pre-allocated (updated before replay)
+        else:
+            pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
 
         residual = None
         new_past_key_values = []
@@ -516,15 +586,32 @@ class QwenTPModelRunner:
                 logits, past_kv = self.model(ids, past_key_values=None, position_offset=0, max_seq_len=max_seq_len)
                 seq.past_key_values = past_kv
                 logits = logits[0, -1, :].unsqueeze(0)
+                seq._decode_step_count = 0; self.model._decode_graph = None  # invalidate graph on new prefill
+            elif self.model.has_decode_graph:
+                new_token = seq.token_ids[-1:]
+                ids = torch.tensor([new_token], dtype=torch.long, device=self.device)
+                position_offset = len(seq.token_ids) - 1
+                pos = torch.tensor([position_offset], dtype=torch.long, device=self.device)
+                logits = self.model.graph_replay(seq.past_key_values, ids, pos)
+                # kv_lens are updated by the graph (_kv_len_gpu incremented inside)
+                seq.past_key_values = [int(layer.self_attn._kv_len_gpu[0].item()) for layer in self.model.layers]
+                logits = logits[0, -1, :].unsqueeze(0)
             else:
                 new_token = seq.token_ids[-1:]
                 ids = torch.tensor([new_token], dtype=torch.long, device=self.device)
                 position_offset = len(seq.token_ids) - 1
+                # Set _kv_len_gpu before forward (required by decode path)
+                self.model._set_kv_len_for_layers(seq.past_key_values)
                 logits, past_kv = self.model(
                     ids, past_key_values=seq.past_key_values, position_offset=position_offset, max_seq_len=max_seq_len
                 )
                 seq.past_key_values = past_kv
                 logits = logits[0, -1, :].unsqueeze(0)
+                # Capture graph after 2 eager warmup steps
+                seq._decode_step_count = seq._decode_step_count + 1
+                if seq._decode_step_count == 2:
+                    pos = torch.tensor([position_offset + 1], dtype=torch.long, device=self.device)
+                    self.model.init_decode_graph(ids, pos, past_kv, max_seq_len)
             next_tokens.append(int(sample_next_tokens(logits, temperature=temperature, top_p=top_p).item()))
         return next_tokens
 
