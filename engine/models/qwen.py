@@ -62,19 +62,36 @@ def _load_qwen_tp_config(model_dir: str | Path) -> QwenTPConfig:
 
 
 class RMSNorm(nn.Module):
-    """与 transformers.models.qwen3.modeling_qwen3.Qwen3RMSNorm 一致：在 fp32 中算方差/归一化，再回写激活 dtype。"""
+    """RMSNorm with vLLM fused kernel backend.
+
+    Dual interface (matching vLLM):
+        forward(x)           -> rms_norm(x)              (no residual)
+        forward(x, residual) -> fused_add_rms_norm       (residual + norm)
+
+    Where fused_add_rms_norm does:
+        1. residual = residual + x          (in-place)
+        2. x = rms_norm(residual) * weight  (in-place)
+    """
 
     def __init__(self, dim: int, eps: float):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return (self.weight * x).to(input_dtype)
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            out = torch.empty_like(x)
+            from engine.kernels.vllm_wrappers import rms_norm
+            rms_norm(out, x.contiguous(), self.weight, self.eps)
+            return out
+        else:
+            from engine.kernels.vllm_wrappers import fused_add_rms_norm
+            fused_add_rms_norm(x.contiguous(), residual.contiguous(), self.weight, self.eps)
+            return x, residual
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -250,13 +267,20 @@ class QwenDecoderLayerTP(nn.Module):
         positions: torch.Tensor,
         past_key_values: tuple | None = None,
         max_seq_len: int = 512,
-    ) -> tuple[torch.Tensor, tuple]:
-        h = self.input_layernorm(hidden_states)
-        h, new_cache = self.self_attn(h, positions, past_key_values, max_seq_len=max_seq_len)
-        hidden_states = hidden_states + h
-        h2 = self.post_attention_layernorm(hidden_states)
-        h2 = self.mlp(h2)
-        return hidden_states + h2, new_cache
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple]:
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, new_cache = self.self_attn(hidden_states, positions, past_key_values, max_seq_len=max_seq_len)
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual, new_cache
 
 
 class QwenForCausalLMTP(nn.Module):
@@ -294,13 +318,16 @@ class QwenForCausalLMTP(nn.Module):
         seq_len = input_ids.shape[1]
         pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
 
+        residual = None
         new_past_key_values = []
         for i, layer in enumerate(self.layers):
             layer_cache = past_key_values[i] if past_key_values is not None else None
-            hidden_states, new_cache = layer(hidden_states, pos, layer_cache, max_seq_len=max_seq_len)
+            hidden_states, residual, new_cache = layer(
+                hidden_states, pos, layer_cache, max_seq_len=max_seq_len, residual=residual
+            )
             new_past_key_values.append(new_cache)
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         logits = self.lm_head(hidden_states)
         return logits, new_past_key_values
 
