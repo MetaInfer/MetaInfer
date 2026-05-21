@@ -46,3 +46,16 @@ def fused_add_rms_norm(
         2. input = rms_norm(residual) * weight
     """
     _vllm_fused_add_rms_norm(input, residual, weight, epsilon)
+
+
+# === Snippet C: silu_and_mul ===
+def silu_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
+    """vLLM silu_and_mul CUDA kernel.
+
+    Contract:
+        input: [*, 2*d]  bf16, contiguous — merged gate+up projection output
+        out:   [*, d]    bf16, contiguous, pre-allocated
+    Operation: out = silu(input[..., :d]) * input[..., d:]
+        where d = input.shape[-1] // 2
+    """
+    torch.ops._C.silu_and_mul(out, input)

@@ -17,6 +17,7 @@ from engine.sampler import sample_next_tokens
 from engine.structs import Sequence
 from engine.tp_layers import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ParallelLMHead,
     RowParallelLinear,
     VocabParallelEmbedding,
@@ -242,15 +243,16 @@ class QwenMLPTP(nn.Module):
         self.tp = get_tp_size()
         ensure_divisible(cfg.intermediate_size, self.tp, name="intermediate_size")
         self.local_intermediate = cfg.intermediate_size // self.tp
-        self.gate_proj = ColumnParallelLinear(cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False)
-        self.up_proj = ColumnParallelLinear(cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False)
+        self.gate_up_proj = MergedColumnParallelLinear(cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False)
         self.down_proj = RowParallelLinear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        h = F.silu(gate) * up
-        return self.down_proj(h)
+        gate_up = self.gate_up_proj(x)                                 # [B, S, 2*local_inter]
+        out = torch.empty(x.shape[0], x.shape[1], self.local_intermediate,
+                          dtype=x.dtype, device=x.device)
+        from engine.kernels.vllm_wrappers import silu_and_mul
+        silu_and_mul(out, gate_up)                                     # [B, S, local_inter]
+        return self.down_proj(out)
 
 
 class QwenDecoderLayerTP(nn.Module):
@@ -417,11 +419,9 @@ class QwenForCausalLMTP(nn.Module):
             layer.self_attn.o_proj.weight.data.copy_(
                 self._load_tensor(f"{pfx}.self_attn.o_proj.weight", split_dim=1).to(layer.self_attn.o_proj.weight)
             )
-            layer.mlp.gate_proj.weight.data.copy_(
-                self._load_tensor(f"{pfx}.mlp.gate_proj.weight", split_dim=0).to(layer.mlp.gate_proj.weight)
-            )
-            layer.mlp.up_proj.weight.data.copy_(
-                self._load_tensor(f"{pfx}.mlp.up_proj.weight", split_dim=0).to(layer.mlp.up_proj.weight)
+            layer.mlp.gate_up_proj.load_weight_shard(
+                self._load_tensor(f"{pfx}.mlp.gate_proj.weight", split_dim=0),
+                self._load_tensor(f"{pfx}.mlp.up_proj.weight", split_dim=0),
             )
             layer.mlp.down_proj.weight.data.copy_(
                 self._load_tensor(f"{pfx}.mlp.down_proj.weight", split_dim=1).to(layer.mlp.down_proj.weight)
@@ -441,16 +441,16 @@ class QwenForCausalLMTP(nn.Module):
             f"device={first.self_attn.q_proj.weight.device}"
         )
         print(
-            f"[TP-Probe] rank={rank} first gate_proj shape={tuple(first.mlp.gate_proj.weight.shape)} "
-            f"device={first.mlp.gate_proj.weight.device}"
+            f"[TP-Probe] rank={rank} first gate_up_proj shape={tuple(first.mlp.gate_up_proj.weight.shape)} "
+            f"device={first.mlp.gate_up_proj.weight.device}"
         )
         print(
             f"[TP-Probe] rank={rank} last q_proj shape={tuple(last.self_attn.q_proj.weight.shape)} "
             f"device={last.self_attn.q_proj.weight.device}"
         )
         print(
-            f"[TP-Probe] rank={rank} last gate_proj shape={tuple(last.mlp.gate_proj.weight.shape)} "
-            f"device={last.mlp.gate_proj.weight.device}"
+            f"[TP-Probe] rank={rank} last gate_up_proj shape={tuple(last.mlp.gate_up_proj.weight.shape)} "
+            f"device={last.mlp.gate_up_proj.weight.device}"
         )
         if torch.cuda.is_available():
             print(f"[TP-Probe] rank={rank} cuda_allocated_mb={torch.cuda.memory_allocated()/1024**2:.2f}")
