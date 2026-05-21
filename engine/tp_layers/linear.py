@@ -101,3 +101,42 @@ class RowParallelLinear(nn.Module):
         start = rank * self.local_input_size
         end = start + self.local_input_size
         self.weight.data.copy_(full_weight[:, start:end].to(device=self.weight.device, dtype=self.weight.dtype))
+
+
+class QKVColumnParallelLinear(nn.Module):
+    """Merge q_proj, k_proj, v_proj into one GEMM (matching vLLM QKVParallelLinear)."""
+
+    def __init__(self, hidden_size, head_size, total_num_heads, total_num_kv_heads,
+                 bias=False, gather_output=False):
+        super().__init__()
+        self.tp_size = get_tp_size()
+        self.head_size = head_size
+        self.num_heads = total_num_heads // self.tp_size
+        if self.tp_size > total_num_kv_heads:
+            self.num_kv_heads = 1
+        else:
+            self.num_kv_heads = total_num_kv_heads // self.tp_size
+        self.q_size = self.num_heads * head_size
+        self.kv_size = self.num_kv_heads * head_size
+        # Keep total sizes for weight slicing
+        self.total_q_size = total_num_heads * head_size
+        self.total_kv_size = total_num_kv_heads * head_size
+        total_local = self.q_size + self.kv_size * 2
+        self.weight = nn.Parameter(torch.empty(total_local, hidden_size))
+        self.gather_output = gather_output
+
+    def forward(self, x):
+        y = F.linear(x, self.weight)
+        if self.gather_output and self.tp_size > 1:
+            y = all_gather_last_dim(y)
+        q, k, v = y.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        return q, k, v
+
+    def load_weight_shard(self, q_weight, k_weight, v_weight):
+        """Load QKV weights. Weights are already TP-sliced by _load_tensor."""
+        w_q = q_weight.to(device=self.weight.device, dtype=self.weight.dtype)
+        w_k = k_weight.to(device=self.weight.device, dtype=self.weight.dtype)
+        w_v = v_weight.to(device=self.weight.device, dtype=self.weight.dtype)
+        self.weight.data[:self.q_size].copy_(w_q)
+        self.weight.data[self.q_size:self.q_size + self.kv_size].copy_(w_k)
+        self.weight.data[self.q_size + self.kv_size:].copy_(w_v)

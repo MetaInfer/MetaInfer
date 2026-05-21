@@ -18,6 +18,7 @@ from engine.structs import Sequence
 from engine.tp_layers import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    QKVColumnParallelLinear,
     ParallelLMHead,
     RowParallelLinear,
     VocabParallelEmbedding,
@@ -174,9 +175,10 @@ class QwenAttentionTP(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.rope_theta = cfg.rope_theta
 
-        self.q_proj = ColumnParallelLinear(cfg.hidden_size, self.total_num_heads * self.head_dim, bias=False, gather_output=False)
-        self.k_proj = ColumnParallelLinear(cfg.hidden_size, self.total_num_kv_heads * self.head_dim, bias=False, gather_output=False)
-        self.v_proj = ColumnParallelLinear(cfg.hidden_size, self.total_num_kv_heads * self.head_dim, bias=False, gather_output=False)
+        self.qkv_proj = QKVColumnParallelLinear(
+            cfg.hidden_size, self.head_dim, self.total_num_heads, self.total_num_kv_heads,
+            bias=False, gather_output=False,
+        )
         self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim, cfg.hidden_size, bias=False)
         self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
@@ -204,9 +206,10 @@ class QwenAttentionTP(nn.Module):
         Returns: (output, new_cache)
         """
         bsz, seqlen, _ = hidden_states.shape
-        q = self.q_proj(hidden_states).view(bsz, seqlen, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        q, k, v = self.qkv_proj(hidden_states)
+        q = q.view(bsz, seqlen, self.num_heads, self.head_dim)
+        k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -434,22 +437,10 @@ class QwenForCausalLMTP(nn.Module):
             layer.self_attn.k_norm.weight.data.copy_(
                 self._load_tensor(f"{pfx}.self_attn.k_norm.weight").to(layer.self_attn.k_norm.weight)
             )
-            layer.self_attn.q_proj.weight.data.copy_(
-                self._load_tensor(f"{pfx}.self_attn.q_proj.weight", split_dim=0).to(layer.self_attn.q_proj.weight)
-            )
-            layer.self_attn.k_proj.weight.data.copy_(
-                self._load_tensor(
-                    f"{pfx}.self_attn.k_proj.weight",
-                    split_dim=0,
-                    allow_kv_replication=True,
-                ).to(layer.self_attn.k_proj.weight)
-            )
-            layer.self_attn.v_proj.weight.data.copy_(
-                self._load_tensor(
-                    f"{pfx}.self_attn.v_proj.weight",
-                    split_dim=0,
-                    allow_kv_replication=True,
-                ).to(layer.self_attn.v_proj.weight)
+            layer.self_attn.qkv_proj.load_weight_shard(
+                self._load_tensor(f"{pfx}.self_attn.q_proj.weight", split_dim=0),
+                self._load_tensor(f"{pfx}.self_attn.k_proj.weight", split_dim=0, allow_kv_replication=True),
+                self._load_tensor(f"{pfx}.self_attn.v_proj.weight", split_dim=0, allow_kv_replication=True),
             )
             layer.self_attn.o_proj.weight.data.copy_(
                 self._load_tensor(f"{pfx}.self_attn.o_proj.weight", split_dim=1).to(layer.self_attn.o_proj.weight)
@@ -472,16 +463,16 @@ class QwenForCausalLMTP(nn.Module):
         first = self.layers[0]
         last = self.layers[-1]
         print(
-            f"[TP-Probe] rank={rank} first q_proj shape={tuple(first.self_attn.q_proj.weight.shape)} "
-            f"device={first.self_attn.q_proj.weight.device}"
+            f"[TP-Probe] rank={rank} first qkv_proj shape={tuple(first.self_attn.qkv_proj.weight.shape)} "
+            f"device={first.self_attn.qkv_proj.weight.device}"
         )
         print(
             f"[TP-Probe] rank={rank} first gate_up_proj shape={tuple(first.mlp.gate_up_proj.weight.shape)} "
             f"device={first.mlp.gate_up_proj.weight.device}"
         )
         print(
-            f"[TP-Probe] rank={rank} last q_proj shape={tuple(last.self_attn.q_proj.weight.shape)} "
-            f"device={last.self_attn.q_proj.weight.device}"
+            f"[TP-Probe] rank={rank} last qkv_proj shape={tuple(last.self_attn.qkv_proj.weight.shape)} "
+            f"device={last.self_attn.qkv_proj.weight.device}"
         )
         print(
             f"[TP-Probe] rank={rank} last gate_up_proj shape={tuple(last.mlp.gate_up_proj.weight.shape)} "

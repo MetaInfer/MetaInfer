@@ -8,7 +8,7 @@ from engine.tp_layers.distributed import (
     is_tp_enabled,
 )
 from engine.tp_layers.embedding import ParallelLMHead, VocabParallelEmbedding
-from engine.tp_layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from engine.tp_layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, QKVColumnParallelLinear, RowParallelLinear
 from engine.tp_layers.moe import ExpertParallelMoE, ExpertParallelMoEConfig, partition_experts_for_rank
 
 __all__ = [
@@ -21,6 +21,7 @@ __all__ = [
     "all_gather_last_dim",
     "ColumnParallelLinear",
     "MergedColumnParallelLinear",
+    "QKVColumnParallelLinear",
     "RowParallelLinear",
     "VocabParallelEmbedding",
     "ParallelLMHead",
