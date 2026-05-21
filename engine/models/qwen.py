@@ -365,7 +365,7 @@ class QwenForCausalLMTP(nn.Module):
         self._graph_input_ids: torch.Tensor | None = None
         self._graph_pos: torch.Tensor | None = None
         self._graph_logits: torch.Tensor | None = None
-        self._cuda_graph_enabled = os.environ.get('META_INFER_CUDA_GRAPH', '1') == '1'
+        self._cuda_graph_enabled = os.environ.get('META_INFER_CUDA_GRAPH', '1') == '1' and get_tp_size() <= 1
 
     # ---- CUDA Graph support ----
     def _set_kv_len_for_layers(self, kv_lens: list[int]) -> None:
@@ -383,9 +383,7 @@ class QwenForCausalLMTP(nn.Module):
         self._graph_input_ids = input_ids.clone()
         self._graph_pos = pos.clone()
         position_offset = int(pos[0].item())
-
-        # Build past_key_values from per-layer kv_len
-        past_kv = kv_lens  # list of ints — the model forward expects this
+        past_kv = kv_lens
 
         self._decode_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._decode_graph):

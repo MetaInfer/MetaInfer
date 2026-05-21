@@ -46,10 +46,7 @@ class CustomAllReduceHandle:
         ops.register_buffer(self._ptr, self._buf_ptrs)
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        """Out-of-place all_reduce via P2P kernel.
-
-        If the handle is not initialized (single GPU), returns inp unchanged.
-        """
+        """Out-of-place all_reduce via P2P kernel."""
         if self._ptr == 0:
             return inp
         out = torch.empty_like(inp)
