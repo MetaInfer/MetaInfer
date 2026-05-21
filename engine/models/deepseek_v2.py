@@ -25,6 +25,7 @@ from engine.tp_layers import (
     ensure_divisible,
     get_tp_rank,
     get_tp_size,
+    init_custom_ar,
     init_tp_distributed,
 )
 from engine.tp_layers.moe import ExpertParallelMoE, ExpertParallelMoEConfig
@@ -853,6 +854,7 @@ class DeepseekTPModelRunner:
         self.model = DeepseekForCausalLMTP(self.cfg, device=device, dtype=dtype)
         self.model.load_weights()
         self.model.eval()
+        init_custom_ar(device=device)
         # Initialize MLA weights (W_UK_T, W_UV) from kv_b_proj after loading
         for layer in self.model.layers:
             layer.self_attn._init_mla_weights()

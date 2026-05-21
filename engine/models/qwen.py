@@ -25,6 +25,7 @@ from engine.tp_layers import (
     ensure_divisible,
     get_tp_rank,
     get_tp_size,
+    init_custom_ar,
     init_tp_distributed,
     is_tp_enabled,
 )
@@ -492,6 +493,7 @@ class QwenTPModelRunner:
         self.model = QwenForCausalLMTP(self.cfg, device=device, dtype=dtype)
         self.model.load_weights()
         self.model.eval()
+        init_custom_ar(device=device)
         # P2: no torch.compile for Qwen (SDPA decode dynamic kv_len)
 
     @torch.inference_mode()

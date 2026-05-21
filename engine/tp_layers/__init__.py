@@ -4,6 +4,7 @@ from engine.tp_layers.distributed import (
     ensure_divisible,
     get_tp_rank,
     get_tp_size,
+    init_custom_ar,
     init_tp_distributed,
     is_tp_enabled,
 )
@@ -13,6 +14,7 @@ from engine.tp_layers.moe import ExpertParallelMoE, ExpertParallelMoEConfig, par
 
 __all__ = [
     "init_tp_distributed",
+    "init_custom_ar",
     "get_tp_rank",
     "get_tp_size",
     "is_tp_enabled",

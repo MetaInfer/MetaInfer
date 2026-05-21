@@ -5,6 +5,9 @@ import os
 import torch
 import torch.distributed as dist
 
+# Lazy-loaded CustomAllReduce handle (init once after dist init + model on GPU)
+_custom_ar_handle = None
+
 
 def get_tp_rank() -> int:
     if dist.is_available() and dist.is_initialized():
@@ -34,6 +37,32 @@ def init_tp_distributed() -> str:
     return backend
 
 
+def init_custom_ar(device: torch.device | None = None, max_size: int = 16 * 1024 * 1024) -> None:
+    """Initialize vLLM CustomAllReduce (P2P) for TP all_reduce.
+
+    Must be called after init_tp_distributed() and after model is on GPU.
+    Creates a secondary gloo group for IPC handle exchange (required by vLLM kernel).
+    """
+    global _custom_ar_handle
+    if _custom_ar_handle is not None:
+        return  # already initialized
+    if not is_tp_enabled():
+        return
+    world_size = get_tp_size()
+    if world_size == 1 or world_size not in (2, 4, 6, 8):
+        return
+
+    # Create a secondary gloo group for IPC handle exchange
+    # (vLLM requires non-NCCL group for all_gather_object)
+    gloo_group = dist.new_group(backend="gloo")
+
+    if device is None:
+        device = torch.device(f"cuda:{get_tp_rank()}")
+
+    from engine.tp_layers.custom_ar import CustomAllReduceHandle
+    _custom_ar_handle = CustomAllReduceHandle(gloo_group, device, max_size)
+
+
 def ensure_divisible(value: int, divisor: int, *, name: str) -> None:
     if value % divisor != 0:
         raise ValueError(f"{name}={value} is not divisible by tp_size={divisor}")
@@ -42,7 +71,9 @@ def ensure_divisible(value: int, divisor: int, *, name: str) -> None:
 def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
     if not is_tp_enabled():
         return x
-    # NCCL natively supports bf16/fp16 all_reduce, no dtype conversion needed.
+    if _custom_ar_handle is not None:
+        return _custom_ar_handle.all_reduce(x)
+    # Fallback to NCCL
     dist.all_reduce(x, op=dist.ReduceOp.SUM)
     return x
 
