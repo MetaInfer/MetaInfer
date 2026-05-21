@@ -41,6 +41,7 @@ class QwenTPConfig:
     vocab_size: int
     rms_norm_eps: float
     rope_theta: float
+    max_position_embeddings: int
     tie_word_embeddings: bool
 
 
@@ -58,8 +59,24 @@ def _load_qwen_tp_config(model_dir: str | Path) -> QwenTPConfig:
         vocab_size=int(cfg.vocab_size),
         rms_norm_eps=float(cfg.rms_norm_eps),
         rope_theta=float(getattr(cfg, "rope_theta", 1000000.0)),
+        max_position_embeddings=int(getattr(cfg, "max_position_embeddings", 32768)),
         tie_word_embeddings=bool(getattr(cfg, "tie_word_embeddings", False)),
     )
+
+
+# Shared RoPE cos/sin cache (de-duplicated across attention layers)
+_cos_sin_cache_registry: dict[tuple, torch.Tensor] = {}
+
+
+def _get_cos_sin_cache(max_pos: int, head_dim: int, rope_theta: float) -> torch.Tensor:
+    from engine.kernels.vllm_wrappers import make_cos_sin_cache
+    key = (max_pos, head_dim, rope_theta)
+    if key not in _cos_sin_cache_registry:
+        # Keep on CPU until model.to(device) moves it
+        _cos_sin_cache_registry[key] = make_cos_sin_cache(
+            max_pos, head_dim, rope_theta, dtype=torch.bfloat16, device='cpu',
+        )
+    return _cos_sin_cache_registry[key]
 
 
 class RMSNorm(nn.Module):
@@ -168,6 +185,12 @@ class QwenAttentionTP(nn.Module):
         self.register_buffer("_cu_q", torch.tensor([0, 0], dtype=torch.int32), persistent=False)
         self.register_buffer("_cu_k", torch.tensor([0, 0], dtype=torch.int32), persistent=False)
 
+        # Shared RoPE cos/sin cache (de-duplicated across layers via module-level cache)
+        self._cos_sin_cache_cpu = _get_cos_sin_cache(
+            cfg.max_position_embeddings, self.head_dim, cfg.rope_theta,
+        )
+        self._cos_sin_cache_gpu: torch.Tensor | None = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -187,7 +210,19 @@ class QwenAttentionTP(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q, k = _apply_rope(q, k, positions, self.rope_theta)
+        # vLLM rotary_embedding: flatten to [num_tokens, heads, head_dim], in-place
+        num_tokens = bsz * seqlen
+        q_flat = q.reshape(num_tokens, self.num_heads, self.head_dim)
+        k_flat = k.reshape(num_tokens, self.num_kv_heads, self.head_dim)
+        from engine.kernels.vllm_wrappers import rotary_embedding
+        if self._cos_sin_cache_gpu is None or self._cos_sin_cache_gpu.device != q.device:
+            self._cos_sin_cache_gpu = self._cos_sin_cache_cpu.to(device=q.device)
+        rotary_embedding(
+            positions, q_flat, k_flat, self.head_dim,
+            self._cos_sin_cache_gpu, is_neox=True,
+        )
+        q = q_flat.view(bsz, seqlen, self.num_heads, self.head_dim)
+        k = k_flat.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
         use_gqa = (self.num_kv_heads != self.num_heads)
 

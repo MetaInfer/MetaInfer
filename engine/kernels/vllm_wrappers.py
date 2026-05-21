@@ -59,3 +59,55 @@ def silu_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
         where d = input.shape[-1] // 2
     """
     torch.ops._C.silu_and_mul(out, input)
+
+
+# === Snippet D: rotary_embedding ===
+from vllm._custom_ops import rotary_embedding as _vllm_rotary_embedding
+
+
+def rotary_embedding(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    """vLLM rotary_embedding CUDA kernel — in-place RoPE on Q and K.
+
+    Contract:
+        positions:     [num_tokens]       int64
+        query:         [num_tokens, N, D] bf16, in-place modified
+        key:           [num_tokens, Nkv, D] bf16, in-place modified (or None)
+        head_size:     int
+        cos_sin_cache: [max_pos, head_size]  cos[:hd//2] || sin[:hd//2]
+        is_neox:       bool (True for Qwen3 GPT-NeoX style)
+    """
+    _vllm_rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
+
+
+# === Snippet E: make_cos_sin_cache ===
+def make_cos_sin_cache(
+    max_position: int,
+    head_size: int,
+    rope_theta: float = 1000000.0,
+    dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Construct cos_sin_cache matching vLLM RotaryEmbeddingBase._compute_cos_sin_cache.
+
+    Format: [max_position, head_size]
+      cache[pos, :head_size//2] = cos values
+      cache[pos, head_size//2:] = sin values
+    vLLM kernel handles NeoX duplication internally.
+
+    Verified against vLLM source (base.py:76-84).
+    """
+    inv_freq = 1.0 / (rope_theta ** (
+        torch.arange(0, head_size, 2, dtype=torch.float32, device=device) / head_size
+    ))
+    t = torch.arange(max_position, dtype=torch.float32, device=device)
+    freqs = torch.einsum("i,j -> ij", t, inv_freq)
+    cos = freqs.cos().to(dtype=dtype)
+    sin = freqs.sin().to(dtype=dtype)
+    return torch.cat((cos, sin), dim=-1)
