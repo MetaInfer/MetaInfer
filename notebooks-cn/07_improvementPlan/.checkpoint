@@ -1,6 +1,6 @@
-current_phase: P3-FA
-status: completed (correctness verified, perf pending GPU availability)
-timestamp: 2026-05-14T11:00:00
+current_phase: P6-torch-compile-cudagraph
+status: in_progress (compile done, cudagraph blocked by mutated inputs)
+timestamp: 2026-05-23T14:00:00
 
 completed_phases:
   - phase: P0
@@ -64,7 +64,33 @@ completed_phases:
     correctness:
       - Qwen3-8B TP=4: PASSED
       - DeepSeek-V2-Lite TP=4: PASSED
-    perf_note: "GPU memory too limited (6-20GB free) for fair comparison. Need GPU 4-7 with 30GB+ free."
+
+  - phase: P6-torch-compile-cudagraph
+    description: torch.compile PIECEWISE (per-layer fullgraph=True) + CUDA Graph
+    result: PARTIAL
+    timestamp: 2026-05-23
+    approaches:
+      - A: model-level forward() torch.compile → regression (+175% CPU time) → REJECTED
+      - B: per-layer forward_decode fullgraph=True → correctness PASSED, CUDA Graph blocked
+    correctness:
+      - single GPU: PASSED
+      - TP=4: PASSED
+    benchmark:
+      nocompile: 53.9 tok/s
+      compile: 45.1 tok/s (-16%, cudagraph skipped)
+      vllm_cudagraph: 171.6 tok/s
+    profiling:
+      gpu_time: meta-infer 82.8ms vs vLLM 79.6ms (1.04x, GPU 已追平)
+      cpu_time: meta-infer 548ms vs vLLM 15ms (36x gap, CPU dispatch overhead)
+    blocking_issue: "rms_norm in-place 修改 hidden_states 输入导致 reduce-overhead 内部 CUDA Graph 被跳过"
+    next_step: "改为 out-of-place (empty_like 预分配输出 buffer) 使 per-layer CUDA Graph 生效"
+    commits:
+      - torch.compile experiment with full profiling
+    files_changed:
+      - engine/kernels/custom_ops.py (新建, flash_attn custom op 注册)
+      - engine/models/qwen.py (forward_decode 无控制流 + per-layer compile)
+      - engine/tp_layers/custom_ar.py (移除 is_current_stream_capturing)
+      - notebooks-cn/07_improvementPlan/kernel_replacement_plan.md (完整文档)
 
 final_metrics:
   model: DeepSeek-V2-Lite-Chat

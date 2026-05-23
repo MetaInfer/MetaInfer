@@ -10,7 +10,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn import flash_attn_varlen_func
+from engine.kernels.custom_ops import flash_attn_with_kvcache_op
+from engine.kernels.vllm_wrappers import fused_add_rms_norm, rms_norm, rotary_embedding, silu_and_mul
+import vllm._C  # trigger torch.ops._C registration for inductor-compatible direct calls
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
@@ -106,11 +109,9 @@ class RMSNorm(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             out = torch.empty_like(x)
-            from engine.kernels.vllm_wrappers import rms_norm
             rms_norm(out, x.contiguous(), self.weight, self.eps)
             return out
         else:
-            from engine.kernels.vllm_wrappers import fused_add_rms_norm
             fused_add_rms_norm(x.contiguous(), residual.contiguous(), self.weight, self.eps)
             return x, residual
 
@@ -230,9 +231,9 @@ class QwenAttentionTP(nn.Module):
         num_tokens = bsz * seqlen
         q_flat = q.reshape(num_tokens, self.num_heads, self.head_dim)
         k_flat = k.reshape(num_tokens, self.num_kv_heads, self.head_dim)
-        from engine.kernels.vllm_wrappers import rotary_embedding
-        if self._cos_sin_cache_gpu is None or self._cos_sin_cache_gpu.device != q.device:
-            self._cos_sin_cache_gpu = self._cos_sin_cache_cpu.to(device=q.device)
+        # Lazy GPU transfer (only first call; torch.compile-friendly)
+        if self._cos_sin_cache_gpu is None:
+            self._cos_sin_cache_gpu = self._cos_sin_cache_cpu.to(device=q.device, non_blocking=False)
         rotary_embedding(
             positions, q_flat, k_flat, self.head_dim,
             self._cos_sin_cache_gpu, is_neox=True,
@@ -286,17 +287,60 @@ class QwenAttentionTP(nn.Module):
                 0, self._slot_mapping_decode, v_flat)
             self._kv_len_gpu[0] += 1
 
-            # Decode attention (paged, graph-compatible — kv_len_gpu as 1D tensor)
+            # Decode attention (paged, graph-compatible, torch.compile compatible via custom op)
             q_kv = q.reshape(1, 1, self.num_heads, self.head_dim)
-            out = flash_attn_with_kvcache(
+            out = flash_attn_with_kvcache_op(
                 q_kv, self._key_cache, self._value_cache,
-                cache_seqlens=self._kv_len_gpu, block_table=self._block_table,
-                softmax_scale=self.scaling, causal=False,
+                self._kv_len_gpu, self._block_table,
+                self.scaling, False,
             )
             out = out.reshape(bsz, seqlen, self.q_size)
 
         new_cache = kv_len + 1
         return self.o_proj(out), new_cache
+
+    def forward_decode(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        kv_len: int,
+        max_seq_len: int = 512,
+    ) -> torch.Tensor:
+        """Decode-only forward — no control flow, torch.compile fullgraph compatible."""
+        bsz, seqlen, _ = hidden_states.shape
+        q, k, v = self.qkv_proj(hidden_states)
+        q = q.view(bsz, seqlen, self.num_heads, self.head_dim)
+        k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        num_tokens = bsz * seqlen
+        q_flat = q.reshape(num_tokens, self.num_heads, self.head_dim)
+        k_flat = k.reshape(num_tokens, self.num_kv_heads, self.head_dim)
+        torch.ops._C.rotary_embedding(
+            positions, q_flat, k_flat, self.head_dim,
+            self._cos_sin_cache_gpu, is_neox=True,
+        )
+        q = q_flat.view(bsz, seqlen, self.num_heads, self.head_dim)
+        k = k_flat.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        # KV write
+        self._slot_mapping_decode[0] = self._kv_len_gpu[0]
+        k_w = k.reshape(1, self.num_kv_heads, self.head_dim)
+        v_w = v.reshape(1, self.num_kv_heads, self.head_dim)
+        self._key_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
+            0, self._slot_mapping_decode, k_w)
+        self._value_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
+            0, self._slot_mapping_decode, v_w)
+        self._kv_len_gpu[0] += 1
+        # Decode attention
+        q_kv = q.reshape(1, 1, self.num_heads, self.head_dim)
+        out = flash_attn_with_kvcache_op(
+            q_kv, self._key_cache, self._value_cache,
+            self._kv_len_gpu, self._block_table,
+            self.scaling, False,
+        )
+        out = out.reshape(bsz, seqlen, self.q_size)
+        return self.o_proj(out)
 
 
 class QwenMLPTP(nn.Module):
@@ -312,8 +356,7 @@ class QwenMLPTP(nn.Module):
         gate_up = self.gate_up_proj(x)                                 # [B, S, 2*local_inter]
         out = torch.empty(x.shape[0], x.shape[1], self.local_intermediate,
                           dtype=x.dtype, device=x.device)
-        from engine.kernels.vllm_wrappers import silu_and_mul
-        silu_and_mul(out, gate_up)                                     # [B, S, local_inter]
+        torch.ops._C.silu_and_mul(out, gate_up)                        # [B, S, local_inter]
         return self.down_proj(out)
 
 
@@ -346,6 +389,33 @@ class QwenDecoderLayerTP(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual, new_cache
 
+    def forward_decode(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        kv_len: int,
+        max_seq_len: int,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode-only forward — torch.compile fullgraph compatible.
+
+        Handles both first-layer (residual=None) and subsequent-layer paths.
+        Dynamo guards ensure the correct path is compiled based on the warmup input.
+        """
+        # input_layernorm: handle first-layer vs subsequent
+        if residual is None:
+            residual = hidden_states.clone()
+            torch.ops._C.rms_norm(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.eps)
+        else:
+            residual = residual + hidden_states
+            torch.ops._C.rms_norm(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.eps)
+        hidden_states = self.self_attn.forward_decode(hidden_states, positions, kv_len, max_seq_len)
+        # post_attention_layernorm: always fused (residual is always a tensor now)
+        residual = residual + hidden_states
+        torch.ops._C.rms_norm(hidden_states, residual, self.post_attention_layernorm.weight, self.post_attention_layernorm.eps)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
 
 class QwenForCausalLMTP(nn.Module):
     def __init__(self, cfg: QwenTPConfig, *, device: torch.device, dtype: torch.dtype):
@@ -365,7 +435,7 @@ class QwenForCausalLMTP(nn.Module):
         self._graph_input_ids: torch.Tensor | None = None
         self._graph_pos: torch.Tensor | None = None
         self._graph_logits: torch.Tensor | None = None
-        self._cuda_graph_enabled = os.environ.get('META_INFER_CUDA_GRAPH', '1') == '1' and get_tp_size() <= 1
+        self._cuda_graph_enabled = os.environ.get('META_INFER_CUDA_GRAPH', '1') == '1'
 
     # ---- CUDA Graph support ----
     def _set_kv_len_for_layers(self, kv_lens: list[int]) -> None:
@@ -384,6 +454,11 @@ class QwenForCausalLMTP(nn.Module):
         self._graph_pos = pos.clone()
         position_offset = int(pos[0].item())
         past_kv = kv_lens
+
+        # Barrier: all ranks enter capture together (NCCL was used in prev forward)
+        if is_tp_enabled():
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
 
         self._decode_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._decode_graph):
@@ -417,19 +492,26 @@ class QwenForCausalLMTP(nn.Module):
         rank = get_tp_rank()
         hidden_states = self.embed_tokens(input_ids)
         seq_len = input_ids.shape[1]
-        if self.has_decode_graph and torch.cuda.is_current_stream_capturing():
-            pos = self._graph_pos  # use pre-allocated (updated before replay)
-        else:
-            pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
+        pos = self._graph_pos if torch.cuda.is_current_stream_capturing() else torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
 
         residual = None
         new_past_key_values = []
+        is_decode = past_key_values is not None
+        _capturing = torch.cuda.is_current_stream_capturing()
         for i, layer in enumerate(self.layers):
-            layer_cache = past_key_values[i] if past_key_values is not None else None
-            hidden_states, residual, new_cache = layer(
-                hidden_states, pos, layer_cache, max_seq_len=max_seq_len, residual=residual
-            )
-            new_past_key_values.append(new_cache)
+            if is_decode:
+                kv_len = past_key_values[i]
+                hidden_states, residual = layer.forward_decode(
+                    hidden_states, pos, kv_len, max_seq_len=max_seq_len, residual=residual,
+                )
+                # .item() is CPU sync — skip during CUDA Graph capture (kv_lens read from _kv_len_gpu after replay)
+                if not _capturing:
+                    new_past_key_values.append(int(layer.self_attn._kv_len_gpu[0].item()))
+            else:
+                hidden_states, residual, new_cache = layer(
+                    hidden_states, pos, None, max_seq_len=max_seq_len, residual=residual,
+                )
+                new_past_key_values.append(new_cache)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         logits = self.lm_head(hidden_states)
@@ -562,7 +644,52 @@ class QwenTPModelRunner:
         self.model.load_weights()
         self.model.eval()
         init_custom_ar(device=device)
-        # P2: no torch.compile for Qwen (SDPA decode dynamic kv_len)
+
+        # CUDA Graph: compile each layer's decode path with fullgraph=True (vLLM-aligned),
+        # then capture the full decode forward during init.
+        if self.model._cuda_graph_enabled:
+            self._compile_and_capture_cuda_graph(max_seq_len=528)
+
+    def _compile_and_capture_cuda_graph(self, max_seq_len: int = 528) -> None:
+        """vLLM-aligned PIECEWISE: compile each layer with reduce-overhead (per-layer CUDA Graph)."""
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = 128
+
+        rank = get_tp_rank()
+
+        # Step 1: Compile each layer's forward_decode with reduce-overhead
+        #   This gives each layer its own internal CUDA Graph (vLLM PIECEWISE mode).
+        if rank == 0:
+            print("[CUDA Graph] Compiling layer decode paths with reduce-overhead (piecewise CUDA Graph) ...")
+        for i, layer in enumerate(self.model.layers):
+            layer.forward_decode = torch.compile(
+                layer.forward_decode, mode='reduce-overhead', fullgraph=True, dynamic=False,
+            )
+
+        # Step 2: Dummy prefill to create KV caches + resolve lazy GPU transfers
+        dummy_ids = torch.tensor([[0] * 4], dtype=torch.long, device=self.device)
+        kv_lens = [4] * self.cfg.num_hidden_layers
+        self.model._set_kv_len_for_layers([0] * self.cfg.num_hidden_layers)
+        self.model.forward(dummy_ids, past_key_values=None, position_offset=0, max_seq_len=max_seq_len)
+        torch.cuda.synchronize()
+
+        # Step 3: Warmup compiled layers (vLLM: trigger compilation + kernel autotuning + CUDA Graph capture)
+        #   torch.compiler.cudagraph_mark_step_begin() marks step boundaries so reduce-overhead
+        #   knows when KV cache tensors can be safely overwritten.
+        self.model._set_kv_len_for_layers(kv_lens)
+        decode_ids = torch.tensor([[0]], dtype=torch.long, device=self.device)
+        decode_pos = torch.tensor([4], dtype=torch.long, device=self.device)
+        for warmup_step in range(4):
+            torch.compiler.cudagraph_mark_step_begin()
+            self.model.forward(decode_ids, kv_lens, int(decode_pos[0].item()), max_seq_len)
+            kv_lens = [v + 1 for v in kv_lens]
+            self.model._set_kv_len_for_layers(kv_lens)
+        torch.cuda.synchronize()
+        if is_tp_enabled():
+            torch.distributed.barrier()
+
+        if rank == 0:
+            print("[CUDA Graph] Piecewise CUDA Graph capture complete (reduce-overhead per layer).")
 
     @torch.inference_mode()
     def run(
@@ -584,32 +711,20 @@ class QwenTPModelRunner:
                 logits, past_kv = self.model(ids, past_key_values=None, position_offset=0, max_seq_len=max_seq_len)
                 seq.past_key_values = past_kv
                 logits = logits[0, -1, :].unsqueeze(0)
-                seq._decode_step_count = 0; self.model._decode_graph = None  # invalidate graph on new prefill
-            elif self.model.has_decode_graph:
-                new_token = seq.token_ids[-1:]
-                ids = torch.tensor([new_token], dtype=torch.long, device=self.device)
-                position_offset = len(seq.token_ids) - 1
-                pos = torch.tensor([position_offset], dtype=torch.long, device=self.device)
-                logits = self.model.graph_replay(seq.past_key_values, ids, pos)
-                # kv_lens are updated by the graph (_kv_len_gpu incremented inside)
-                seq.past_key_values = [int(layer.self_attn._kv_len_gpu[0].item()) for layer in self.model.layers]
-                logits = logits[0, -1, :].unsqueeze(0)
+                seq._decode_step_count = 0
             else:
+                # vLLM PIECEWISE: mark step boundary so reduce-overhead CUDA Graphs
+                # can safely overwrite intermediate buffers (KV cache, etc.)
+                torch.compiler.cudagraph_mark_step_begin()
                 new_token = seq.token_ids[-1:]
                 ids = torch.tensor([new_token], dtype=torch.long, device=self.device)
                 position_offset = len(seq.token_ids) - 1
-                # Set _kv_len_gpu before forward (required by decode path)
                 self.model._set_kv_len_for_layers(seq.past_key_values)
                 logits, past_kv = self.model(
                     ids, past_key_values=seq.past_key_values, position_offset=position_offset, max_seq_len=max_seq_len
                 )
                 seq.past_key_values = past_kv
                 logits = logits[0, -1, :].unsqueeze(0)
-                # Capture graph after 2 eager warmup steps
-                seq._decode_step_count = seq._decode_step_count + 1
-                if seq._decode_step_count == 2:
-                    pos = torch.tensor([position_offset + 1], dtype=torch.long, device=self.device)
-                    self.model.init_decode_graph(ids, pos, past_kv, max_seq_len)
             next_tokens.append(int(sample_next_tokens(logits, temperature=temperature, top_p=top_p).item()))
         return next_tokens
 

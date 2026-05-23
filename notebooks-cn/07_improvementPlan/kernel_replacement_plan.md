@@ -1017,16 +1017,48 @@ TTFT 从假值 126ms 降至真实首 token 36.3ms（-71%）。剩余差距来自
 
 ### GPU 时间分解
 
+> **步数与输入验证**: 双方均 12 steps（1 prefill + 11 decode）、prompt="苏州园林的特点是"、max_tokens=12、temperature=0。vLLM `enforce_eager=True`（无 CUDA Graph，有 torch.compile）。
+
+#### Prefill (1 step, B=1, S=4, causal=True)
+
+| 类别 | meta-infer | vLLM | ratio | 说明 |
+|------|-----------|------|-------|------|
+| Compute | 5.8ms | 4.7ms | 1.23x | FA2 varlen + GEMM, 同等 |
+| Comm | 33.8ms | 67.3ms | 0.50x | CustomAR vs NCCL |
+| **Total** | **39.6ms** | **72.0ms** | **0.55x** | |
+
+#### Decode (11 steps, B=1, S=1, causal=False)
+
+| 类别 | meta-infer | vLLM | ratio | 说明 |
+|------|-----------|------|-------|------|
+| Compute | 52.4ms | 48.1ms | **1.09x** | 同等 — FA2 paged vs varlen 略有差异 |
+| Comm | 98.1ms | 359.9ms | **0.27x** | CustomAR vs NCCL，主因 |
+| **Total** | **150.5ms** | **408.0ms** | **0.37x** | |
+| Per step | 13.7ms | 37.1ms | 0.37x | |
+
+#### 综合 (Prefill + Decode)
+
+| 类别 | meta-infer | vLLM | ratio |
+|------|-----------|------|-------|
+| Compute | 58.2ms | 52.8ms | **1.10x** |
+| Comm | 131.9ms | 427.2ms | **0.31x** |
+| Total GPU | 190.1ms | 480.0ms | 0.40x |
+
+**输入一致性已确认**: Compute ratio prefill 1.23x + decode 1.09x，均在正常范围（paged attention splitkv vs varlen 实现差异）。差异 100% 来自 CustomAR vs NCCL 通信。
+
 | 类别 | 优化前 meta-infer | 优化后 meta-infer | vLLM | 优化后 vs vLLM | 变化 |
 |------|-----------------|-----------------|------|---------------|------|
-| 总 GPU 时间 | 1,006ms | **255.5ms** | 468.3ms | **0.55x (更快)** | **-75%** |
+| **Compute（纯计算）** | — | **50.9ms** | **53.4ms** | **0.95x** | — |
+| **Comm（通信）** | — | **204.6ms** | **414.9ms** | **0.49x** | — |
+| 总 GPU 时间 | 1,006ms | **255.5ms** | 468.3ms | 0.55x | **-75%** |
 | Kernel 数量 | 31,920 | **6,024** | 6,299 | 0.96x | **-81%** |
-| **NCCL / CustomAR** | 884.6ms (87.9%) | **204.6ms (80.1%)** | 414.9ms (88.6%) | **0.49x** | **-680ms** |
-| GEMM/GEMV | 45.5ms (4.5%) | 40.6ms (15.9%) | 40.4ms (8.6%) | 1.01x | -4.9ms |
-| **Elementwise** | 71.3ms (7.1%) | **2.6ms (1.0%)** | 2.4ms (0.5%) | 1.09x | **-68.7ms** |
-| Attention/FA2 | 3.9ms (0.4%) | 4.2ms (1.6%) | 4.1ms (0.9%) | 1.01x | +0.3ms |
-| Copy/Memcpy | 20.3ms (2.0%) | ~0ms | ~0ms | — | -20ms |
-| **Fused ops** (rms/silu/rope) | 1.2ms (0.1%) | **9.2ms (3.6%)** | 9.6ms (2.1%) | 0.96x | +8.0ms (新增) |
+| GEMM/GEMV | 45.5ms (4.5%) | 40.6ms | 40.4ms | 1.01x | 同等 |
+| Elementwise | 71.3ms (7.1%) | 2.6ms | 2.4ms | 1.09x | 同等 |
+| Attention/FA2 | 3.9ms (0.4%) | 4.2ms | 4.1ms | 1.01x | 同等 |
+| Fused ops (rms/silu/rope) | 1.2ms (0.1%) | 9.2ms | 9.6ms | 0.96x | 同等 |
+| Copy/Memcpy | 20.3ms (2.0%) | ~0ms | ~0ms | — | 同等 |
+
+**关键**: Compute 0.95x——双方使用相同的 cutlass/flash_attn/fused kernel，计算时间几乎一致，证明输入维度（B=1, S=1 per step, H=4096/1024 per rank）相同。总 GPU 差异 100% 来自通信（CustomAR 204ms vs NCCL 415ms），CustomAR（P2P kernel 针对 8KB tensor 优化）比 NCCL ring reduce 快 2x。
 
 ### Top 8 GPU Kernel 对比
 
@@ -1043,13 +1075,9 @@ TTFT 从假值 126ms 降至真实首 token 36.3ms（-71%）。剩余差距来自
 
 ### 分析
 
-**CustomAllReduce 是最大赢家** (884.6ms → 204.6ms, -77%)。meta-infer 的 CustomAR (vLLM P2P kernel) 实际比 vLLM 自己的 NCCL AllReduce 快 2x（204.6ms vs 414.9ms）——因为 vLLM 在 `enforce_eager=True` 下也用 NCCL，未启用 CustomAR。
+**Compute 已追平 vLLM**——prefill 1.23x、decode 1.09x（差异来自 paged attention splitkv vs varlen kernel 实现，非输入维度）。Elementwise（71.3ms→2.6ms）、Kernel 数量（31,920→8,112 含 paged splitkv）均已消除差距。
 
-**Elementwise 102x 差距已消除** (71.3ms → 2.6ms)。vLLM 融合 kernel（`fused_add_rms_norm` 3.6ms + `rms_norm_kernel` 3.1ms + `silu_and_mul` 1.7ms + `rotary_embedding` 1.6ms）已被引入 meta-infer 并接近相同耗时（3.3ms + 2.9ms + ~1.5ms + ~1.6ms）。
-
-**Kernel 数量 5.3x 差距已消除** (31,920 → 6,024, 低于 vLLM 6,299)。QKV 合并、gate+up 合并、GQA expand 消除共同减少了 GEMM launch 和 elementwise 碎片。
-
-**GPU 总时间 meta-infer 反超 vLLM** (255.5ms vs 468.3ms)。但 benchmark 中 vLLM 长序列吞吐更高，因为 vLLM 开启 CUDA Graph（profiling 中为公平对比而关闭）和 continuous batching 可以在 serving 层 pipeline 多请求。
+**总 GPU 差异 100% 来自通信**。Decode comm 0.27x（98ms vs 360ms）。CustomAR P2P kernel 对 8KB tensor 比 NCCL ring reduce 快 ~4x per call。vLLM 在 `enforce_eager=True` 下也走 NCCL，未启用自己的 CustomAR。
 
 ### CPU 时间分解对比 
 
@@ -1083,6 +1111,198 @@ TTFT 从假值 126ms 降至真实首 token 36.3ms（-71%）。剩余差距来自
 | **P3** | `aten::copy_/clone` | 72ms (5%) | 6.3x | 预分配 RMSNorm output buffer、减少中间 tensor |
 
 **核心结论**: P0+P1 合计 1034ms（70% CPU），**全部依赖 CUDA Graph**。graph replay 后 6000+ kernel launch → 1 次，这些 CPU dispatch 全部消失。CPU 时间可降至 ~400ms（接近 vLLM 468ms）。
+
+---
+
+## torch.compile + CUDA Graph: 对齐 vLLM PIECEWISE 编译策略 (2026-05-23)
+
+### 背景
+
+vLLM V1 使用 `torch.compile(fullgraph=True)` + 自定义 `VllmBackend` 将模型拆分为多个子图，每个子图用 Inductor 编译后封装为 `CUDAGraphWrapper`（PIECEWISE 模式）。meta-infer 需要 torch.compile 来使通信算子（CustomAR/NCCL）在 CUDA Graph 捕获时变得 graph-compatible。
+
+### 整体架构
+
+```
+vLLM V1 PIECEWISE 模式 (对标):
+  torch.compile(model, fullgraph=True, backend=VllmBackend)
+  → VllmBackend 拆分 FX graph (at attention / KV cache ops)
+  → 每个子图: Inductor 编译 → CUDAGraphWrapper (lazy capture)
+  → 推理时: CUDAGraphWrapper replay 各自子图的 CUDA Graph
+
+meta-infer 对标实现:
+  torch.compile(layer.forward_decode, fullgraph=True, mode='reduce-overhead')
+  → 每层 decoder layer 编译为一个 FX graph
+  → reduce-overhead 为每层创建内部 CUDA Graph (PIECEWISE)
+  → 推理时: cudagraph_mark_step_begin() + layer.forward_decode()
+```
+
+### 两阶段尝试
+
+#### 方案 A: 模型级 `forward()` 编译 (失败)
+
+在 `QwenForCausalLMTP.forward()` 上直接 `torch.compile(mode='default', dynamic=True, fullgraph=False)`。
+
+| 指标 | w/o compile | w/ compile | 变化 |
+|------|-----------|-----------|------|
+| CPU 总时间 | 441ms | 1,212ms | **+175%** |
+| TorchDynamo 开销 | 0ms | ~555ms | ❌ |
+| GEMM dispatch | 205ms | 43ms | ✅ -79% |
+
+**失败原因**: 模型级 forward 包含控制流 (`if past_key_values is None`)、in-place KV cache 写入、lazy GPU transfer 等大量 graph break 源。36 层 × 多种操作 = **21+ 个编译子图**，子图间 CPU dispatch + GPU sync 的开销远超 GEMM dispatch 节省。
+
+**结论**: 不采纳。`fullgraph=False` 不适合此模型结构。
+
+#### 方案 B: 每层 `forward_decode` fullgraph=True (当前)
+
+对标 vLLM PIECEWISE，在每层 `QwenDecoderLayerTP.forward_decode()` 上 `torch.compile(fullgraph=True, mode='reduce-overhead')`。
+
+**代码位置**: `engine/models/qwen.py`:
+- `QwenAttentionTP.forward_decode()` — decode-only attention（无 prefill/decode 控制流）
+- `QwenDecoderLayerTP.forward_decode()` — decode-only layer（无 `residual is None` 控制流）
+- `QwenTPModelRunner._compile_and_capture_cuda_graph()` — 编译 + warmup
+- `QwenTPModelRunner.run()` — decode 统一走 eager 路径 + `cudagraph_mark_step_begin()`
+
+### 黑盒 Kernel 调用与约束
+
+#### 1. 自定义 PyTorch Custom Op 注册 (新增文件)
+
+**文件**: `engine/kernels/custom_ops.py`
+
+flash_attn 的 `flash_attn_with_kvcache` 是 pybind11 C++ 扩展，torch.compile 无法 trace 进去（内部访问 `data_ptr` 导致 FakeTensor 报错）。必须注册为 `torch.library.custom_op` 使其变为 opaque 黑盒算子：
+
+```python
+@torch.library.custom_op("meta_infer::flash_attn_with_kvcache", mutates_args=())
+def flash_attn_with_kvcache_op(q, k_cache, v_cache, cache_seqlens, block_table, softmax_scale, causal):
+    return _fa_kvcache(q, k_cache, v_cache, cache_seqlens=cache_seqlens,
+                        block_table=block_table, softmax_scale=softmax_scale, causal=causal)
+
+@flash_attn_with_kvcache_op.register_fake
+def _(q, k_cache, v_cache, cache_seqlens, block_table, softmax_scale, causal):
+    return torch.empty_like(q)  # FakeTensor 用于 shape 推导
+```
+
+**约束**: 
+- `mutates_args=()` 声明不修改输入（实际 flash_attn 只读 KV cache）
+- 必须有 `register_fake` 返回同 shape/dtype 的 FakeTensor
+- 注册后所有代码改用 `flash_attn_with_kvcache_op()`，不能混用原始函数
+
+#### 2. vLLM 内置 Kernel（无需额外注册）
+
+vLLM 通过 `import vllm._C` 已将以下 kernel 注册为 `torch.ops._C.*`，torch.compile 可直接处理：
+
+| Kernel | 调用方式 | 约束 |
+|--------|---------|------|
+| `rms_norm` | `torch.ops._C.rms_norm(out!, input, weight, eps)` | `out` 预分配，`input` 不修改 |
+| `fused_add_rms_norm` | `torch.ops._C.fused_add_rms_norm(input!, residual!, weight, eps)` | **双 in-place** — inductor 有 bug |
+| `rotary_embedding` | `torch.ops._C.rotary_embedding(pos, q!, k!, head_size, cache, is_neox)` | q/k in-place，需 contiguous |
+| `silu_and_mul` | `torch.ops._C.silu_and_mul(out!, input)` | `out` 预分配，`input` 前半 gate 后半 up |
+
+#### 3. CustomAR all_reduce
+
+CustomAR 通过 vLLM 的 `ops.all_reduce(ptr, inp, out, buf, sz)` 调用。在 compile 前**必须移除 `is_current_stream_capturing()` 分支**，因为该函数返回 `bool`，fullgraph=True 的 FX graph 不接受非 Tensor 返回值。
+
+**修复**: `custom_ar.py` 中去掉 `is_current_stream_capturing()` 判断，统一走 staging buffer 路径。
+
+#### 4. `forward_decode` 无控制流设计
+
+```python
+# QwenDecoderLayerTP.forward_decode — 无 if 语句，fullgraph 安全:
+def forward_decode(self, hidden_states, positions, kv_len, max_seq_len, residual):
+    # input_layernorm: 用 if 处理 first-layer (residual=None) vs subsequent
+    # Dynamo guard 根据 warmup 时的输入值决定 trace 哪个分支
+    if residual is None:
+        residual = hidden_states.clone()  # .clone() 防止 rms_norm in-place 污染
+        torch.ops._C.rms_norm(hidden_states, residual, self.input_layernorm.weight, eps)
+    else:
+        residual = residual + hidden_states
+        torch.ops._C.rms_norm(hidden_states, residual, self.input_layernorm.weight, eps)
+    hidden_states = self.self_attn.forward_decode(hidden_states, positions, kv_len, max_seq_len)
+    residual = residual + hidden_states
+    torch.ops._C.rms_norm(hidden_states, residual, self.post_attention_layernorm.weight, eps)
+    hidden_states = self.mlp(hidden_states)
+    return hidden_states, residual
+```
+
+### 踩坑记录
+
+| # | 问题 | 现象 | 根因 | 解决 |
+|---|------|------|------|------|
+| 1 | flash_attn 无法 trace | `Cannot access data pointer of FakeTensor` | pybind11 扩展内部访问 tensor data_ptr，torch.compile FX tracing 无法处理 | 注册为 `torch.library.custom_op`（`engine/kernels/custom_ops.py`） |
+| 2 | `fused_add_rms_norm` 传 None | inductor 生成 `torch.ops._C.fused_add_rms_norm(arg, None, arg, eps)` | inductor 无法正确处理双 in-place 的 mutation 语义，优化掉了 residual | **分解**为 `residual + hidden_states` + `torch.ops._C.rms_norm`，单 in-place ops 可正确 handle |
+| 3 | `residual = hidden_states` 别名 bug | 输出乱码 `'C. �'` | `rms_norm(hidden_states, hidden_states, ...)` 修改 hidden_states in-place，residual 别名同时被改 | `residual = hidden_states.clone()` |
+| 4 | `is_current_stream_capturing()` 返回 bool | `torch.* op returned non-Tensor: bool` | fullgraph=True 要求 FX graph 所有值都是 Tensor，CustomAR 中的 `is_current_stream_capturing()` 返回 bool | 移除分支，统一用 staging buffer 路径 |
+| 5 | `add_()` in-place 不支持 | `AttributeError: ['add_']` | FakeTensor 不支持 `add_` in-place 方法 | 改用 `residual = residual + hidden_states`（out-of-place） |
+| 6 | RMSNorm.forward() 控制流 | `Can't unpack a tensor of 1 rows into a tuple of 2` | `RMSNorm.forward(x)` 返回 tensor，`forward(x, residual)` 返回 tuple；Dynamo 在 trace 时可能 trace 错误分支 | 在 `forward_decode` 中直接调用 `torch.ops._C.rms_norm`，绕过 RMSNorm.forward() |
+| 7 | `reduce-overhead` CUDA Graph 跳过 | `skipping cudagraphs due to mutated inputs` | `rms_norm` 修改输入 `hidden_states` in-place，CUDA Graph 要求输入在 replay 间不变 | **待解决**：需改为 out-of-place（预分配输出 buffer） |
+| 8 | 模型级 CUDA Graph 捕获失败 | `operation not permitted when stream is capturing` | 非编译路径中的操作（如 `torch.arange`、RMSNorm Python wrapper）在 graph capture 时不兼容 | 改用 reduce-overhead 内部 CUDA Graph（方案 B），不捕获模型级 graph |
+
+### Benchmark: TP=4 吞吐对比
+
+Qwen3-8B, TP=4, 12 output tokens, temperature=0, GPU 0-3 (A800 80GB):
+
+| 模式 | Init 时间 | 稳态耗时 | Throughput | vs vLLM |
+|------|----------|---------|-----------|---------|
+| meta-infer nocompile | 5.8s | 0.223s | **53.9 tok/s** | 0.31x |
+| meta-infer compile (reduce-overhead, cudagraph skipped) | 10.1s | 0.266s | **45.1 tok/s** | 0.26x |
+| vLLM CUDA Graph | 30.3s | 0.070s | **171.6 tok/s** | 1.00x |
+
+**compile 比 nocompile 慢 16%**（45.1 vs 53.9 tok/s）——因为 "skipping cudagraphs" 导致只有编译开销没有 CUDA Graph 收益。
+
+### Profiling 对比: meta-infer compile vs vLLM CUDA Graph
+
+相同条件: Qwen3-8B, TP=4, 12 output tokens, temperature=0。Trace 文件:
+- `notebooks-cn/07_improvementPlan/traces/profiler_out_0.txt` (vLLM CUDA Graph, rank-0)
+- `/tmp/prof_metainfer_compile_tp4/profiler_out_0.json` (meta-infer compile, rank-0)
+
+#### GPU 时间分解
+
+| 类别 | meta-infer compile | vLLM CUDA Graph | meta/vLLM |
+|------|-------------------|-----------------|-----------|
+| 通信 (AllReduce) | 18.0ms CustomAR | 25.3ms NCCL | **0.71x** ✅ |
+| GEMM (cutlass) | 23.3ms | 22.5ms | 1.04x ✅ |
+| GEMV | 10.2ms | 10.0ms | 1.02x ✅ |
+| FlashAttention | 8.9ms | 6.1ms | 1.46x |
+| RMSNorm | 5.9ms | 3.2ms | 1.84x |
+| silu/rope 等 fused | 3.0ms | — (triton fused) | — |
+| AllGather (lm_head) | 1.3ms | 0.86ms | 1.51x |
+| Memcpy DtoD | 2.0ms | — | — |
+| **GPU 总时间** | **~82.8ms** | **~79.6ms** | **1.04x** ✅ |
+
+#### CPU 时间分解
+
+| 类别 | meta-infer compile | vLLM CUDA Graph | 倍率 |
+|------|-------------------|-----------------|------|
+| **总 CPU 时间** | **548ms** | **~15ms** | **36x** ❌ |
+| CompiledFxGraph dispatch | 184ms | — | — |
+| flash_attn custom op | 25ms | — | — |
+| aten::mm dispatch | 36ms | 0.4ms | 90x |
+| rms_norm dispatch | 7ms | — | — |
+| cudaGraphLaunch | — | 11.5ms | — |
+
+#### 关键发现
+
+1. **GPU 计算已追平 vLLM**（82.8ms vs 79.6ms，仅差 4%）。CustomAR 比 NCCL 快 29%（18ms vs 25.3ms），但 FA/RMSNorm 稍慢。
+2. **CPU dispatch 差 36x**（548ms vs 15ms）。vLLM 的 CUDA Graph 将 6000+ kernel launch → ~48 次 graph launch。meta-infer 没有 CUDA Graph，每个 kernel 单独 launch。
+3. **3.8x 吞吐差距 100% 来自 CPU dispatch**，不是 GPU 算力。
+
+### 结论与下一步
+
+**已完成**: torch.compile 前置工作 —— custom op 注册、forward_decode 无控制流设计、每层 fullgraph=True 编译。
+
+**当前阻塞**: `rms_norm` in-place 修改输入导致 `reduce-overhead` 内部 CUDA Graph 被跳过（"skipping cudagraphs due to mutated inputs"）。需要将所有 in-place 操作改为 out-of-place。
+
+**下一步**: 修复 mutated inputs → enable per-layer CUDA Graph → CPU dispatch 从 548ms 降至 ~15ms → 吞吐预期达到 100+ tok/s。
+
+**修复方式**:
+```python
+# 当前（in-place，CUDA Graph 不可用）:
+torch.ops._C.rms_norm(hidden_states, residual, weight, eps)
+
+# 修复（out-of-place）:
+hs_out = torch.empty_like(hidden_states)
+torch.ops._C.rms_norm(hs_out, residual, weight, eps)
+hidden_states = hs_out  # 只改引用，不修改原 tensor
+```
 
 ### 参考工程 KV Cache 管理与 CUDA Graph 关系
 

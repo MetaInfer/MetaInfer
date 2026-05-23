@@ -18,6 +18,7 @@ class CustomAllReduceHandle:
     def __init__(self, group: dist.ProcessGroup, device: torch.device, max_size: int):
         self._ptr: int = 0
         self._disposed = False
+        self._gloo_group = group  # stored for register_graph_buffers
         rank = dist.get_rank(group)
         world_size = dist.get_world_size(group)
 
@@ -46,7 +47,7 @@ class CustomAllReduceHandle:
         ops.register_buffer(self._ptr, self._buf_ptrs)
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        """Out-of-place all_reduce via P2P kernel."""
+        """Out-of-place all_reduce via P2P kernel (staging buffer)."""
         if self._ptr == 0:
             return inp
         out = torch.empty_like(inp)
@@ -55,6 +56,21 @@ class CustomAllReduceHandle:
             self._buf_ptrs[dist.get_rank()], self._max_size,
         )
         return out
+
+    def register_graph_buffers(self) -> None:
+        """Register graph buffers for P2P address tracking. Call after capture."""
+        if self._ptr == 0:
+            return
+        handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
+        world_size = dist.get_world_size(group=self._gloo_group)
+        rank = dist.get_rank(group=self._gloo_group)
+        all_data = [[None, None] for _ in range(world_size)]
+        all_data[rank] = [handle, offset]
+        for src in range(world_size):
+            dist.broadcast_object_list(all_data[src], src=src, group=self._gloo_group, device="cpu")
+        handles = [d[0] for d in all_data]
+        offsets = [d[1] for d in all_data]
+        ops.register_graph_buffers(self._ptr, handles, offsets)
 
     def close(self):
         if self._ptr and not self._disposed:
