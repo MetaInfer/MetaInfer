@@ -72,7 +72,7 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
     if not is_tp_enabled():
         return x
     if _custom_ar_handle is not None:
-        return _custom_ar_handle.all_reduce(x)
+        return _custom_ar_handle.custom_all_reduce(x)
     dist.all_reduce(x, op=dist.ReduceOp.SUM)
     return x
 

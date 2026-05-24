@@ -13,12 +13,16 @@ from vllm import _custom_ops as ops
 
 
 class CustomAllReduceHandle:
-    """Per-rank state for vLLM P2P CustomAllReduce."""
+    """Per-rank state for vLLM P2P CustomAllReduce.
+
+    Black-box extracted from vllm/distributed/device_communicators/custom_all_reduce.py.
+    """
 
     def __init__(self, group: dist.ProcessGroup, device: torch.device, max_size: int):
         self._ptr: int = 0
         self._disposed = False
         self._gloo_group = group  # stored for register_graph_buffers
+        self._IS_CAPTURING: bool = False  # vLLM :199-211 capture() context flag
         rank = dist.get_rank(group)
         world_size = dist.get_world_size(group)
 
@@ -46,19 +50,61 @@ class CustomAllReduceHandle:
         self._ptr = ops.init_custom_ar(self._meta_ptrs, self._rank_data, rank, fully_connected)
         ops.register_buffer(self._ptr, self._buf_ptrs)
 
-    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        """Out-of-place all_reduce via P2P kernel (staging buffer)."""
+    # ---- vLLM-aligned black-box interface ----
+
+    def all_reduce(
+        self, inp: torch.Tensor, *, out: torch.Tensor = None, registered: bool = False
+    ) -> torch.Tensor:
+        """Out-of-place all_reduce via P2P kernel.
+
+        Aligned with vLLM custom_all_reduce.py:247-264.
+        - registered=True: uses pre-registered IPC buffer (CUDA Graph path)
+        - registered=False: copies into staging buffer first (eager path)
+        """
         if self._ptr == 0:
             return inp
-        out = torch.empty_like(inp)
-        ops.all_reduce(
-            self._ptr, inp, out,
-            self._buf_ptrs[dist.get_rank()], self._max_size,
-        )
+        if out is None:
+            out = torch.empty_like(inp)
+        if registered:
+            ops.all_reduce(self._ptr, inp, out, 0, 0)
+        else:
+            ops.all_reduce(
+                self._ptr, inp, out,
+                self._buf_ptrs[dist.get_rank()], self._max_size,
+            )
         return out
 
+    def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        """Dispatch: registered mode during CUDA Graph capture, staging buffer otherwise.
+
+        Aligned with vLLM custom_all_reduce.py:266-282.
+        """
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.all_reduce(inp, registered=True)
+            else:
+                return torch.empty_like(inp)  # warmup: mimic allocation pattern
+        else:
+            return self.all_reduce(inp, registered=False)
+
+    def capture(self):
+        """Context manager: set _IS_CAPTURING flag, auto-register graph buffers on exit.
+
+        Aligned with vLLM custom_all_reduce.py:199-211.
+        """
+        try:
+            self._IS_CAPTURING = True
+            yield
+        finally:
+            self._IS_CAPTURING = False
+            if not self._disposed:
+                self.register_graph_buffers()
+
     def register_graph_buffers(self) -> None:
-        """Register graph buffers for P2P address tracking. Call after capture."""
+        """Register graph buffers for P2P address tracking. Call after capture.
+
+        Aligned with vLLM custom_all_reduce.py:213-230.
+        """
         if self._ptr == 0:
             return
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)

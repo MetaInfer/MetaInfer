@@ -402,17 +402,15 @@ class QwenDecoderLayerTP(nn.Module):
         Handles both first-layer (residual=None) and subsequent-layer paths.
         Dynamo guards ensure the correct path is compiled based on the warmup input.
         """
-        # input_layernorm: handle first-layer vs subsequent
+        # input_layernorm: first-layer (residual=None) vs subsequent
         if residual is None:
             residual = hidden_states.clone()
-            torch.ops._C.rms_norm(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.eps)
+            rms_norm(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.eps)
         else:
-            residual = residual + hidden_states
-            torch.ops._C.rms_norm(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.eps)
+            fused_add_rms_norm(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.eps)
         hidden_states = self.self_attn.forward_decode(hidden_states, positions, kv_len, max_seq_len)
-        # post_attention_layernorm: always fused (residual is always a tensor now)
-        residual = residual + hidden_states
-        torch.ops._C.rms_norm(hidden_states, residual, self.post_attention_layernorm.weight, self.post_attention_layernorm.eps)
+        # post_attention_layernorm: always fused (residual is always a tensor here)
+        fused_add_rms_norm(hidden_states, residual, self.post_attention_layernorm.weight, self.post_attention_layernorm.eps)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -430,47 +428,10 @@ class QwenForCausalLMTP(nn.Module):
         self.lm_head = ParallelLMHead(cfg.hidden_size, cfg.vocab_size, gather_output=True)
         self.to(device=device, dtype=dtype)
 
-        # CUDA Graph for decode
-        self._decode_graph: torch.cuda.CUDAGraph | None = None
-        self._graph_input_ids: torch.Tensor | None = None
-        self._graph_pos: torch.Tensor | None = None
-        self._graph_logits: torch.Tensor | None = None
-        self._cuda_graph_enabled = os.environ.get('META_INFER_CUDA_GRAPH', '1') == '1'
-
-    # ---- CUDA Graph support ----
     def _set_kv_len_for_layers(self, kv_lens: list[int]) -> None:
+        """Set _kv_len_gpu on each attention layer before decode forward."""
         for i, layer in enumerate(self.layers):
             layer.self_attn._kv_len_gpu[0] = kv_lens[i]
-
-    @property
-    def has_decode_graph(self) -> bool:
-        return self._decode_graph is not None
-
-    def init_decode_graph(self, input_ids: torch.Tensor, pos: torch.Tensor, kv_lens: list[int], max_seq_len: int) -> None:
-        if not self._cuda_graph_enabled:
-            return
-        self._set_kv_len_for_layers(kv_lens)
-        self._graph_input_ids = input_ids.clone()
-        self._graph_pos = pos.clone()
-        position_offset = int(pos[0].item())
-        past_kv = kv_lens
-
-        # Barrier: all ranks enter capture together (NCCL was used in prev forward)
-        if is_tp_enabled():
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-
-        self._decode_graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._decode_graph):
-            logits, _ = self.forward(self._graph_input_ids, past_kv, position_offset, max_seq_len)
-            self._graph_logits = logits
-
-    def graph_replay(self, kv_lens: list[int], input_ids: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-        self._set_kv_len_for_layers(kv_lens)
-        self._graph_input_ids.copy_(input_ids)
-        self._graph_pos.copy_(pos)
-        self._decode_graph.replay()
-        return self._graph_logits
 
     @torch.inference_mode()
     def forward(
@@ -480,38 +441,18 @@ class QwenForCausalLMTP(nn.Module):
         position_offset: int = 0,
         max_seq_len: int = 512,
     ) -> tuple[torch.Tensor, list[tuple]]:
-        """Forward with optional KV cache.
-
-        Args:
-            input_ids: [B, seq_len] token ids
-            past_key_values: list of per-layer cache tuples, or None for prefill
-            position_offset: starting position for the tokens
-        Returns:
-            (logits, new_past_key_values)
-        """
-        rank = get_tp_rank()
         hidden_states = self.embed_tokens(input_ids)
         seq_len = input_ids.shape[1]
-        pos = self._graph_pos if torch.cuda.is_current_stream_capturing() else torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
+        pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
 
         residual = None
         new_past_key_values = []
-        is_decode = past_key_values is not None
-        _capturing = torch.cuda.is_current_stream_capturing()
         for i, layer in enumerate(self.layers):
-            if is_decode:
-                kv_len = past_key_values[i]
-                hidden_states, residual = layer.forward_decode(
-                    hidden_states, pos, kv_len, max_seq_len=max_seq_len, residual=residual,
-                )
-                # .item() is CPU sync — skip during CUDA Graph capture (kv_lens read from _kv_len_gpu after replay)
-                if not _capturing:
-                    new_past_key_values.append(int(layer.self_attn._kv_len_gpu[0].item()))
-            else:
-                hidden_states, residual, new_cache = layer(
-                    hidden_states, pos, None, max_seq_len=max_seq_len, residual=residual,
-                )
-                new_past_key_values.append(new_cache)
+            layer_cache = past_key_values[i] if past_key_values is not None else None
+            hidden_states, residual, new_cache = layer(
+                hidden_states, pos, layer_cache, max_seq_len=max_seq_len, residual=residual,
+            )
+            new_past_key_values.append(new_cache)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         logits = self.lm_head(hidden_states)
@@ -645,52 +586,6 @@ class QwenTPModelRunner:
         self.model.eval()
         init_custom_ar(device=device)
 
-        # CUDA Graph: compile each layer's decode path with fullgraph=True (vLLM-aligned),
-        # then capture the full decode forward during init.
-        if self.model._cuda_graph_enabled:
-            self._compile_and_capture_cuda_graph(max_seq_len=528)
-
-    def _compile_and_capture_cuda_graph(self, max_seq_len: int = 528) -> None:
-        """vLLM-aligned PIECEWISE: compile each layer with reduce-overhead (per-layer CUDA Graph)."""
-        import torch._dynamo
-        torch._dynamo.config.cache_size_limit = 128
-
-        rank = get_tp_rank()
-
-        # Step 1: Compile each layer's forward_decode with reduce-overhead
-        #   This gives each layer its own internal CUDA Graph (vLLM PIECEWISE mode).
-        if rank == 0:
-            print("[CUDA Graph] Compiling layer decode paths with reduce-overhead (piecewise CUDA Graph) ...")
-        for i, layer in enumerate(self.model.layers):
-            layer.forward_decode = torch.compile(
-                layer.forward_decode, mode='reduce-overhead', fullgraph=True, dynamic=False,
-            )
-
-        # Step 2: Dummy prefill to create KV caches + resolve lazy GPU transfers
-        dummy_ids = torch.tensor([[0] * 4], dtype=torch.long, device=self.device)
-        kv_lens = [4] * self.cfg.num_hidden_layers
-        self.model._set_kv_len_for_layers([0] * self.cfg.num_hidden_layers)
-        self.model.forward(dummy_ids, past_key_values=None, position_offset=0, max_seq_len=max_seq_len)
-        torch.cuda.synchronize()
-
-        # Step 3: Warmup compiled layers (vLLM: trigger compilation + kernel autotuning + CUDA Graph capture)
-        #   torch.compiler.cudagraph_mark_step_begin() marks step boundaries so reduce-overhead
-        #   knows when KV cache tensors can be safely overwritten.
-        self.model._set_kv_len_for_layers(kv_lens)
-        decode_ids = torch.tensor([[0]], dtype=torch.long, device=self.device)
-        decode_pos = torch.tensor([4], dtype=torch.long, device=self.device)
-        for warmup_step in range(4):
-            torch.compiler.cudagraph_mark_step_begin()
-            self.model.forward(decode_ids, kv_lens, int(decode_pos[0].item()), max_seq_len)
-            kv_lens = [v + 1 for v in kv_lens]
-            self.model._set_kv_len_for_layers(kv_lens)
-        torch.cuda.synchronize()
-        if is_tp_enabled():
-            torch.distributed.barrier()
-
-        if rank == 0:
-            print("[CUDA Graph] Piecewise CUDA Graph capture complete (reduce-overhead per layer).")
-
     @torch.inference_mode()
     def run(
         self,
@@ -711,11 +606,7 @@ class QwenTPModelRunner:
                 logits, past_kv = self.model(ids, past_key_values=None, position_offset=0, max_seq_len=max_seq_len)
                 seq.past_key_values = past_kv
                 logits = logits[0, -1, :].unsqueeze(0)
-                seq._decode_step_count = 0
             else:
-                # vLLM PIECEWISE: mark step boundary so reduce-overhead CUDA Graphs
-                # can safely overwrite intermediate buffers (KV cache, etc.)
-                torch.compiler.cudagraph_mark_step_begin()
                 new_token = seq.token_ids[-1:]
                 ids = torch.tensor([new_token], dtype=torch.long, device=self.device)
                 position_offset = len(seq.token_ids) - 1
