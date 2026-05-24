@@ -33,6 +33,7 @@ from engine.tp_layers import (
     init_tp_distributed,
     is_tp_enabled,
 )
+from engine.tp_layers.cuda_graph_wrapper import CUDAGraphWrapper
 
 
 @dataclass
@@ -428,6 +429,17 @@ class QwenForCausalLMTP(nn.Module):
         self.lm_head = ParallelLMHead(cfg.hidden_size, cfg.vocab_size, gather_output=True)
         self.to(device=device, dtype=dtype)
 
+        # Static buffers for CUDA Graph input (pre-allocated, fixed data_ptr)
+        self._graph_pos: torch.Tensor | None = None
+        self._graph_input_ids: torch.Tensor | None = None
+
+    def _ensure_graph_inputs(self, device: torch.device) -> None:
+        """One-time allocation of static graph input buffers."""
+        if self._graph_pos is None:
+            self._graph_pos = torch.zeros(1, dtype=torch.long, device=device)
+        if self._graph_input_ids is None:
+            self._graph_input_ids = torch.zeros(1, 1, dtype=torch.long, device=device)
+
     def _set_kv_len_for_layers(self, kv_lens: list[int]) -> None:
         """Set _kv_len_gpu on each attention layer before decode forward."""
         for i, layer in enumerate(self.layers):
@@ -443,7 +455,11 @@ class QwenForCausalLMTP(nn.Module):
     ) -> tuple[torch.Tensor, list[tuple]]:
         hidden_states = self.embed_tokens(input_ids)
         seq_len = input_ids.shape[1]
-        pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
+        # Use static buffer during CUDA Graph capture; eager otherwise
+        if torch.cuda.is_current_stream_capturing() and self._graph_pos is not None:
+            pos = self._graph_pos
+        else:
+            pos = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
 
         residual = None
         new_past_key_values = []
@@ -585,6 +601,65 @@ class QwenTPModelRunner:
         self.model.load_weights()
         self.model.eval()
         init_custom_ar(device=device)
+
+        # CUDA Graph PIECEWISE: torch.compile + CUDAGraphWrapper per layer
+        self._cuda_graph_enabled = os.environ.get('META_INFER_CUDA_GRAPH', '1') == '1'
+        if self._cuda_graph_enabled:
+            self._setup_cuda_graph_piecewise(max_seq_len=528)
+
+    def _setup_cuda_graph_piecewise(self, max_seq_len: int = 528) -> None:
+        """vLLM-aligned PIECEWISE: torch.compile each layer + CUDAGraphWrapper.
+
+        Order: compile -> warmup (trigger inductor + autotune) -> capture (CUDAGraphWrapper).
+        All ranks naturally sync during init — no explicit barrier needed for single GPU.
+        """
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = 128
+
+        rank = get_tp_rank()
+        if rank == 0:
+            print("[CUDA Graph] Compiling layer decode paths with fullgraph=True ...")
+
+        # Step 1: Pre-allocate static graph input buffers
+        self.model._ensure_graph_inputs(self.device)
+
+        # Step 2: torch.compile + CUDAGraphWrapper per layer
+        for i, layer in enumerate(self.model.layers):
+            compiled = torch.compile(
+                layer.forward_decode, fullgraph=True, dynamic=False,
+            )
+            layer.forward_decode = CUDAGraphWrapper(
+                compiled, debug_mode=os.environ.get('META_INFER_DEBUG', '0') == '1',
+            )
+
+        # Step 3: Dummy prefill to create KV caches
+        dummy_ids = torch.tensor([[0] * 4], dtype=torch.long, device=self.device)
+        self.model._set_kv_len_for_layers([0] * self.cfg.num_hidden_layers)
+        self.model.forward(dummy_ids, past_key_values=None, position_offset=0, max_seq_len=max_seq_len)
+        torch.cuda.synchronize()
+        if is_tp_enabled():
+            torch.distributed.barrier()
+
+        # Step 4: Warmup decode steps — trigger torch.compile + autotune + graph capture
+        kv_lens = [4] * self.cfg.num_hidden_layers
+        decode_ids = torch.tensor([[0]], dtype=torch.long, device=self.device)
+        for warmup_step in range(3):
+            pos_val = 4 + warmup_step
+            self.model._graph_pos.copy_(torch.tensor([pos_val], device=self.device))
+            self.model._set_kv_len_for_layers(kv_lens)
+            self.model.forward(
+                decode_ids, past_key_values=kv_lens,
+                position_offset=pos_val, max_seq_len=max_seq_len,
+            )
+            kv_lens = [v + 1 for v in kv_lens]
+        torch.cuda.synchronize()
+        if is_tp_enabled():
+            torch.distributed.barrier()
+
+        if rank == 0:
+            captures = sum(1 for l in self.model.layers
+                          if hasattr(l.forward_decode, 'is_captured') and l.forward_decode.is_captured)
+            print(f"[CUDA Graph] {captures}/36 layers compiled + captured (PIECEWISE mode)")
 
     @torch.inference_mode()
     def run(
