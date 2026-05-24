@@ -620,19 +620,19 @@ class QwenTPModelRunner:
         if rank == 0:
             print("[CUDA Graph] Compiling layer decode paths with fullgraph=True ...")
 
-        # Step 1: Pre-allocate static graph input buffers
+        # Pre-allocate static graph input buffers
         self.model._ensure_graph_inputs(self.device)
 
-        # Step 2: torch.compile + CUDAGraphWrapper per layer
+        # Step 2: torch.compile each layer, eager-warmup to trigger Dynamo+inductor
+        #   (compilation must happen OUTSIDE torch.cuda.graph() — Dynamo accesses RNG state)
+        compiled_layers = []
         for i, layer in enumerate(self.model.layers):
             compiled = torch.compile(
                 layer.forward_decode, fullgraph=True, dynamic=False,
             )
-            layer.forward_decode = CUDAGraphWrapper(
-                compiled, debug_mode=os.environ.get('META_INFER_DEBUG', '0') == '1',
-            )
+            compiled_layers.append(compiled)
 
-        # Step 3: Dummy prefill to create KV caches
+        # Step 3: Dummy prefill to create KV caches (needed for eager warmup)
         dummy_ids = torch.tensor([[0] * 4], dtype=torch.long, device=self.device)
         self.model._set_kv_len_for_layers([0] * self.cfg.num_hidden_layers)
         self.model.forward(dummy_ids, past_key_values=None, position_offset=0, max_seq_len=max_seq_len)
@@ -640,13 +640,32 @@ class QwenTPModelRunner:
         if is_tp_enabled():
             torch.distributed.barrier()
 
-        # Step 4: Warmup decode steps — trigger torch.compile + autotune + graph capture
+        # Step 4: Eager warmup — trigger Dynamo tracing + inductor compilation OUTSIDE graph
         kv_lens = [4] * self.cfg.num_hidden_layers
         decode_ids = torch.tensor([[0]], dtype=torch.long, device=self.device)
-        for warmup_step in range(3):
-            pos_val = 4 + warmup_step
+        self.model._set_kv_len_for_layers(kv_lens)
+        # Temporarily replace forward_decode with raw compiled (not wrapped) for eager warmup
+        for i, layer in enumerate(self.model.layers):
+            layer.forward_decode = compiled_layers[i]
+        self.model.forward(
+            decode_ids, past_key_values=kv_lens,
+            position_offset=4, max_seq_len=max_seq_len,
+        )
+        torch.cuda.synchronize()
+
+        # Step 5: Wrap with CUDAGraphWrapper (compiled code is ready, capture will succeed)
+        for i, layer in enumerate(self.model.layers):
+            layer.forward_decode = CUDAGraphWrapper(
+                compiled_layers[i],
+                debug_mode=os.environ.get('META_INFER_DEBUG', '0') == '1',
+            )
+
+        # Step 6: Warmup decode — trigger CUDAGraphWrapper capture (compilation already done)
+        kv_lens = [5] * self.cfg.num_hidden_layers  # kv_len advanced from step 4
+        self.model._set_kv_len_for_layers(kv_lens)
+        for warmup_step in range(2):
+            pos_val = 5 + warmup_step
             self.model._graph_pos.copy_(torch.tensor([pos_val], device=self.device))
-            self.model._set_kv_len_for_layers(kv_lens)
             self.model.forward(
                 decode_ids, past_key_values=kv_lens,
                 position_offset=pos_val, max_seq_len=max_seq_len,
