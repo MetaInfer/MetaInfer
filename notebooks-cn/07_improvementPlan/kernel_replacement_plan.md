@@ -626,9 +626,49 @@ Stage 0: 提取代码片段 + cos_sin_cache → 本计划文档中的 Snippets A
 
 ---
 
-## 六、验证 SOP (每个 Stage 必须执行)
+### 当前最佳表现: meta-infer nocompile vs vLLM (2026-05-23)
 
-### 6.1 单元测试
+> **环境**: Qwen3-8B, TP=4, GPU 0-3 (A800 80GB), 12 output tokens, temperature=0
+> **meta-infer 版本**: `META_INFER_CUDA_GRAPH=0`, commit `2e1eb8b` / clean baseline `4e352e0`
+> **运行方式**: `CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4`
+
+#### vs vLLM enforce_eager (无 CUDA Graph)
+
+| 指标 | meta-infer | vLLM enforce_eager | meta/vLLM |
+|------|-----------|-------------------|-----------|
+| **GPU 总时间** | **305ms** | 480ms | **0.64x** ✅ |
+| — 通信 (AllReduce) | 18ms (CustomAR) | 427ms (NCCL) | **0.04x** |
+| — 计算 | 58ms | 53ms | 1.10x |
+| **CPU 总时间** | **441ms** | 468ms | **0.94x** ✅ |
+| **Throughput** | **53.9 tok/s** | — | — |
+
+GPU 快是因为 CustomAR P2P kernel 比 NCCL ring reduce 对小 tensor 快 ~4x/次。
+CPU 略快是因为 meta-infer 轻量 Python 调度链路比 vLLM 的 C++ scheduler + torch.compile dispatch 更直接。
+
+#### vs vLLM CUDA Graph (开启)
+
+| 指标 | meta-infer nocompile | vLLM CUDA Graph | meta/vLLM |
+|------|---------------------|-----------------|-----------|
+| GPU 时间 | 305ms | **80ms** | 3.81x |
+| CPU 时间 | 441ms | **15ms** | 29.4x |
+| **Throughput** | 53.9 tok/s | **171.6 tok/s** | 0.31x |
+
+差距 100% 来自 CUDA Graph——vLLM 把 6000+ kernel launch 合并为 ~48 次 graph replay。
+
+#### Git 回退
+
+```bash
+# 回退到 nocompile 最佳版本（无 torch.compile 代码）
+git checkout 4e352e0
+
+# 或者在当前 commit 上禁用 CUDA Graph
+META_INFER_CUDA_GRAPH=0 torchrun --nproc_per_node=4 ...
+```
+
+两个版本的性能等价（当前 commit 的 `META_INFER_CUDA_GRAPH=0` 路径与 `4e352e0` 的 eager 路径核心计算一致）。
+
+---
+
 
 ```python
 # 每个 Snippet 都要验证: 标品输出 == PyTorch 原生输出

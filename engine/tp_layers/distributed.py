@@ -68,10 +68,21 @@ def ensure_divisible(value: int, divisor: int, *, name: str) -> None:
         raise ValueError(f"{name}={value} is not divisible by tp_size={divisor}")
 
 
-def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
+# Module-level flag: set True before CUDA Graph capture. Routes CustomAR
+# to registered=True path (P2P direct, no staging buffer copy) for graph compatibility.
+# vLLM-aligned: parallel_state.py wraps capture with ca_comm.capture() context.
+_graph_capture_mode: bool = False
+
+
+def all_reduce_sum(x: torch.Tensor, *, force_nccl: bool = False) -> torch.Tensor:
+    """All-reduce.
+
+    Eager path: CustomAR (faster). CUDA Graph path: NCCL (Trace-verified).
+    vLLM Trace: 876 NCCL all_reduce inside CUDA Graphs, 0 CustomAR (TF-1, TF-2).
+    """
     if not is_tp_enabled():
         return x
-    if _custom_ar_handle is not None:
+    if _custom_ar_handle is not None and not force_nccl:
         return _custom_ar_handle.custom_all_reduce(x)
     dist.all_reduce(x, op=dist.ReduceOp.SUM)
     return x
