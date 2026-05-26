@@ -52,11 +52,6 @@ class CustomAllReduceHandle:
         self._ptr = ops.init_custom_ar(self._meta_ptrs, self._rank_data, rank, fully_connected)
         ops.register_buffer(self._ptr, self._buf_ptrs)
 
-        # Pre-allocated output buffer for graph-safe all_reduce.
-        # torch.empty_like during CUDA Graph capture allocates from graph pool
-        # with unstable addresses across replay. Caching here fixes data_ptr.
-        self._out_buf: torch.Tensor | None = None
-
     # ---- vLLM-aligned black-box interface ----
 
     def all_reduce(
@@ -67,16 +62,11 @@ class CustomAllReduceHandle:
         Aligned with vLLM custom_all_reduce.py:247-264.
         - registered=True: uses pre-registered IPC buffer (CUDA Graph path)
         - registered=False: copies into staging buffer first (eager path)
-
-        Uses cached _out_buf to avoid torch.empty_like during CUDA Graph capture.
         """
         if self._ptr == 0:
             return inp
         if out is None:
-            # Reuse cached buffer to avoid allocation during graph capture
-            if self._out_buf is None or self._out_buf.shape != inp.shape:
-                self._out_buf = torch.empty_like(inp)
-            out = self._out_buf
+            out = torch.empty_like(inp)
         if registered:
             ops.all_reduce(self._ptr, inp, out, 0, 0)
         else:

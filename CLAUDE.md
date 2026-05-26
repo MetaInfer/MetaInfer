@@ -3,7 +3,18 @@
 ## 1. 项目目标
 
 将自研推理引擎 `meta-infer` 的吞吐率从 baseline 2.15 tok/s 优化至接近 vLLM 水平。
-当前已完成 5.93x 提升（2.15 → 12.75 tok/s），正在进行 Flash Attention 集成。
+当前已实现 Qwen3-8B TP=4 nocompile **55.7 tok/s**（~26x vs baseline），与 vLLM CUDA Graph（166.8 tok/s）差距来自 CUDA Graph 未在 TP=4 启用。
+
+## 2. 优化阶段总览
+
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| Stage 1-7 (kernel_replacement_plan.md) | 7 个 vLLM 黑盒 kernel 替换 | ✅ 全部完成 |
+| Stage A (cuda_graph_plan.md) | 伪图代码清理、CustomAR 接口恢复 | ✅ 已完成 |
+| Stage B | CUDAGraphWrapper + torch.compile 单 GPU | ✅ 已完成 |
+| Stage C | 单 GPU 10K replay 压测 + clone 回归修复 | ✅ 已完成 |
+| Stage D (阶段三) | TP=4 CUDA Graph（all_reduce_sum 入图） | 🔴 待实施 |
+| P4 Continuous Batching | 代码已提交，未激活 | ⏸ 暂停 |
 
 ## 2. 代码位置
 
@@ -49,54 +60,9 @@
 | P4 | Continuous Batching | - | 代码已提交，未激活 |
 | P5 | TP 通信优化 | 8.87 | 完成 |
 
-## 5. 当前待解决问题：P3-FA Flash Attention
+## 5. 已解决：P3-FA Flash Attention
 
-### 5.1 目标
-
-将 decode 路径的 `F.scaled_dot_product_attention` 替换为 `flash_attn_varlen_func`，
-消除 `attn_mask` 分配开销，利用 flash kernel 的 IO-aware tiling 加速。
-
-### 5.2 当前实现状态
-
-**Qwen (已完成，无回退)**:
-- Prefill + Decode 均使用 `flash_attn_varlen_func` 直接调用
-- 3D ragged 格式 `[total_tokens, nheads, headdim]`，无需 permute
-- 代码位置: `engine/models/qwen.py` `QwenAttentionTP.forward()`
-
-**DeepSeek-V2 (P3-Triton MLA Decode)**:
-- Prefill: FA2 + V-padding（不变）
-- Decode: Triton MLA kernel — `engine/kernels/triton_mla_decode.py`
-- 统一 KV cache: `[B, max_seq_len, 1, kv_lora_rank + rope_dim]` 存储 `[c_kv | k_pe_rope]`
-- Q 投影: `q_nope @ W_UK_T → q_nope_proj` (潜空间)
-- 输出扩展: `out_latent @ W_UV → out` (v_head_dim 空间)
-- Scaling: `1/sqrt(qk_head_dim) = 1/sqrt(192)` (与 vLLM 一致)
-- k_pe 在存入 cache 前应用 RoPE（关键修复）
-- 代码位置: `engine/models/deepseek_v2.py` `DeepseekAttentionTP.forward()`
-
-### 5.3 尝试过的方案与回退原因
-
-| 方案 | DeepSeek 策略 | 结果 | 回退原因 |
-|------|-------------|------|---------|
-| A | 切片 KV + SDPA 无 mask | -20% | torch.compile 动态 shape 重编译 |
-| B | 切片 KV + SDPA + 去 attn compile | -12% | 切片开销 > 消除 attn_mask 收益 |
-| C (当前) | V-padding + flash_attn_varlen_func | -15% | F.pad/unpad 开销 + full buffer 浪费 |
-
-### 5.4 关键技术约束
-
-- **GPU**: A800 (SM80, Ampere) → 仅支持 FA2（FA3 需 SM90 Hopper）
-- **FA2 最大 headdim**: 256
-- **DeepSeek-V2-Lite MLA**: QK headdim=192 (< 256), V headdim=128, K/V 不同需 padding
-- **DeepSeek-V2 全量版**: QK headdim=576 (> 256), 需 FA3/FlashMLA（A800 不支持）
-- **torch.compile**: `mode='default'`（kernel fusion only），支持动态 shape 但会重编译
-
-### 5.5 待验证
-
-1. **V-padding 性能**: 之前测试 GPU 只有 6-20GB 空闲，无法公平对比。需要 GPU 有 30GB+ 空闲时重新测试
-2. **vLLM 对比**: `run_compare_metainfer_vllm.sh` 已添加 `VLLM_GPU_MEM_UTIL` 参数，可设置 `VLLM_GPU_MEM_UTIL=0.15` 避免 OOM
-3. **其他优化方向**: 如果 V-padding 仍有回退，可考虑：
-   - 自定义 Triton kernel（跳过 padding 计算）
-   - 使用 PyTorch SDPA 但预分配 attn_mask 缓冲区（避免每步分配）
-   - 等 FA3 支持 SM80 或使用 FlashInfer
+Qwen3 的 Flash Attention 集成已完成——prefill 使用 `flash_attn_varlen_func`，decode 使用 `flash_attn_with_kvcache`（paged attention, block_size=256）。DeepSeek-V2 使用 Triton MLA decode kernel。
 
 ## 6. 测试环境与脚本
 
@@ -200,9 +166,6 @@ SKIP_VLLM=1 CUDA_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 ROUNDS=10 STEPS=8 REQUEST_RAT
 
 ## 9. 下一步行动
 
-1. 等 GPU 4-7 有 30GB+ 空闲时，跑 V-padding 性能基准
-2. 如果 V-padding 仍有回退，考虑：
-   - 预分配 attn_mask 缓冲区（避免每步分配开销）
-   - 自定义 Triton kernel
-   - 等 FlashInfer 支持
-3. P4 Continuous Batching 代码已提交（commit f1ff0a3），可随时激活
+1. **阶段三**: TP=4 CUDA Graph——引入 sglang 切图方案（在 all_reduce_sum 处拆分 FX 图，通信 eager 执行不入图），见 `cuda_graph_plan.md` §四
+2. 单 GPU CUDA Graph 已可用（`META_INFER_CUDA_GRAPH=1`），当前 35.4 tok/s（reduce-overhead 方案）
+3. 高并发场景需要 P4 Continuous Batching（代码已提交未激活）

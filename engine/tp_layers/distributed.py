@@ -68,24 +68,35 @@ def ensure_divisible(value: int, divisor: int, *, name: str) -> None:
         raise ValueError(f"{name}={value} is not divisible by tp_size={divisor}")
 
 
-# Module-level flag: set True before CUDA Graph capture. Routes CustomAR
-# to registered=True path (P2P direct, no staging buffer copy) for graph compatibility.
-# vLLM-aligned: parallel_state.py wraps capture with ca_comm.capture() context.
-_graph_capture_mode: bool = False
+# Snippet G: all_reduce_sum registered as PyTorch custom op.
+# Aligned with vLLM parallel_state.py:262-266 direct_register_custom_op("all_reduce").
+# torch.compile treats this as an atomic black-box node — no internal tracing,
+# no guard checks, no recompilation during CUDA Graph capture.
+@torch.library.custom_op("meta_infer::all_reduce_sum", mutates_args=())
+def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
+    """Black-box all-reduce. Compiler sees only: Tensor → Tensor.
 
-
-def all_reduce_sum(x: torch.Tensor, *, force_nccl: bool = False) -> torch.Tensor:
-    """All-reduce.
-
-    Eager path: CustomAR (faster). CUDA Graph path: NCCL (Trace-verified).
-    vLLM Trace: 876 NCCL all_reduce inside CUDA Graphs, 0 CustomAR (TF-1, TF-2).
+    Contract:
+        x: [*, *] bf16/fp16 — input tensor
+        returns: [*, *] same shape — all_reduce sum (new tensor, not alias of x)
+    Internal dispatch (invisible to compiler):
+        - TP disabled → returns x.clone()
+        - CustomAR available → all_reduce via staging buffer
+        - Fallback → NCCL dist.all_reduce on clone
     """
     if not is_tp_enabled():
-        return x
-    if _custom_ar_handle is not None and not force_nccl:
-        return _custom_ar_handle.custom_all_reduce(x)
-    dist.all_reduce(x, op=dist.ReduceOp.SUM)
-    return x
+        return x.clone()
+    if _custom_ar_handle is not None:
+        return _custom_ar_handle.all_reduce(x, registered=False)
+    y = x.clone()
+    dist.all_reduce(y, op=dist.ReduceOp.SUM)
+    return y
+
+
+@all_reduce_sum.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    """FakeTensor interface for shape/dtype inference during compilation."""
+    return torch.empty_like(x)
 
 
 def all_gather_last_dim(x: torch.Tensor) -> torch.Tensor:

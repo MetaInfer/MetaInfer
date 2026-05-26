@@ -31,18 +31,17 @@
 
 ## 0. 启动前强制动作
 
-1. 进入项目根目录：`/data/whl-test/agent-infer3`。
-2. 读取并同步以下上下文（**Qwen3 / DeepSeek-V2 TP 知识入口**：先看 `inference_blueprint.json` 顶部的 `agent_navigation`，再按需展开 `model_layer` 与 `framework_layer.data_flow_contracts.tp_layer_interface_contracts`）：
-   - `curosr/skills/inference_blueprint.json`
-   - `notebooks/tasks.md`
-   - `notebooks/MEMORY.md`
-   - `notebooks/00_overview/README.md`
-   - `notebooks-cn/01_framework_design/*`
-   - `notebooks-cn/02_model_specifics/*`
-   - `notebooks-cn/08_history_prompt/*`
-   - `notebooks-cn/06_experience/*`
-   - `notebooks-cn/07_agentPlan/*`
-   - `notebooks-cn/04_parallel_strategies/*`
+1. 进入项目根目录：`/home/honglin/meta-infer`。
+2. **物理块双轨制感知边界（CRITICAL-01 强制）**：
+   - TP Runner 路径（`inference_backend="qwen_tp"/"deepseek_tp"`）：KV cache 由模型自管（`_kv_block_size=256`，`torch.arange` 顺序分配）。**严禁** BlockManager API 接入 TP Runner。
+   - HF 兜底路径（`inference_backend="hf"`）：框架层 paging（BlockManager, block_size=16）正常生效。
+3. 读取并同步以下上下文：
+   - `.cursor/skills/inference_blueprint.json`
+   - `notebooks-cn/04_parallel_strategies/*`（TP 切分策略）
+   - `notebooks-cn/06_experience/*`（TP 调试经验）
+   - `notebooks-cn/07_improvementPlan/improvement_plan.md`（框架层改动记录：P0 KV Cache、P2 torch.compile、P3-FA Flash Attention）
+   - `notebooks-cn/07_improvementPlan/kernel_replacement_plan.md`（kernel 替换计划，后续阶段使用）
+   - `CLAUDE.md`（当前项目状态总览）
 3. 对输入模型目录先读取 `config.json`，提取：
    - `architectures`
    - `rope_scaling`
@@ -73,6 +72,7 @@
    - `assert not torch.isinf(out).any()`
 3. **维度白盒化**  
    关键中间变量必须支持打印 shape/device/dtype（受 debug 开关控制）。
+4. **CUDA Graph 防御性探针**：Graph 捕获态内严禁 `.item()`、`torch.cuda.synchronize()`、`torch.cuda.get_rng_state()`。NaN 健康检查必须用 `is_current_stream_capturing()` 守卫。
 
 ### 1.2 显存与 Device 可观测性（TP 排障强制）
 
@@ -97,8 +97,8 @@
 2. **4 卡 TP 一致性**  
    - `torchrun --nproc_per_node=4` 期间，参与 TP 的 4 张卡 VRAM% 需出现同量级且近似一致的区间。  
 3. **目标区间（经验阈值）**  
-   - `/data/xinference/cache/Qwen3-8B` 在 TP=4 推理时，每卡 VRAM% 约 `7%`。  
-   - `/data/xinference/cache/deepseek-v2-chat-pytorch-16b` 在 TP=4 推理时，每卡 VRAM% 约 `14%`。  
+   - `/home/honglin/models/qwen/Qwen3-8B` 在 TP=4 推理时，每卡 VRAM% 约 `7%`。  
+   - `/home/honglin/models/deepseek-ai/DeepSeek-V2-Lite-Chat` 在 TP=4 推理时，每卡 VRAM% 约 `14%`。  
 4. **真实并行计算证据**  
    - 测试窗口内需出现 HCU% `> 0` 的时刻，且至少覆盖 4 张 TP 卡。  
 5. **反作弊约束**  
@@ -125,11 +125,31 @@
 
 ## 3. 阶段 2：单路径组装（Single-Path Assembly）
 
+### 3.0 引擎代码结构与 Qwen3 入口
+
+实际工程目录（`/home/honglin/meta-infer`）关键文件：
+
+| 文件 | 作用 |
+|------|------|
+| `llm_engine.py` | LLMEngine、RealModelRunner（HF 兜底路径）；`inference_backend=”qwen_tp”` 路由到 QwenTPModelRunner |
+| `engine/models/qwen.py` | QwenTPModelRunner（入口）、QwenForCausalLMTP（模型 forward）、QwenDecoderLayerTP（单层）、QwenAttentionTP（注意力 + paged KV cache）、QwenMLPTP |
+| `engine/tp_layers/linear.py` | ColumnParallelLinear、RowParallelLinear、**QKVColumnParallelLinear**（QKV 合并投影）、**MergedColumnParallelLinear**（gate+up 合并） |
+| `engine/tp_layers/embedding.py` | VocabParallelEmbedding、ParallelLMHead |
+| `engine/tp_layers/distributed.py` | init_tp_distributed()、all_reduce_sum()、all_gather_last_dim()、init_custom_ar() |
+
+Qwen3 TP decode 实际流程（与 blueprint 旧 HF 路径不同）：
+
+1. `QwenForCausalLMTP.forward()` → `is_decode` 分支调用 `layer.forward_decode()`
+2. `QwenDecoderLayerTP.forward_decode()` → input_layernorm → `self_attn.forward_decode()` → post_attn_layernorm → `mlp()`
+3. `QwenAttentionTP.forward_decode()`: `qkv_proj` → Q/K norm → `rotary_embedding` → KV cache write（`index_copy_`）→ `flash_attn_with_kvcache`（paged, custom op）→ `o_proj`
+4. KV cache 为 **paged 格式**：`_key_cache[num_blocks, 256, num_kv_heads, head_dim]`，`block_size=256`
+5. KV 长度用 `_kv_len_gpu`（GPU tensor，非 Python int）追踪
+
 1. 严禁复制 vLLM 巨型分支结构与运行时 if-else 树。
 2. 根据检索到的算子约束，直接合成单路径模型实现：
-   - Dense：Qwen 路径（QKV/O + gate/up/down）
+   - Dense：Qwen 路径（QKV 合并 + gate/up 合并 + down）
    - MLA+MoE：DeepSeek 路径（q_a/kv_a replicated + q_b/kv_b/o TP + routed EP）
-3. 禁止“先写通用再临时 patch”；应直接产出架构定制代码。
+3. 禁止”先写通用再临时 patch”；应直接产出架构定制代码。
 
 ---
 
@@ -270,6 +290,20 @@
    - `notebooks/00_overview/README.md`
    - `inference_blueprint.json` 中目标组件的 `ref_docs` / `ref_code`
 2. 缩小问题规模到单组件最小可复现测试。
+3. 查阅 `inference_blueprint.json > model_layer.failure_mode_library` 的 symptom→check→fix 词条。
+
+### E. CUDA Graph 崩溃与显存指针漂移
+
+1. **Dynamo RNG 重编译（TP=4）**：`CUDAGeneratorImpl::current_seed` 在 graph 捕获时报错 → `torch.compile(fullgraph=True)` 追踪进入了 `all_reduce_sum` → sglang 切图方案修复（`torch.fx.split_module`，通信子图 `backend='eager'`）。
+2. **cuBLAS 地址漂移**：raw CUDA Graph replay 后 hs 差 3.4 → cuBLAS workspace 地址在捕获/回放间不一致 → 通信 op 必须从 CUDA Graph 分离（eager 执行）。
+3. **mutated inputs → cudagraphs 跳过**：`skipping cudagraphs due to mutated inputs` → `fused_add_rms_norm` 原地修改输入 → `forward_decode_graph` 开头 clone 输入修复。
+4. **compiled region .item()**：SIGABRT → `.item()` 必须在 `forward()`（非编译）中，不能在 `forward_decode`（编译）中。
+
+### F. 性能回退诊断
+
+1. **无条件 clone 回退**：nocompile 吞吐 < 50 tok/s → 检查 `aten::copy_` 占比 >5% → 拆分 forward_decode/forward_decode_graph。
+2. **通信回退**：TP=4 wall > 300ms → 检查 CustomAR 是否初始化（`init_custom_ar` 在 `load_weights` 后调用）。
+3. **GEMM dispatch 回退**：`aten::linear/mm` CPU total > 200ms → CUDA Graph 未启用。
 
 ---
 
@@ -282,3 +316,6 @@
 3. 子模块单测全部通过（含 NaN/Inf 与 shape 校验）。
 4. `test_xxx_tp_real.py` 在 torchrun 下输出稳定、可读文本。
 5. 提供变更摘要：文件、规则映射、测试命令、风险与后续建议。
+6. **性能底线（Qwen3-8B, TP=4, 12 tokens）**：nocompile ≥ 54 tok/s；GPU Self CUDA ≤ 66ms；CustomAR 通信 ≤ 25ms。
+7. **CUDA Graph 正确性**：单 GPU 5/5 greedy decode 字字对齐；graph_launches > 0（profiler 可观测）。
+8. **Kernel 调用合规**：所有 RMSNorm/RoPE/Silu 必须使用 `kernel_replacement_plan.md §九` 的 vLLM 标品 kernel，禁止手写 PyTorch 逐元素实现。

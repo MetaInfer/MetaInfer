@@ -614,7 +614,7 @@ Stage 0: 提取代码片段 + cos_sin_cache → 本计划文档中的 Snippets A
           Stage 4 (CustomAllReduce)  ✅ 已完成
                 │
                 ▼
-          Stage 8 (CUDA Graph decode)  ✅ 已完成
+          Stage 8 (CUDA Graph decode)  ⚠️ 已替换为 reduce-overhead，见 cuda_graph_plan.md
 ```
 
 | 里程碑 | 完成标准 | 预期 GPU 时间 | 预期 vs vLLM (412ms) |
@@ -622,50 +622,37 @@ Stage 0: 提取代码片段 + cos_sin_cache → 本计划文档中的 Snippets A
 | M0 | 当前基线 (P0-SDPA) | 1006ms | 2.44x |
 | M1 | Stage 1+2+3+5+7 完成 | ~860ms (单 GPU 实测: 76.6 tok/s, 2.19x vs 基线) | ✅ 已完成 |
 | M2 | + Stage 4 (CustomAR) | ~400ms (TP=4 实测: 70.9 tok/s) | ✅ 已完成 |
-| M3 | + Stage 8 (CUDA Graph) | 单 GPU 实测 74.7 tok/s (paged attn + graph replay) | ✅ 已完成 |
+| M3 | + Stage 8 (CUDA Graph) | 单 GPU: reduce-overhead 35.4 tok/s; TP=4: 阻塞（阶段三） | ⚠️ 已替换 |
 
 ---
 
-### 当前最佳表现: meta-infer nocompile vs vLLM (2026-05-23)
+### 当前最佳表现: meta-infer nocompile vs vLLM (2026-05-26 更新)
 
 > **环境**: Qwen3-8B, TP=4, GPU 0-3 (A800 80GB), 12 output tokens, temperature=0
-> **meta-infer 版本**: `META_INFER_CUDA_GRAPH=0`, commit `2e1eb8b` / clean baseline `4e352e0`
+> **meta-infer 版本**: `META_INFER_CUDA_GRAPH=0`, commit `1ce6f51` (Stage A-C 完成后)
 > **运行方式**: `CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4`
+> **vLLM**: vLLM 0.15.1, `max_model_len=1024`
 
-#### vs vLLM enforce_eager (无 CUDA Graph)
+#### vs vLLM enforce_eager (无 CUDA Graph, 有 torch.compile)
 
-| 指标 | meta-infer | vLLM enforce_eager | meta/vLLM |
-|------|-----------|-------------------|-----------|
-| **GPU 总时间** | **305ms** | 480ms | **0.64x** ✅ |
-| — 通信 (AllReduce) | 18ms (CustomAR) | 427ms (NCCL) | **0.04x** |
-| — 计算 | 58ms | 53ms | 1.10x |
-| **CPU 总时间** | **441ms** | 468ms | **0.94x** ✅ |
-| **Throughput** | **53.9 tok/s** | — | — |
-
-GPU 快是因为 CustomAR P2P kernel 比 NCCL ring reduce 对小 tensor 快 ~4x/次。
-CPU 略快是因为 meta-infer 轻量 Python 调度链路比 vLLM 的 C++ scheduler + torch.compile dispatch 更直接。
+| 指标 | meta-infer nocompile | vLLM eager | meta/vLLM |
+|------|---------------------|-----------|-----------|
+| **GPU Self CUDA** | **66.0ms** | 257.7ms | **0.26x** ✅ |
+| — Compute (GEMM/FA/norm) | 50.4ms | ~53ms | 0.95x |
+| — Comm (AllReduce) | **23.5ms** (CustomAR P2P) | 204.1ms (NCCL ring) | **0.12x** 🚀 |
+| **Wall 时间** | **215.6ms** | 273.2ms | **0.79x** ✅ |
+| **Throughput** | **55.7 tok/s** | 43.9 tok/s | **1.27x** ✅ |
 
 #### vs vLLM CUDA Graph (开启)
 
 | 指标 | meta-infer nocompile | vLLM CUDA Graph | meta/vLLM |
 |------|---------------------|-----------------|-----------|
-| GPU 时间 | 305ms | **80ms** | 3.81x |
-| CPU 时间 | 441ms | **15ms** | 29.4x |
-| **Throughput** | 53.9 tok/s | **171.6 tok/s** | 0.31x |
+| GPU Self CUDA | 66.0ms | **67.7ms** | 0.97x |
+| CPU Self | 264.9ms | **62.0ms** | 4.27x |
+| **Wall 时间** | 215.6ms | **71.9ms** | 3.00x |
+| **Throughput** | 55.7 tok/s | **166.8 tok/s** | 0.33x |
 
-差距 100% 来自 CUDA Graph——vLLM 把 6000+ kernel launch 合并为 ~48 次 graph replay。
-
-#### Git 回退
-
-```bash
-# 回退到 nocompile 最佳版本（无 torch.compile 代码）
-git checkout 4e352e0
-
-# 或者在当前 commit 上禁用 CUDA Graph
-META_INFER_CUDA_GRAPH=0 torchrun --nproc_per_node=4 ...
-```
-
-两个版本的性能等价（当前 commit 的 `META_INFER_CUDA_GRAPH=0` 路径与 `4e352e0` 的 eager 路径核心计算一致）。
+详细 profiling 对比见 `stage0_2_vs_vllm.md`。TP=4 CUDA Graph 阶段三待实施（见 `cuda_graph_plan.md`）。
 
 ---
 
@@ -1359,107 +1346,31 @@ hidden_states = hs_out  # 只改引用，不修改原 tensor
 
 ---
 
-## Stage 8: CUDA Graph Decode (对标 vLLM FULL 模式) ✅ 已完成
+## Stage 8: CUDA Graph Decode (对标 vLLM FULL 模式) ⚠️ 已替换
 
-### 实施方案: paged attention + CUDA Graph
+> **状态变更 (2026-05-26)**: 本节描述的旧版 raw CUDA Graph 方案（commit `b110d86`→`4e352e0`，使用 `init_decode_graph`/`graph_replay`/`_decode_graph`）已在 Stage A 清理中删除（commit `550bfe6`）。当前方案见 `cuda_graph_plan.md`——使用 `torch.compile(mode='reduce-overhead')`（inductor 内部 cudagraph_trees）+ `forward_decode_graph`。旧版文档保留仅供参考。
 
-采用 **paged KV cache** (block_size=256, 满足 `flash_attn_with_kvcache` 要求) + `torch.cuda.CUDAGraph` 捕获全模型 decode forward。
+<details>
+<summary>旧版 Stage 8 文档（已废弃，点击展开）</summary>
 
-### 解决过程
+### 旧实施方案: paged attention + raw CUDA Graph (已删除)
 
-原 contiguous KV cache 与 CUDA Graph 不兼容——动态 slicing（`k_buf[:, :kv_len]`）无法被 graph 捕获。换成 paged attention 后，所有可变数据通过固定 shape buffer 传递：
-- `block_table`: `[1, max_blocks]` — 固定 shape, 内容在 prefill 时设置
-- `slot_mapping`: `[1]` — 固定 shape, 内容在 replay 前更新
-- `_kv_len_gpu`: `[1]` — 固定 shape GPU scalar
-- `_graph_pos`: pre-allocated position tensor
+~~采用 **paged KV cache** + `torch.cuda.CUDAGraph` 捕获全模型 decode forward。~~
 
-### 代码改动
+~~单 GPU 实测 74.7 tok/s（paged attn + graph replay），但 TP=4 时 cuBLAS 图池地址不稳定导致 replay 结果错误（hs 差 3.4），且违反黑盒原则（自研图捕获逻辑）。已于 Stage A 清理。~~
 
-| 文件 | 改动 |
-|------|------|
-| `engine/models/qwen.py` | QwenAttentionTP: paged KV cache + block_table + slot_mapping + `flash_attn_with_kvcache`; QwenForCausalLMTP: `init_decode_graph` + `graph_replay`; runner: graph capture on step 3, graph invalidation on prefill |
+</details>
 
-### 正确性验证 ✅
+### 当前方案 (cuda_graph_plan.md Stage A-C)
 
-- 单元测试: graph replay 输出 == eager 输出 (逐字对齐)
-- 多次 generate 稳定性: 5 轮输出一致
+见 `cuda_graph_plan.md` 和 `stage0_2_vs_vllm.md`：
 
-### Profiling 效果 (单 GPU, 24 tokens)
+| 模式 | 单 GPU 吞吐 | TP=4 吞吐 | 方式 |
+|------|-----------|----------|------|
+| nocompile (CUDA_GRAPH=0) | — | **55.7 tok/s** | eager，CustomAR P2P |
+| CUDA Graph (CUDA_GRAPH=1) | **35.4 tok/s** | 阻塞（阶段三） | `torch.compile(mode='reduce-overhead')` |
 
-| 指标 | Stage 7 (无 graph) | Stage 8 (graph) |
-|------|-------------------|----------------|
-| single GPU throughput | 76.6 tok/s | **74.7 tok/s** |
-
-paged attention (block_size=256) 有 ~2.5% 额外开销，但 CUDA Graph 消除了 6000+→1 kernel launch，为 serving 层带来 TPOT 降低和 CPU dispatch 消除。
-
-### 踩坑与解决
-
-| 踩坑 | 解决 |
-|------|------|
-| `flash_attn_with_kvcache` 要求 `block_size >= 256` | 使用 256 blocks，对短序列（<256 tokens）仅需 1 个 block |
-| `position_offset` 被 graph baking 为常量 → RoPE 位置错误 | 预分配 `_graph_pos` tensor，replay 前 copy 更新 |
-| graph replay 引用旧 KV cache tensor 地址 → illegal memory access | prefill 时 `self._decode_graph = None` 触发重新 capture |
-| `cache_seqlens=self._kv_len_gpu` 需 tensor 而非 int | 直接用 `_kv_len_gpu` 1D tensor 传给 FA2 |
-
-### 算子约束
-
-- paged KV cache layout: `[num_blocks, 256, num_kv_heads, head_dim]`
-- `flash_attn_with_kvcache`: block_size≥256, block_table 为 int32
-- CUDA Graph: `META_INFER_CUDA_GRAPH=0` 可禁用, graph 在 prefill 后重新 capture
-- 仅支持单 GPU (tp_size=1), TP>1 时 CustomAR 的 graph 兼容需额外工作
-
-尝试复用 sglang/mini-sglang 的 CUDA Graph 模式后，连续遇到 `cudaErrorStreamCaptureUnsupported`。根因分析：
-
-**sglang/mini-sglang 能工作的原因**：使用 **paged attention**。所有可变数据（`seq_lens`、`kv_indices`、`kv_indptr`、`out_cache_loc`）都是**固定 shape 的 pre-allocated buffer**，内容在 replay 前 in-place copy 覆盖，buffer 地址永不变。attention kernel 通过 indirection table（`page_table → slot → cache row`）访问 KV，无需动态 slicing。
-
-**meta-infer 失败的原因**：使用 **contiguous KV cache**。decode 路径依赖以下不可 graph-capture 的操作：
-
-| 操作 | 失败原因 |
-|------|---------|
-| `k_buf[:, :kv_len_gpu]` | 动态 slicing — 输出 shape 依赖 GPU scalar 值，CUDA Graph 不支持 |
-| `k_buf[0, gpu_scalar] = k[0,0]` | GPU-scalar advanced indexing — Graph 不支持 |
-| `_cu_q[1] = scalar` | Python int→GPU H2D copy — 值被 baking 为 capture 时刻常量 |
-| `_kv_len_gpu[0].item()` | CPU sync — Graph 内禁止 |
-
-**5. 运行时**
-```python
-if self._decode_graph is not None:
-    # 更新 GPU buffers
-    self._kv_len_gpu[0] += 1
-    self._input_ids_gpu[0] = next_token_id
-    self._positions_gpu[0] += 1
-    self._decode_graph.replay()      # ← 单次 kernel launch
-else:
-    self._forward_decode_step(...)     # eager fallback (prefill)
-```
-
-### 改动文件
-
-| 文件 | 改动 |
-|------|------|
-| `engine/models/qwen.py` | QwenAttentionTP: kv_len GPU 化 + KV write GPU scatter；QwenForCausalLMTP: CUDA Graph capture + replay |
-| `llm_engine.py` | generate_stream/generate: 首次 warmup + graph replay 路径，prefill 保持 eager |
-| `engine/tp_layers/custom_ar.py` | CustomAR graph support: `registered=True` mode for capture |
-
-### 兼容性风险
-
-| 风险 | 概率 | 缓解 |
-|------|------|------|
-| CustomAR kernel 在 graph 内不兼容 | 中 | 首次先 capture 不含 CustomAR 的子图；验证后再加入通信 |
-| GPU tensor scatter vs Python slice 数值不一致 | 低 | 逐 token 对比验证 |
-| CUDA Graph 显存池冲突 (OOM) | 中 | 预留 graph pool；捕获时 freeze GC |
-| FA2 在 graph 内 `max_seqlen_k` 动态报错 | 中 | 用 cu_seqlens GPU 更新规避，必要时 fallback eager |
-
-### 回退策略
-
-全局开关 `CUDA_GRAPH_ENABLED = False` → 全部走 eager 路径。每个改动点保留 eager fallback 分支。
-
-### 预期收益
-
-- **Kernel launch**: ~6,000 次 → **1 次** graph replay
-- **CPU dispatch**: ~40% CPU 时间（scheduler/sampler 除外）→ 消除
-- **TPOT**: 14ms → 预期 9-10ms（-30%）
-- **STEPS=64 吞吐**: 69 tok/s → 预期 85-95 tok/s
+当前 CUDA Graph 使用 `forward_decode_graph`（含 clone）+ inductor 内部 `cudagraph_trees`，不再手动管理 `CUDAGraph`。TP=4 阶段三需引入 sglang 的切图方案（在通信 op 处拆分 FX 图，通信 eager 执行不入图）。
 
 ---
 
@@ -1515,4 +1426,86 @@ torch.testing.assert_close(cache_ours, cache_vllm)
 
 ---
 
-> **下一步**: 等待用户审核计划。批准后按 Stage 0 → 1/2/3/5 → 6 → 4 顺序执行，每 Stage 完成完整 SOP 闭环。
+## 九、vLLM 标品 Kernel 自包含调用契约速查（离机参考）
+> **用途**: 新 Agent 在无 `engine/` 工程源码的情况下，仅阅读本节即可正确调用 vLLM 安装包（`pip install vllm` 后）提供的 CUDA kernel。
+> **前提**: `pip install vllm` 已完成，`import vllm._C` 触发算子注册。
+
+### 9.1 RMSNorm（替换 PyTorch `RMSNorm.forward`）
+
+| 属性 | 值 |
+|------|-----|
+| **vLLM 源码** | `vllm/_custom_ops.py` lines 420-423, kernel `rms_norm_kernel<c10::BFloat16, 8, 3>` |
+| **导入** | `from vllm._custom_ops import rms_norm as _vllm_rms_norm` |
+| **调用** | `_vllm_rms_norm(out, input, weight, epsilon)` |
+| **out** | `torch.empty_like(input)` — 必须预分配，同 dtype 同 shape |
+| **input** | `[*, H]` bf16/fp16/fp32, **必须 contiguous**（view 结果需先 `.contiguous()`） |
+| **weight** | `[H]` 同 dtype |
+| **epsilon** | float (Qwen3-8B: 1e-6) |
+| **内部精度** | kernel 内部升 fp32 计算方差，归一化后 cast 回 input dtype |
+| **代码模板** | 见 §三 Snippet A |
+
+### 9.2 fused_add_rms_norm（替换残差加法 + RMSNorm）
+
+| 属性 | 值 |
+|------|-----|
+| **vLLM 源码** | `vllm/_custom_ops.py` lines 420-423, kernel `fused_add_rms_norm_kernel<c10::BFloat16, 8>` |
+| **导入** | `from vllm._custom_ops import fused_add_rms_norm as _vllm_fused_add_rms_norm` |
+| **调用** | `_vllm_fused_add_rms_norm(input, residual, weight, epsilon)` |
+| **语义（双 in-place）** | 1) `residual = residual + input` (残差融合)；2) `input = rms_norm(residual) * weight` (归一化) |
+| **input** | `[*, H]` bf16, contiguous — 子层输出（如 attention output），**原地被修改为归一化结果** |
+| **residual** | `[*, H]` bf16, contiguous — 残差状态，**原地被修改为 residual + input** |
+| **weight** | `[H]` 同 dtype |
+| **跨层依赖** | post-mlp 调用时 weight 必须是**下一层**的 `input_layernorm.weight`（residual chaining 模式） |
+| **代码模板** | 见 §三 Snippet B |
+
+### 9.3 silu_and_mul（替换 `F.silu(gate) * up`）
+
+| 属性 | 值 |
+|------|-----|
+| **vLLM 源码** | `vllm/model_executor/layers/activation.py` class `SiluAndMul.forward_cuda` |
+| **注册触发** | `import vllm._C` (registry `torch.ops._C.silu_and_mul`) |
+| **调用** | `torch.ops._C.silu_and_mul(out, input)` |
+| **out** | `[*, d]` bf16 contiguous, **预分配** `torch.empty(..., dtype=..., device=...)` |
+| **input** | `[*, 2*d]` bf16 contiguous — MergedColumnParallelLinear 输出，**前半 gate 后半 up** |
+| **等价** | `out = silu(input[..., :d]) * input[..., d:]` |
+| **代码模板** | 见 §三 Snippet C |
+
+### 9.4 rotary_embedding（替换手写 RoPE）
+
+| 属性 | 值 |
+|------|-----|
+| **vLLM 源码** | `vllm/_custom_ops.py` lines 400-410, kernel `rotary_embedding_kernel<c10::BFloat16, true>` |
+| **导入** | `from vllm._custom_ops import rotary_embedding as _vllm_rotary_embedding` |
+| **调用** | `_vllm_rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)` |
+| **positions** | `[num_tokens]` int64, 1D |
+| **query** | `[num_tokens, num_heads, head_dim]` bf16, **2D (非 4D)**，**in-place 修改** |
+| **key** | `[num_tokens, num_kv_heads, head_dim]` bf16，同上，可为 None |
+| **head_size** | int (Qwen3-8B: 128) |
+| **cos_sin_cache** | `[max_position, head_size]` — 前 `head_size//2` 为 cos，后 `head_size//2` 为 sin。vLLM kernel 内部自行处理 NeoX 重复。**禁止**使用 `[max_pos, 2*head_size]` 格式 |
+| **is_neox** | bool — Qwen3 严格 `True`（前后分半 rotate_half）；DeepSeek-V2 用 `False`（GPT-J 奇偶交错）。**错配导致短句重复、局部复读** |
+| **代码模板** | 见 §三 Snippet D + Snippet E |
+
+### 9.5 CustomAR all_reduce（替换 `dist.all_reduce`）
+
+| 属性 | 值 |
+|------|-----|
+| **vLLM 源码** | `vllm/_custom_ops.py` lines 640-680 |
+| **导入** | `from vllm import _custom_ops as ops` |
+| **初始化** | 必须先调用 `init_custom_ar()`：创建 gloo `ProcessGroup` → IPC 句柄交换 → `ops.init_custom_ar` + `ops.register_buffer`。必须在 `dist.init_process_group` 之后、模型加载到 GPU 之后调用 |
+| **调用** | `ops.all_reduce(ptr, inp, out, reg_buffer, reg_buffer_sz_bytes)` — out-of-place |
+| **约束** | tp_size ∈ {2,4,6,8}；GPU 间全连接 P2P；`reg_buffer_sz_bytes >= inp.numel() * inp.element_size()`；inp 字节数 16B 对齐 |
+| **单 GPU 兼容** | `world_size==1` 时 init 直接 return，all_reduce 为 no-op |
+| **代码模板** | 见 §三 Snippet F |
+
+### 9.6 cos_sin_cache 构造
+
+| 属性 | 值 |
+|------|-----|
+| **vLLM 源码** | `model_executor/layers/rotary_embedding/base.py:76-84` |
+| **格式** | `[max_position, head_size]` — 前 `head_size//2` cos，后 `head_size//2` sin |
+| **Qwen3-8B 参数** | max_position=32768, head_size=128, rope_theta=1000000.0 |
+| **共享策略** | 模块级共享（所有 DecoderLayer 引用同一 tensor），避免 36×8MB=288MB 显存浪费 |
+| **设备** | 可 CPU 创建，lazy 首次 forward 移到 GPU |
+| **代码模板** | 见 §三 Snippet E |
+
+
