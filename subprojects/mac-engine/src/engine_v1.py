@@ -41,6 +41,57 @@ class InferenceEngine:
         self.model, self.config = load_qwen3_model(model_path)
         self.tokenizer = Tokenizer(model_path)
 
+    def generate_stream(self, prompt: str, max_tokens: int = 64, temperature: float = 0.0):
+        """Generate tokens with stream pipeline (mx.async_eval pattern).
+
+        Pipeline: async_eval(token N) while building graph for token N+1,
+        so GPU compute overlaps with graph building + tokenizer.decode.
+        """
+        if self.model is None or self.tokenizer is None:
+            msg = "Model not loaded"
+            raise RuntimeError(msg)
+
+        token_ids = self.tokenizer.encode(prompt)
+        n_layers = len(self.model.layers)
+        self._cache = make_kv_cache(
+            n_layers,
+            n_kv_heads=self.config.num_key_value_heads,
+            head_dim=self.config.head_dim,
+            max_len=2048,
+        )
+
+        # Prefill: full prompt forward with cache
+        input_ids = mx.array([token_ids])
+        logits = self.model(input_ids, cache=self._cache)
+
+        # Define inner step: forward + sample (no Python sync)
+        def _step(tok_arr: mx.array) -> mx.array:
+            """One decode step: model forward + compiled argmax. Returns output logits."""
+            _in = tok_arr.reshape(1, 1)
+            _logits = self.model(_in, cache=self._cache)
+            return _compiled_sample(_logits[0, -1, :], temperature)
+
+        # Pipeline: async_eval pattern (see mlx_lm/generate.py:396-470)
+        mx.new_stream(mx.gpu)
+        y = _compiled_sample(logits[0, -1, :], temperature)
+
+        n = 0
+        while True:
+            # Build graph for next token (while GPU evaluates current y)
+            if n != max_tokens:
+                next_y = _step(y)
+                mx.async_eval(next_y)
+            if n == 0:
+                mx.eval(y)  # Ensure first token is ready
+            if n == max_tokens:
+                break
+            next_id = int(y.item())
+            yield self.tokenizer.decode([next_id])
+            if n % 256 == 0:
+                mx.clear_cache()  # Prevent unbounded graph cache growth
+            y = next_y
+            n += 1
+
     def generate(self, prompt: str, max_tokens: int = 64, temperature: float = 0.0):
         if self.model is None or self.tokenizer is None:
             msg = "Model not loaded"
