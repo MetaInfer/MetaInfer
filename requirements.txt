@@ -1,1 +1,5 @@
+# Python 3.10 | CUDA 12.8
+# Install: pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu128
+
+torch==2.9.1
 vllm==0.15.1

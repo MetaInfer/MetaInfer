@@ -1,7 +1,15 @@
-# MetaInfer技术文档
+# MetaInfer
+
+> **克隆即用**：`git clone` master 分支 → Claude Code 打开本目录 → Agent 按知识图谱自主生成推理引擎。
+>
+> 本目录是一个自包含的**知识包**（prior knowledge package），包含领域知识图谱 `inference_blueprint.json`、多智能体执行 SOP `AGENT_SKILL.md`、28 个不可变测试合约 `scripts/`。用 Claude Code 打开后，主 Agent 会自动读取这三层先验知识，驱动三角色对抗式子代理（implementer → spec-reviewer → verification），按 11 个 Phase 管线自下而上生成适用于目标模型与硬件配置的**单路径推理框架**（约 4,500 行 Python）。
+>
+> **启动时只需提供两个路径**：模型权重目录 `MODEL_DIR` 和 Python 环境 `PYTHON_PATH`（含 torch、flash_attn、vLLM 的 conda/venv）。Agent 会先验证环境，再根据模型 `config.json` 自动路由架构（Dense / MLA+MoE(更新中)），然后逐 Phase 生成代码并通过 scripts/ 门禁验收。详见下文技术文档。
+
+# MetaInfer 技术文档
 
 > 本文档为 MetaInfer 项目的技术报告，系统记录从问题定义、系统设计、性能评估到未来规划的全过程。
-> 
+>
 > 
 
 # **摘要**
