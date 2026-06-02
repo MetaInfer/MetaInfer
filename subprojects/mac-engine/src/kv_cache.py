@@ -29,8 +29,9 @@ class KVCache:
     def pre_allocated(cls, n_kv_heads: int, head_dim: int, max_len: int) -> KVCache:
         """Create a KVCache with pre-allocated buffer for max_len tokens."""
         cache = cls()
-        cache.keys = mx.zeros((1, n_kv_heads, max_len, head_dim), mx.float16)
-        cache.values = mx.zeros((1, n_kv_heads, max_len, head_dim), mx.float16)
+        # Use bfloat16 to match model weights dtype — avoids bf16↔f16 cast overhead
+        cache.keys = mx.zeros((1, n_kv_heads, max_len, head_dim), mx.bfloat16)
+        cache.values = mx.zeros((1, n_kv_heads, max_len, head_dim), mx.bfloat16)
         cache.offset = 0
         return cache
 
@@ -74,7 +75,11 @@ def make_kv_cache(num_layers: int, n_kv_heads: int = 8, head_dim: int = 128,
                    max_len: int = 0) -> list[KVCache]:
     """Create KV cache list.
 
-    Always uses dynamic growth (matching mlx_lm's KVCache).
+    If max_len > 0, pre-allocate buffers (avoids dynamic realloc overhead).
+    Otherwise, uses dynamic growth (matching mlx_lm's KVCache).
     The cache auto-detects dtype from the first K/V tensor stored.
     """
+    if max_len > 0:
+        return [KVCache.pre_allocated(n_kv_heads, head_dim, max_len)
+                for _ in range(num_layers)]
     return [KVCache() for _ in range(num_layers)]

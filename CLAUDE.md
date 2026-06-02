@@ -59,6 +59,7 @@ ruff format src/ subprojects/
 | KV Cache | 自己实现 | `mlx_lm.models.cache.make_prompt_cache` |
 | 采样 | 自己实现 | `mlx_lm.sample_utils.make_sampler` |
 | Server | 自己实现 OpenAI API | — |
+| 模型精度 | 原始精度推理（bf16/fp16） | ❌ 量化（int4/int8/GPTQ/AWQ）、蒸馏、剪枝、任何改变模型权重的操作 |
 
 **可用参考**（只读）:
 - `mlx_lm/models/qwen3.py` — 模型架构参考

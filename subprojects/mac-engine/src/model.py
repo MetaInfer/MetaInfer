@@ -119,19 +119,6 @@ class Qwen3Block(nn.Module):
         return h + r
 
 
-# --- Causal Mask ---
-def _make_causal_mask(L: int, offset: int = 0, dtype=mx.float32) -> mx.array:
-    """Create additive causal mask: 0 for valid, -inf for future tokens.
-
-    Returns shape [1, 1, L, offset+L].
-    """
-    total = offset + L
-    mask = mx.triu(
-        mx.full((L, total), float("-inf"), dtype), k=offset + 1,
-    )
-    return mask.reshape(1, 1, L, total)
-
-
 # --- Full Model ---
 class Qwen3Model(nn.Module):
     """Qwen3 decoder-only transformer."""
@@ -152,13 +139,13 @@ class Qwen3Model(nn.Module):
         L = h.shape[1]
         mask = None
         if cache[0] is not None:
-            offset = cache[0].offset
             if L > 1:
-                # Prefill with cache: need mask for new tokens
-                mask = _make_causal_mask(L, offset, dtype=h.dtype)
+                # Prefill with cache: use SDPA "causal" fast path
+                mask = "causal"
             # L==1 (decode): no mask needed — SDPA handles causal constraint
         elif L > 1:
-            mask = _make_causal_mask(L, 0, dtype=h.dtype)
+            # Initial prefill: use SDPA "causal" fast path
+            mask = "causal"
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

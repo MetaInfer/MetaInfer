@@ -27,6 +27,10 @@ class Tokenizer:
         if isinstance(tokens, list):
             if tokens and isinstance(tokens[0], list):
                 tokens = tokens[0]
+        if not tokens:
+            # Empty prompt — use BOS token if available, else a space
+            bos = getattr(self._tok, "bos_token_id", None)
+            tokens = [bos] if bos is not None else [self._tok.encode(" ")[0]]
         return tokens  # type: ignore[no-any-return]
 
     def decode(self, ids: list[int]) -> str:

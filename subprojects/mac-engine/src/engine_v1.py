@@ -10,22 +10,9 @@ import mlx.core as mx
 
 from .kv_cache import KVCache, make_kv_cache
 from .model import Qwen3Config
+from .sampler import compiled_sample
 from .tokenizer import Tokenizer
 from .weights import load_qwen3_model
-
-
-def _compiled_sample(logits_last: mx.array, temperature: float) -> mx.array:
-    """Compiled argmax/greedy sampling. Returns single-element array [next_id]."""
-    if temperature <= 0.0:
-        next_id = mx.argmax(logits_last, axis=-1, keepdims=True)
-    else:
-        probs = mx.softmax(logits_last / temperature, axis=-1)
-        next_id = mx.random.categorical(probs)
-        next_id = mx.expand_dims(next_id, axis=0)
-    return next_id
-
-
-_compiled_sample = mx.compile(_compiled_sample, shapeless=True)
 
 # Thread-local stream for async pipeline (see mlx_lm/generate.py:226)
 _generation_stream = mx.new_thread_local_stream(mx.gpu)
@@ -73,21 +60,20 @@ class InferenceEngine:
             with mx.stream(_generation_stream):
                 _in = tok_arr.reshape(1, 1)
                 _logits = self.model(_in, cache=self._cache)
-                return _compiled_sample(_logits[0, -1, :], temperature)
+                return compiled_sample(_logits[0, -1, :], temperature)
 
         # Pipeline: async_eval pattern (see mlx_lm/generate.py:453-470)
-        y = _compiled_sample(logits[0, -1, :], temperature)
+        y = compiled_sample(logits[0, -1, :], temperature)
 
         n = 0
         while True:
-            # Build graph for next token (while GPU evaluates current y)
-            if n != max_tokens:
-                next_y = _step(y)
-                mx.async_eval(next_y)
             if n == 0:
                 mx.eval(y)  # Ensure first token is ready
             if n == max_tokens:
                 break
+            # Build graph for next token (while GPU evaluates current y)
+            next_y = _step(y)
+            mx.async_eval(next_y)
             next_id = int(y.item())
             yield self.tokenizer.decode([next_id])
             if n % 256 == 0:
@@ -123,7 +109,7 @@ class InferenceEngine:
         while generated < max_tokens:
             # Compiled argmax: stays in MX graph, no .item() sync
             next_logits = logits[0, -1, :]
-            next_id_arr = _compiled_sample(next_logits, temperature)
+            next_id_arr = compiled_sample(next_logits, temperature)
             next_id = int(next_id_arr.item())  # only sync point
 
             token_text = self.tokenizer.decode([next_id])
