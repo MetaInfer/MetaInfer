@@ -41,8 +41,9 @@
 | E02 | 0602 | Phase 1 | 9.3 | 52.2% | 134.0 | 107.5 | 5.9 | ✅ | KV cache 增量解码, ~2x vs Phase 0 |
 | E03 | 0602 | Phase 2 | 9.3 (s) / 9.3 (x4) | 52.2% | - | - | 3.1 | ✅ | 调度器 + round-robin, 并发与单次持平 |
 | E04 | 0602 | Phase 1+ | 9.0 | 50.6% | 135.7 | 111.5 | 2.8 | ✅ | mx.compile sample + pre-alloc KVCache (中性, 瓶颈在 model forward) |
+| E05 | 0602 | Phase 1+ | 9.0 | 50.6% | 254.7 | 110.1 | 2.7 | ✅ | mx.async_eval stream pipeline (中性, MLX 0.31.2 async_eval 无实际加速) |
 
-> E02 首 token 与 golden 一致("Machine"), E03 并发吞吐=单次(串行调度)。E04 优化中性。
+> E02 首 token 与 golden 一致("Machine"), E03 并发吞吐=单次(串行调度)。E04 优化中性。E05 stream pipeline 输出与 generate() 逐 token 一致 (3/3 prompts)，但 async_eval 在 MLX 0.31.2 + 自定义模型架构上无提速效果（与 mlx_lm 的 generate_step 行为差异待进一步分析）。
 
 ## 4. 正确性验证记录
 
@@ -57,7 +58,9 @@
 |------|--------|---------|------|
 | KV Cache 增量解码 | P0 | 2.0x (vs P0) | ✅ 已完成 (Phase 1, 9.3 tok/s) |
 | 批量推理调度器 | P1 | 并发支持 | ✅ 已完成 (Phase 2, 9.3 tok/s @ x4) |
-| mx.compile 包装 decode | P2 | 1.5-2.0x decode 提升 | ⬜ 待开始 |
+| mx.async_eval stream pipeline | P2 | 1.5-1.8x decode 提升 | ⚠️ 已尝试 (E05, 中性) — MLX 0.31.2 上 async_eval+stream 对自定义模型无提速 |
+| mx.compile 包装 model forward | P2 | 1.5-2.0x decode 提升 | ⬜ 待开始 (需解决 mutable cache 兼容性) |
+| bfloat16 dtype | P1 | 1.5-2.0x | ⚠️ 已尝试 (3.4 tok/s 回退) — 自定义模型架构 bf16 有未知性能退化，待排查 |
 | 固定形状 KV Cache | P3 | 1.1-1.2x 提升 | ⬜ 待开始 |
 | Triton/Metal kernel | P4 | 2-3x 提升 | ⬜ 待开始 (参考上游 CUDA 分支) |
 

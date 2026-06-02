@@ -4,12 +4,22 @@
 
 ## 当前状态
 
-| 指标 | 自研引擎 (Phase 1) | MLX 基线 (vllm-metal) | 差距 |
-|------|-------------------|----------------------|------|
-| 吞吐 | 9.3 tok/s | 17.8 tok/s | 1.9x |
-| TPOT | 107.5 ms/tok | 55.6 ms/tok | 1.9x |
-| TTFT | 134.0 ms | 237.8 ms | 0.6x (更快) |
-| 内存 | 5.9 GB | 7.3 GB | 0.8x |
+| 指标 | 自研引擎 (Phase 1+) | MLX 基线 (vllm-metal / mlx-lm) | 差距 |
+|------|-------------------|-------------------------------|------|
+| 吞吐 | 9.0 tok/s | 17.8 / 17.6 tok/s | 1.96x |
+| TPOT | 110.1 ms/tok | 55.6 ms/tok | 1.98x |
+| TTFT | 254.7 ms | 237.8 ms | 1.07x |
+| 内存 | 2.7 GB | 7.3 / 15.8 GB | 0.37x |
+
+> 内存差距因 dtype 不同：自研 float32 (2.7GB RSS)，mlx_lm bfloat16 (15.8GB)。
+
+### 已尝试优化的结果
+
+| 优化 | 预期收益 | 实际 | 结论 |
+|------|---------|------|------|
+| mx.compile sample (E04) | +10-15% | 中性 (9.3→9.0) | 采样开销微不足道 |
+| mx.async_eval stream pipeline (E05) | +55-80% | 中性 (9.0→9.0) | MLX 0.31.2 + 自定义模型上无加速 |
+| bfloat16 dtype | +50-100% | **退化** (9.0→3.4) | 自定义模型架构 bf16 有未知 bug |
 
 ## 差距拆解
 
@@ -44,23 +54,9 @@
 
 **预期收益**: +80-150%
 
-**原理**: 将整个 decode step（logits → argmax → next_input → model forward）编译为静态计算图，消除每步重建开销。
+**状态**: ⚠️ 已尝试 (E04) — `mx.compile` 因 mutable KV Cache 无法直接包裹 `model()`，仅编译采样函数（中性结果，9.3→9.0 tok/s）。完整 decode step 编译需重新设计 cache 接口。
 
-```python
-@mx.compile
-def compiled_decode_step(logits, cache):
-    next_id = mx.argmax(logits[0, -1, :], axis=-1)
-    next_input = mx.expand_dims(next_id, axis=(0, 1))
-    return model(next_input, cache=cache), next_id
-```
-
-**实施**: 修改 `engine_v1.py` decode 循环，用 `mx.compile` 包裹热点。
-
-**风险**: 中等。compile 首次调用慢，需固定 tensor 形状。Qwen3 的 cache 机制在编译模式下可能不兼容（cache 作为 mutable 状态）。
-
-**回退条件**: 如编译后 decode 提升 <30%，放弃 compile 改为手动 batch 优化。
-
-**参考**: 上游 CUDA 分支 P2 阶段使用 `torch.compile` 获 50% 提升 (8.49→12.75 tok/s)。MLX compile 语义类似但限于固定形状图。
+**风险**: 高。`mx.compile` 不支持 mutable 状态（KV Cache 就地更新），需改为 functional cache 或支持 compile 的 cache 设计。
 
 ---
 
@@ -120,16 +116,11 @@ cache = KVCache(max_len=2048, pre_allocated=True)  # 一次分配
 
 ---
 
-### O5: dtype 优化 (float16 全程)
+### O5: dtype 优化 (float16 / bfloat16)
 
 **预期收益**: +10-20%
 
-**原理**: 当前权重为 float32（bfloat16→float32 转换）。MLX 支持混合精度，保持 float16 可减少内存带宽压力。
-
-```python
-# weights.py: 不转换 bf16→f32
-weights[key] = mx.array(t.numpy().view(np.uint16), dtype=mx.bfloat16)
-```
+**状态**: ⚠️ 已尝试 — bfloat16 导致吞吐从 9.0→3.4 tok/s（退化 2.6x）。mlx_lm 使用 bfloat16 获 17.6 tok/s，说明退化来自自定义模型架构的某个操作（可能是 nn.RMSNorm / causal mask dtype 不匹配 / attention 隐式 upcast）。需进一步 profiling 定位。
 
 **风险**: 中。bfloat16 可能影响精度，需与 golden 逐 token 对比。
 
@@ -165,15 +156,16 @@ weights[key] = mx.array(t.numpy().view(np.uint16), dtype=mx.bfloat16)
 
 ## 汇总
 
-| ID | 优化项 | 预期收益 | 难度 | 风险 | 优先级 |
-|----|--------|---------|------|------|--------|
-| O1 | mx.compile decode | +80-150% | 中 | 中 | ⭐⭐⭐ |
-| O2 | 减少 Python 开销 | +10-20% | 低 | 低 | ⭐⭐⭐ |
-| O3 | 固定形状 KVCache | +5-10% | 低 | 低 | ⭐⭐ |
-| O4 | 消除掩码重建 | +5-10% | 低 | 极低 | ⭐⭐ |
-| O5 | float16 全程 | +10-20% | 中 | 中 | ⭐⭐ |
-| O6 | Custom Metal kernel | +20-40% | 高 | 高 | ⭐ |
-| O7 | 投机解码 | +20-50% | 高 | 高 | ⭐ |
+| ID | 优化项 | 预期收益 | 难度 | 风险 | 优先级 | 状态 |
+|----|--------|---------|------|------|--------|------|
+| O1 | mx.compile decode | +80-150% | 高 | 高 | ⭐⭐⭐ | ⚠️ 已尝试 (中性) |
+| O2 | 减少 Python 开销 | +10-20% | 低 | 低 | ⭐⭐⭐ | ✅ 已完成 (E04) |
+| O3 | 固定形状 KVCache | +5-10% | 低 | 低 | ⭐⭐ | ✅ 已完成 (E04) |
+| O4 | 消除掩码重建 | +5-10% | 低 | 极低 | ⭐⭐ | ⬜ 待开始 |
+| O5 | bfloat16 dtype | +10-20% | 中 | 中 | ⭐⭐ | ⚠️ 已尝试 (退化) |
+| O6 | Custom Metal kernel | +20-40% | 高 | 高 | ⭐ | ⬜ 待开始 |
+| O7 | 投机解码 | +20-50% | 高 | 高 | ⭐ | ⬜ 待开始 |
+| — | mx.async_eval stream pipeline | +55-80% | 中 | 中 | ⭐⭐⭐ | ⚠️ 已尝试 (E05, 中性) |
 
 ### 推荐实施顺序
 
