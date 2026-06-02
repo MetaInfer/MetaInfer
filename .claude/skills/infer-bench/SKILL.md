@@ -91,6 +91,57 @@ sysctl -n machdep.cpu.brand_string && sysctl hw.memsize
 ## 第三步：执行对比
 
 按用户指定的层级执行。**同一层级的双方对比必须使用相同的参数和硬件**。
+**正确性验证（Layer 0）必须在任何性能对比之前通过——输出不对，性能数据无意义。**
+
+### Layer 0: 正确性验证（Greedy Decode 逐 token 对齐）
+
+> **优先级最高。** Layer 0 不通过，Layer 1/2/3 结果无效。
+
+#### 验证方法
+
+通过 OpenAI-compatible API 调用两个引擎，对比 greedy decode (temperature=0.0) 输出：
+
+```bash
+# 两个 engine 分别启动 server
+# 参考引擎 (已由 infer-ref-bench 采集 golden outputs)
+python -m mlx_lm.server --model <model_path> --port 8080 &
+
+# 自研引擎
+python -m mac_engine.server --model <model_path> --port 8081 &
+```
+
+运行验证脚本（与 infer-ref-bench 共用 `scripts/verify_correctness.py`）：
+
+```bash
+python scripts/verify_correctness.py \
+  --ref-url http://localhost:8080/v1 \
+  --target-url http://localhost:8081/v1 \
+  --golden tests/golden_outputs/golden_outputs.json
+```
+
+#### 验证矩阵
+
+| 维度 | 检查方法 | 通过条件 |
+|------|---------|---------|
+| 逐 token 对齐 | 对比 golden vs target 完整输出文本 | 字符级完全一致 |
+| 特殊 token 处理 | 空 prompt / chat template 用例 | 输出一致 |
+| 长上下文 | 长 prompt 用例 | 输出一致 |
+| 终止条件 | finish_reason 一致 | `stop` / `length` 一致 |
+
+#### 输出格式
+
+```
+Layer 0 正确性验证:
+| 测试用例 | Golden Hash | Target Hash | 状态 |
+|---------|------------|-------------|------|
+| basic_en | a1b2c3d4 | a1b2c3d4 | ✅ |
+| basic_zh | e5f6g7h8 | e5f6g7h8 | ✅ |
+| edge_empty | i9j0k1l2 | i9j0k1l2 | ✅ |
+
+Result: 7/7 PASS
+```
+
+**FAIL 处理**: 输出不一致时，先定位差异位置 → 对比两者 tokenizer 输出 → 对比两者模型 logits → 定位根因后再跑性能。
 
 ### Layer 1: 算子级对比
 
@@ -273,8 +324,10 @@ notebooks-cn/07_improvementPlan/compare_<engine>_<framework>_<model>_<YYYYMMDD>.
 
 ## 关键约束
 
-1. **同一硬件**: 双方必须在同一台机器、同一 GPU/芯片上测试。严禁跨机器对比。
-2. **同一模型**: 双方使用同一 checkpoint 目录和 tokenizer 配置。
-3. **温度归零**: `temperature=0.0` 保证 greedy decode 可复现。
-4. **先验证后测速**: 正确性不通过，性能数据无效。
-5. **差距必须量化**: 不说"差不多"，只说"1.18x"或"快/慢 X%"。
+1. **正确性优先**：Layer 0 不通过，禁止进入 Layer 1/2/3。
+2. **同一硬件**: 双方必须在同一台机器、同一 GPU/芯片上测试。严禁跨机器对比。
+3. **同一模型**: 双方使用同一 checkpoint 目录和 tokenizer 配置。
+4. **温度归零**: `temperature=0.0` 保证 greedy decode 可复现。
+5. **先验证后测速**: 正确性不通过，性能数据无效。
+6. **差距必须量化**: 不说"差不多"，只说"1.18x"或"快/慢 X%"。
+7. **OpenAI API 协议对比**：自研引擎与参考引擎均通过 `/v1/completions` 调用，避免 tokenizer 实现差异。

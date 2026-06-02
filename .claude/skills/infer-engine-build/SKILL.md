@@ -18,8 +18,9 @@ description: >
 ## 前置条件
 
 1. 实验基线表已存在（`infer-baseline` → `docs/01_planning/experiment_baseline.md`）
-2. MLX 基准数据已填入（`infer-mlx-ref` → 基线表 §2）
-3. 目标模型权重可正常加载
+2. 基准数据已填入（`infer-ref-bench` → 基线表 §3）
+3. Golden outputs 已采集（`infer-ref-bench` → `tests/golden_outputs/golden_outputs.json`）
+4. 目标模型权重可正常加载
 
 ---
 
@@ -59,6 +60,13 @@ print(tokenizer.decode([next_token.item()]))
 
 **验证**：输出合理 token，无崩溃。记录到基线表 §3。
 
+**正确性验证**：启动 engine server，通过 OpenAI API 对比 golden outputs：
+```bash
+python -m mac_engine.server --model <model_path> --port 8081 &
+python scripts/verify_correctness.py --golden tests/golden_outputs/golden_outputs.json
+```
+Phase 0 只要求**非崩溃**、输出有效 token，不要求与 golden 完全对齐（缺少 KV cache 时 logits 可能不同）。
+
 **不要做的事**：
 - ❌ 写 KV cache（Phase 1 才加）
 - ❌ 写调度器（Phase 2 才加）
@@ -90,6 +98,12 @@ next_token = mx.argmax(logits[:, -1, :])
 
 **验证**：与 Phase 0 同 prompt 输出完全一致（greedy decode），吞吐显著提升。
 
+**正确性验证**：Phase 1 必须通过完整 golden outputs 对比：
+```bash
+python scripts/verify_correctness.py --golden tests/golden_outputs/golden_outputs.json
+```
+temperature=0.0 下所有测试用例输出**逐字符完全一致**。不一致 → 不进入 Phase 2。
+
 ---
 
 ### Phase 2: 批量推理 + 简单调度（≥65% baseline）
@@ -110,7 +124,7 @@ cache_batch = [s.cache for s in running_seqs]  # or use MLX's cache format
 logits, new_caches = model(token_batch, cache=cache_batch)
 ```
 
-**验证**：2-4 并发，每个请求输出与串行完全一致。
+**验证**：2-4 并发，每个请求输出与串行完全一致，通过 golden 对比。
 
 ---
 
@@ -162,7 +176,7 @@ src/
 
 **重要**：每次实验用 git commit 保存代码，commit message 格式：
 ```
-engine(phase<N>): <what changed> (<throughput> tok/s, <X>% baseline)
+engine(phase<N>): <what changed> (<throughput> tok/s, <X>% baseline, correctness: <PASS/FAIL>)
 ```
 
 ---
@@ -170,21 +184,23 @@ engine(phase<N>): <what changed> (<throughput> tok/s, <X>% baseline)
 ## 退出条件
 
 - [ ] Phase 3 完成，吞吐 ≥70% baseline
-- [ ] 所有 Phase 的输出正确性验证通过（与 Phase 0 逐 token 对比）
-- [ ] 基线表 §3 有 ≥3 条实验记录
+- [ ] 所有 Phase 输出正确性验证通过（`verify_correctness.py` 全 PASS）
+- [ ] 基线表 §3 有 ≥3 条实验记录，§4 有对应正确性记录
 
 达成后，输出摘要：
 
 ```
 ✅ 自研引擎达到目标
 
-Qwen2.5-0.5B:
+Qwen3-8B:
 - 自研: 32.1 tok/s (71.0% baseline)
 - MLX:  45.2 tok/s (100%)
 - 差距: 13.1 tok/s (29.0%)
+- 正确性: 7/7 PASS (golden outputs 全对齐)
 
 Phase 总结: E01(15.3)→E02(24.1)→E03(32.1)
 代码: src/ (engine.py, model_runner.py, scheduler.py, sampler.py, kv_cache.py)
+Golden: tests/golden_outputs/golden_outputs.json
 
 下一步: /infer-optimize-plan 分析剩余 29% 差距，规划优化方向
 ```
