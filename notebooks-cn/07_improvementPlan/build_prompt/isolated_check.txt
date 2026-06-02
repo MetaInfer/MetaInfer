@@ -1,0 +1,100 @@
+> **任务：执行 `meta-infer/.cursor/skills/inference_blueprint.json`'meta-infer/.cursor/skills/AGENT_SKILL.md' 针对核心调度层与 Qwen3 模型的独立可重构性审计**
+> 
+> **审计身份**：推理引擎独立闭环审计官（Isolated Reconstructability Auditor）。
+> **核心假设**：假定当前 `meta-infer` 工程的 `engine/` 目录源码被完全物理擦除，仅保留 `meta-infer/.cursor/skills/inference_blueprint.json` 和 `meta-infer/.cursor/skills/AGENT_SKILL.md` 作为全量技术规范。
+> **审计目标**：白盒化评估全新 Agent 仅依赖此图谱，能否 100% 逆向重构出包含完整调度层（Scheduler/BlockManager等）、支持 Qwen3-8B (TP=4)、具备 10 大核心改动与 CUDA Graph 优化的工业级推理引擎。
+> 
+> ### 1. 隔离审计红线
+> - **输入白名单**：仅限提供的 `inference_blueprint.json`和'AGENT_SKILL.md' 内容。
+> - **物理隔离**：禁止检索或假设任何已知存在的 Python 业务代码实现细节。
+> - **排除范围**：跳过所有 `deepseek_v2_v3_mla_moe` 相关节点。
+> 
+> ### 2. 完备性与信息熵检查清单（Completeness Checklist）
+> 请逐项审查图谱，针对以下四大系统模块进行“信息熵缺漏排查”，回答是否具备直接编码的指导力：
+> 
+> #### 2.1 推理框架调度层 (Framework Scheduling Layer)
+> - **Scheduler 调度逻辑**：`scheduler_to_runner` 节点是否定义了严格的 `can_allocate` 和 `can_append_one_more` 算法边界？是否写清了 Prefill 与 Decode 的批次组装具体限制（如 `max_num_batched_tokens` 的计算依据）？
+> - **BlockManager 内存分配**：图谱仅说明了“链式前缀哈希”，是否给出了具体的 `compute_hash` 签名规范？引用计数 (`ref_count`) 的具体增减生命周期边界是否清晰？
+> - **双轨块大小隔离**：图谱中 `_dual_track_note` 声明了 16 与 256 块大小双轨制，是否给出了阻止 Agent 将 16-token 调度逻辑侵入 TP Runner 前向通路的硬性架构屏障或伪代码接口？
+> 
+> #### 2.2 框架层增量修改 (P0, P2, P3-FA)
+> - **P0 增量 KV**：`paged_kv_cache_contract` 是否指明了 Decode 步对 K/V Tensor 拼接的精确 Shape 契约？是否说明了因果掩码 `is_causal = (past_key_values is None)` 的状态判定逻辑？
+> - **P2 编译模式**：`torch_compile_contract` 是否指明了不可在 MoE 层面编译的根本代码原因（如 `.item()` 同步的堆栈层级）？
+> - **P3-FA 算子**：`flash_attention_integration_contract` 是否写清了 Qwen 架构使用 `flash_attn_varlen_func` 时，`cu_seqlens_q` 与 `cu_seqlens_k` 的构造方法？
+> 
+> #### 2.3 Kernel 层 7 大标品替换黑盒
+> - **数据契约完备性**：`qwen3_kernel_contracts` 中 `rms_norm` / `silu_and_mul` 等算子是否明确列出了“必须预分配 output buffer”这一物理内存分配约束？
+> - **残差链拓扑**：`fused_add_rms_norm` 的跨层权重依赖（下一层的 input_layernorm.weight），在 JSON 中是否有可供代码实现的层级参数传递拓扑说明？
+> - **IPC 握手时序**：`custom_ar_all_reduce` 的 Gloo 组句柄交换，是否明确定义了发生于 `load_weights` 与第一次 `forward` 之间的状态机卡点？
+> 
+> #### 2.4 CUDA Graph 静态执行契约
+> - **显存地址锁死**：`cuda_graph_execution_contract` 是否给出了切断 cuBLAS 到 NCCL 显存指针漂移的具体代码规约（例如强制使用 `out=static_buffer`）？
+> - **自定义算子遮蔽**：是否包含 `@torch.library.custom_op` 注册 `all_reduce_sum` 以屏蔽 Dynamo 追踪的接口签名与 Fake Tensor 形状推导骨架代码？
+> 
+> ### 3. 审计输出规范
+> 
+> 请出具一份完全客观的《蓝图重构完备性漏洞报告》，结构限定如下：
+> 
+> - **1. 🔴 Reconstructability Gaps (重构死锁漏洞项)**：列出图谱中缺乏具体物理参数、算法公式或控制流伪代码，导致全新 Agent 必定写出崩溃/死锁代码的空洞规约。必须指出精确的 **JSON Path**，并给出**必须补充的技术规格契约**。
+> - **2. 🟡 Ambiguous Descriptions (信息熵不足警告项)**：列出图谱中记录了规则，但缺乏失败背景或上下文边界（例如缺乏张量维度的具体推导逻辑），导致 Agent 容易进行错误抽象的节点。
+> - **3. 🟢 Verdict (最终图纸判决)**：给出最终量化结论：当前图谱对于“独立重构调度层与 Qwen3 引擎”的信息完备度百分比（0-100%）。是否允许直接交付给全新 Agent 闭环开工？如果否，列出必须修复的 Top 3 阻断项。
+
+
+
+
+
+
+
+
+
+
+
+
+
+> **任务：基于 RAG 辅助路径的推理框架蓝图“盲测完备性”独立审计**
+> 
+> **审计身份**：独立第三方系统级审计官（Zero-Shot Reconstructability Auditor）。
+> **核心假设**：
+> 1. 目标工程 `meta-infer` 的所有业务源码已被物理销毁。
+> 2. 你现在的全部技术资产仅有：`meta-infer/.cursor/skills/inference_blueprint.json` 和 `meta-infer/.cursor/skills/AGENT_SKILL.md`。
+> 3. 你拥有完整的 RAG 检索权限，可以随时查阅图谱中配置的所有 `ref_code`（如 nano-vllm 参考工程）和 `ref_docs`（设计文档）。
+> 
+> **审计目标**：白盒化评估这份 JSON 图谱是否具备“严丝合缝的工程指导力”。如果你现在就要立刻开始敲代码重构 Qwen3 (nocompile, B=1, TP=4)的完整引擎，这份图谱加上参考资料，是否存在导致你“被迫脑补”或“抄错代码”的致命断层？
+> 
+> ---
+> 
+> ### 1. 盲测排查方法论 (Audit Methodology)
+> 
+> 请逐层遍历 `inference_blueprint.json` 中的组件（排除 deepseek 章节），并对图谱与 `ref_code` 的映射关系执行以下三维度的严苛盘问：
+> 
+> #### 维度一：重载契约核验 (Override & Adaptation Check)
+> 参考工程（ref_code）通常包含通用逻辑或默认配置。自研引擎必然对其进行了魔改。
+> - **盘问**：图谱在指向某段 `ref_code` 时，是否通过硬约束（hard_rule）明确指出了“我们与参考代码的不同之处”？（例如：参考代码的默认参数是否需要修改？参考代码中的某些冗余分支是否需要剔除？）如果图谱不指明，你作为重构者是否会把参考库里的“毒药代码”原封不动抄进来？
+> 
+> #### 维度二：引路信噪比评估 (Pointer Precision Check)
+> - **盘问**：当图谱给出 `ref_code` 路径时，是精确定位到了具体的类、函数和调用签名，还是只给了一个庞大文件的泛泛引用？如果只给了文件路径，你是否能仅凭图谱中的 `role` 描述，准确从几百行源码中抠出需要的逻辑而不引入多余依赖？
+> 
+> #### 维度三：缝合代码与维度盲区 (Glue Logic & Shape Blind Spots)
+> 参考工程之间的组件是需要“缝合（Glue）”的。
+> - **盘问**：
+>   1. 图谱是否给出了目标模型（如 Qwen3-8B）具体实例化的物理维度参数（如 hidden_size 的具体数值），以供你初始化张量？
+>   2. 不同算子、不同层级之间传递的 Tensor Shape 是否有严密的推导公式和预处理说明（如前缀和、槽位映射等）？
+>   3. 那些在 `ref_code` 中不存在（属于自研优化）的黑盒算子或底层通信逻辑，图谱是否给出了足以让你直接编写出 Python 代码的伪代码或接口签名？
+>
+> #### 维度四：扩展存储完备性核验 (ref_docs Coverage Check)
+> `ref_docs` 不是"参考资料列表"，而是蓝图信息的扩展存储。图谱在 pseudocode 或 hard_rule 中引用的函数签名、维度参数、约束条件，可能只在 ref_doc 中有完整定义。
+> - **盘问（强制操作）**：
+>   1. 审计时必须**实际打开**至少 3 个被 `ref_docs` 引用的文档文件，逐段验证至少 1 个图谱引用的知识点（如 `kernel_replacement_plan.md §九` 的 kernel 调用契约）确实存在于对应文档中。
+>   2. 当图谱在 pseudocode 中引用 ref_doc 的具体章节时，该 ref_doc 文件的指定章节是否确实包含了图谱所依赖的具体内容（函数签名、伪代码、维度参数、约束条件）？
+>   3. 如果 ref_doc 中该内容缺失或与图谱矛盾，重构者将无法写出正确代码——这是否构成了事实上的信息断裂？
+>   4. 不得假定"文档存在即信息完备"。必须打开文档确认内容后才可作结论。
+>
+> ---
+>
+> ### 2. 审计输出规范 (Output Format)
+> 
+> 请出具一份冷酷客观的《蓝图重构盲测漏洞报告》。禁止修改原文件，严格按以下结构输出你发现的系统级漏洞：
+> 
+> - **🔴 Fatal Gaps (致命脑补漏洞项)**：列出那些因为参考资料缺失、图谱也未提供具体伪代码/维度参数/接口签名，导致你**现在根本无法写出对应代码**（或必定写错）的节点。必须给出对应的 JSON Path 及导致死锁的理由。
+> - **🟡 Override Warnings (重载失效警告项)**：列出图谱指向了 `ref_code`，但缺乏明确的“修改/裁剪指引”，导致你极有可能直接抄入错误配置或不兼容逻辑的节点。
+> - **🟢 Reconstructability Score (重构可行性判决)**：给出一个 0-100% 的量化分数。以你当前掌握的信息（JSON + 脑海中的 RAG 参考库），你有多大把握写出能一次性跑通的 Qwen3 TP=4 引擎？必须列出阻碍你达到 100% 的 Top 3 阻断因素。
