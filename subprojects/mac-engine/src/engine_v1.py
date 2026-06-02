@@ -48,9 +48,14 @@ class InferenceEngine:
 
         token_ids = self.tokenizer.encode(prompt)
 
-        # Create fresh KV cache (one per layer)
+        # Create fresh KV cache (one per layer), pre-allocate for 2048 tokens
         n_layers = len(self.model.layers)
-        self._cache = make_kv_cache(n_layers)
+        self._cache = make_kv_cache(
+            n_layers,
+            n_kv_heads=self.config.num_key_value_heads,
+            head_dim=self.config.head_dim,
+            max_len=2048,
+        )
 
         # Prefill: full prompt forward with cache
         input_ids = mx.array([token_ids])
