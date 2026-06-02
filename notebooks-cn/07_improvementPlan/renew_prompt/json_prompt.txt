@@ -1,0 +1,37 @@
+> **系统最高指令：执行知识图谱 Schema 逆向解析与全量知识同步 (Knowledge Sync & Alignment)**
+> 
+> 你现在是 AutoLLM 系统的首席知识架构师。随着我们完成了 Qwen3 的 10 大核心改造（7 个 Kernel 替换 + 3 个框架层改动，见 `qwen3_effective_changes.md`）以及近期的 Raw CUDA Graph 攻坚，现有的 `inference_blueprint.json` 和 `AGENT_SKILL.md` 已经严重滞后于物理工程事实。
+> 
+> 我不需要你仅仅更新几个零散的节点。你必须执行一套极其严密的“Schema 抽取 -> 源码印证 -> 结构化写入”的标准化流水线。
+> 
+> 请严格按照以下四个阶段执行本次全量知识更新：
+> 
+> ### 阶段一：逆向解析原图谱的 Schema 范式 (Schema Reverse-Engineering)
+> 请深度阅读原始的 `meta-infer/.cursor/skills/inference_blueprint.json`，提取出我们定义知识的标准数据结构。你接下来的所有更新必须严格包含这些必备字段：
+> 1. **架构契约节点 (Architecture Node)**：必须包含 `source_refs` (溯源文档), `architectures`, `classification`, `*_routing`, `hard_rule` / `directive` (约束), `risk_if_violated`。
+> 2. **数据流与算子接口契约 (Interface Contract)**：必须包含 `source_impl` / `impl_code` (源码路径), `_note` (实现提示), 输入输出 Shape 定义, 核心底层调用签名（如 `flash_attn_with_kvcache`）。
+> 3. **故障模式库 (Failure Mode Library)**：必须包含 `symptom` (症状), `check` (排查手段), `fix` (修复方案), `source_refs`。
+> 
+> ### 阶段二：遍历提取与工程源码交叉印证 (Fact Extraction & Code Alignment)
+> 请读取 `@meta-infer/notebooks-cn/07_improvementPlan/qwen3_effective_changes.md` 中的全部 10 个改动点，以及近期 `cuda_graph_plan.md` 中关于 Raw CUDA Graph 的最终决策。
+> 在写入前，你必须将每一个知识点与当前 `meta-infer` 工程的实际代码进行交叉比对，确保证据链闭环。例如：
+> - 提取到 `silu_and_mul` 时，必须去 `engine/kernels/vllm_wrappers.py` 和 `engine/models/qwen.py` 确认其 `out` 预分配的调用逻辑。
+> - 提取到 `CustomAR` 时，必须确认其 out-of-place 特性及 `registered` 传参逻辑。
+> - 提取到 CUDA Graph 时，必须印证代码中静态 Buffer（如 `_graph_hidden_buf`）的真实变量名与赋值逻辑。
+> 
+> ### 阶段三：全量更新 `inference_blueprint.json` (Strict Serialization)
+> 严格依照阶段一提取的 Schema，向 JSON 注入新知识。**要求覆盖面 100%，不得遗漏任何一个踩坑点或 Kernel 契约：**
+> - **更新 `framework_layer` 及接口契约**：覆盖 框架层 3 大改动写入 (P0, P2, P3-FA)的底层约束。
+> - **更新 `qwen_series_dense` 及接口契约**：覆盖 7 大 Kernel 替换（RMSNorm chaining、RoPE cache 模块级共享、SDPA enable_gqa、QKV/MLP 合并投影等）的底层约束。
+> - **新增 `cuda_graph_execution_contract` 节点**：完整记录零 torch.compile 策略、静态 Buffer 零拷贝覆盖、cuBLAS `out=` 地址锁死、以及 Raw CUDA Graph 通信黑盒注册规范。
+> - **暴增 `failure_mode_library`**：将 10 个改动中涉及的所有“踩坑经验”（如 RoPE cache OOM、RMSNorm 跨层依赖、cuBLAS 地址漂移差 3.4、Dynamo RNG 崩溃）全部转化为标准化的 `symptom -> check -> fix` 词条。
+> 
+> ### 阶段四：同步更新 `AGENT_SKILL.md` (SOP Alignment)
+> 基于更新后的知识库，升维执行 SOP：
+> - 更新 **[1.1 面向可观测性设计]**：强制加入“静态图防御性探针”规则（Graph 捕获态内严禁调用引发 CPU 同步的 API）。
+> - 更新 **[7.4 通用 Debug 指南]**：增设“CUDA Graph 崩溃与显存指针漂移”专项排障流程。
+> - 更新 **[8. 完成定义 (DoD)]**：加入端到端性能吞吐底线与 CPU dispatch 毫秒级断言标准。
+> 
+> ---
+> **行动约束**：
+> 请向我展示你的思考过程（你提取到了哪些 Schema，准备往哪些 Json Path 写入哪些字段）。在思考完毕且确保 JSON 语法 100% 正确、不破坏原 HF 兜底路由的前提下，直接输出更新后的完整文件 Diff 或重写方案。

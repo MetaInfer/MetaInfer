@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-sglang"
+version = "0.0.1"
+description = "nano SGLang: LLM inference framework"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+classifiers = ["Programming Language :: Python :: 3"]
+dependencies = ["requests"]
+
+[project.optional-dependencies]
+all = [
+    "fastapi",
+    "psutil",
+    "rpyc",
+    "torch>=2.8.0",
+    "transformers",
+    "triton",
+    "uvloop",
+    "uvicorn",
+    "zmq",
+    "interegular",
+    "lark",
+    "numba",
+    "tqdm",
+    "numpy",
+    "requests",
+    "huggingface_hub",
+    "safetensors",
+    "Pillow",
+    "filelock",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/gogongxt/nano-sglang"
+"Bug Tracker" = "https://github.com/gogongxt/nano-sglang/issues"

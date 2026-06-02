@@ -1,0 +1,128 @@
+import argparse
+import dataclasses
+from typing import List, Optional
+
+
+@dataclasses.dataclass
+class ServerArgs:
+    model_path: str
+    tokenizer_path: Optional[str] = None
+    host: str = "127.0.0.1"
+    port: int = 30000
+    load_format: str = "auto"
+    tokenizer_mode: str = "auto"
+    trust_remote_code: bool = True
+    mem_fraction_static: Optional[float] = None
+    tp_size: int = 1
+    model_mode: List[str] = ()
+    schedule_heuristic: str = "lpm"
+    random_seed: int = 42
+    log_level: str = "info"
+
+    def __post_init__(self):
+        if self.tokenizer_path is None:
+            self.tokenizer_path = self.model_path
+        if self.mem_fraction_static is None:
+            if self.tp_size > 1:
+                self.mem_fraction_static = 0.8
+            else:
+                self.mem_fraction_static = 0.9
+
+    @staticmethod
+    def add_cli_args(parser: argparse.ArgumentParser):
+        parser.add_argument(
+            "--model-path",
+            type=str,
+            help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+            required=True,
+        )
+        parser.add_argument(
+            "--tokenizer-path",
+            type=str,
+            default=ServerArgs.tokenizer_path,
+            help="The path of the tokenizer.",
+        )
+        parser.add_argument("--host", type=str, default=ServerArgs.host)
+        parser.add_argument("--port", type=int, default=ServerArgs.port)
+        parser.add_argument(
+            "--load-format",
+            type=str,
+            default=ServerArgs.load_format,
+            choices=["auto", "pt", "safetensors", "npcache", "dummy"],
+            help="The format of the model weights to load. "
+            '"auto" will try to load the weights in the safetensors format '
+            "and fall back to the pytorch bin format if safetensors format "
+            "is not available. "
+            '"pt" will load the weights in the pytorch bin format. '
+            '"safetensors" will load the weights in the safetensors format. '
+            '"npcache" will load the weights in pytorch format and store '
+            "a numpy cache to speed up the loading. "
+            '"dummy" will initialize the weights with random values, '
+            "which is mainly for profiling.",
+        )
+        parser.add_argument(
+            "--tokenizer-mode",
+            type=str,
+            default=ServerArgs.tokenizer_mode,
+            choices=["auto", "slow"],
+            help="Tokenizer mode. 'auto' will use the fast "
+            "tokenizer if available, and 'slow' will "
+            "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--trust-remote-code",
+            action="store_true",
+            help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        )
+        parser.add_argument(
+            "--mem-fraction-static",
+            type=float,
+            default=ServerArgs.mem_fraction_static,
+            help="The fraction of the memory used for static allocation (model weights and KV cache memory pool)",
+        )
+        parser.add_argument(
+            "--tp-size",
+            type=int,
+            default=ServerArgs.tp_size,
+            help="Tensor parallelism degree.",
+        )
+        parser.add_argument(
+            "--model-mode",
+            type=str,
+            default=[],
+            nargs="+",
+            choices=["flashinfer", "no-cache"],
+            help="Model mode: [flashinfer, no-cache]",
+        )
+        parser.add_argument(
+            "--schedule-heuristic",
+            type=str,
+            default=ServerArgs.schedule_heuristic,
+            help="Schudule mode: [lpm, weight, random, fcfs]",
+        )
+        parser.add_argument(
+            "--random-seed",
+            type=int,
+            default=ServerArgs.random_seed,
+            help="Random seed.",
+        )
+        parser.add_argument(
+            "--log-level",
+            type=str,
+            default=ServerArgs.log_level,
+            help="Log level",
+        )
+
+    @classmethod
+    def from_cli_args(cls, args: argparse.Namespace):
+        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        return cls(**{attr: getattr(args, attr) for attr in attrs})
+
+
+@dataclasses.dataclass
+class PortArgs:
+    tokenizer_port: int  # Port for tokenizer manager communication
+    router_port: int  # Port for router process communication and load balancing
+    detokenizer_port: int  # Port for detokenizer process communication
+    nccl_port: int  # Port for NCCL multi-GPU communication
+    model_rpc_ports: List[int]  # Ports for model RPC calls (tensor parallelism)

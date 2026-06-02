@@ -1,0 +1,53 @@
+> **系统最高指令：基于自下而上拓扑依赖，重构纯 Eager 模式白板开发 SOP**
+> 
+> **执行身份**：AutoLLM 首席架构师与 SOP 流程规划专家。
+> **工程背景**：我们需要在一张“白板”上，从零重构支持 Qwen3 (TP=4) non-compile, non- cuda graph的自研推理框架。本次重构的**最高约束**是：绝对禁止引入 `torch.compile` 和 `CUDA Graph`，必须在纯 Eager 模式下，通过极致的 Python 调度和纯净的标品算子串联，直接对齐 `meta-infer` 的基准 Benchmark 指标（CPU dispatch < 15ms/layer，Eager 吞吐对齐）。
+> **你的任务**：读取现有的 `meta-infer/engine`及其在Qwen3 (TP=4) non-compile, non- cuda graph实际推理profiling得到的物理真实tracing 和 `meta-infer/.cursor/skills/inference_blueprint.json`，根据底层模块间的物理依赖关系，彻底重写 `meta-infer/.cursor/skills/AGENT_SKILL.md` 中的开发阶段（Phases）与串联顺序。
+> **核心要求**：作为拥有工程全局上下文的 Agent，你必须**自主推导**底层的物理依赖链路，以此来刷新开发 SOP。
+> 
+> 请严格按照以下 3 步方法论，分析并更新 `AGENT_SKILL.md` 中的 `[todo_generation_playbook]`：
+> 
+> ### 1. 真实依赖拓扑图逆向解析 (Dependency Graph Parsing)
+> - 读取当前 `inference_blueprint.json` 中的接口契约，结合你对现有工程模块职责的理解。
+> - **自主计算自下而上（Bottom-up）的构建依赖树**：分析模块间的耦合关系。例如：必须先实例化哪些基建（通信句柄、显存池等），才能测试中层积木（TP 线性层、Attention 算子），最后才能组装高层容器（Model Runner、Engine Loop）。
+> 
+> ### 2. 重写纯 Eager 模式的阶段流水线 (Phase Pipeline Restructuring)
+> - 基于你推导出的物理依赖树，彻底推翻旧的混合式开发 Phase，在 `AGENT_SKILL.md` 中重新划分出逻辑严密的开发流水线（Phase 1 到 Phase N）。
+> - 每个新 Phase 必须具备**高内聚性**。
+> - 在每个 Phase 的 `implementation_todos` 中，精准填入你推导出的、必须在该阶段按序实现的具体组件名。
+> 
+> ### 3. 注入纯 Eager 性能与 TDD 测试门禁 (Eager-Specific Gates)
+> - **摒弃旧的图编译测试**：由于本次是纯 Eager 重构，在每阶段的 `minimal_test_commands` 和 `done_criteria` 中，必须加入针对 Eager 模式的断言要求（例如：要求 TDD 独立验证 CustomAR 与标品 wrapper ；要求单层 Profiling 证明无多余的 Python 封箱开销）。
+> - **端到端验收底线**：在最终的 Phase 中，加入贪婪解码（Temperature=0）字字对齐与 CPU 延迟达标的 E2E 验收标准。
+> 
+> ---
+> **行动约束**：
+> 严禁直接开始编写业务代码。请先向我输出你推导出的**模块依赖拓扑关系分析**，以及基于此拓扑对 `AGENT_SKILL.md` 的完整更新方案（Diff 摘要）。确认无误后我们再开工。
+
+
+
+
+> **任务：基于真实工程拓扑与 Eager 性能目标的白板重构 SOP 逆向推导与更新**
+> 
+> **执行身份**：首席系统流程架构师。
+> **工程背景**：我们需要在“白板”上从零重构支持 Qwen3 (TP=4) 的自研推理框架。本次重构的最高约束是：**绝对禁用 torch.compile 与 CUDA Graph**。必须在纯 Eager 模式下，通过极致的 Python 调度和标品黑盒算子串联，直接对齐基准 Benchmark 指标（CPU dispatch < 15ms/layer，Eager 吞吐对齐）。
+> **核心要求**：作为拥有工程全局上下文的 Agent，你必须**自主推导**底层的物理依赖链路，以此来刷新开发 SOP。
+> 
+> 请严格按照以下 3 步方法论，分析并更新 `AGENT_SKILL.md` 中的 `[todo_generation_playbook]`：
+> 
+> ### 1. 真实依赖拓扑图逆向解析 (Dependency Graph Parsing)
+> - 读取当前 `inference_blueprint.json` 中的接口契约，结合你对现有工程模块职责的理解。
+> - **自主计算自下而上（Bottom-up）的构建依赖树**：分析模块间的耦合关系。例如：必须先实例化哪些基建（通信句柄、显存池等），才能测试中层积木（TP 线性层、Attention 算子），最后才能组装高层容器（Model Runner、Engine Loop）。
+> 
+> ### 2. 重写纯 Eager 模式的阶段流水线 (Phase Pipeline Restructuring)
+> - 基于你推导出的物理依赖树，彻底推翻旧的混合式开发 Phase，在 `AGENT_SKILL.md` 中重新划分出逻辑严密的开发流水线（Phase 1 到 Phase N）。
+> - 每个新 Phase 必须具备**高内聚性**。
+> - 在每个 Phase 的 `implementation_todos` 中，精准填入你推导出的、必须在该阶段按序实现的具体组件名。
+> 
+> ### 3. 注入纯 Eager 性能与 TDD 测试门禁 (Eager-Specific Gates)
+> - **摒弃旧的图编译测试**：由于本次是纯 Eager 重构，在每阶段的 `minimal_test_commands` 和 `done_criteria` 中，必须加入针对 Eager 模式的断言要求（例如：要求 TDD 独立验证 CustomAR 与标品 wrapper ；要求单层 Profiling 证明无多余的 Python 封箱开销）。
+> - **端到端验收底线**：在最终的 Phase 中，加入贪婪解码（Temperature=0）字字对齐与 CPU 延迟达标的 E2E 验收标准。
+> 
+> ---
+> **行动约束**：
+> 严禁直接开始编写业务代码。请先向我输出你推导出的**模块依赖拓扑关系分析**，以及基于此拓扑对 `AGENT_SKILL.md` 的完整更新方案（Diff 摘要）。确认无误后我们再开工。

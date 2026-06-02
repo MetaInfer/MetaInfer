@@ -1,0 +1,188 @@
+
+> **任务：全面实施「测试脚本作为先验知识」体系改造与 Superpowers 审查门禁**
+> 
+> **执行身份**：AutoLLM 系统首席测试架构师与 DevOps 流程控制官。
+> **输入依据**：最新的 `meta-infer/notebooks-cn/07_improvementPlan/test_scrpits/test_as_prior_knowledge_plan.md`、`meta-infer/.cursor/skills`、`meta-infer/.cursor/AGENT_SKILL.md`。
+> **核心目标**：彻底剥夺后续开发 Agent “自编自导自演”测试脚本的权力。你必须建立一个神圣不可侵犯的 `scripts/` 测试契约库，强制执行 10 条审查门禁，并实施对抗压力测试。
+> 
+> 请严格按照以下 4 个阶段执行本次底层工作流重构：
+> 
+> ### 阶段一：先验测试脚本生成与标准化头部 (Script Generation)
+> 请在根目录下创建 `scripts/` 目录。你将按计划输出 26 个脚本。
+> **强制要求**：每个脚本文件头部必须严格包含以下 4 行元数据（缺失直接驳回）：
+> ```python
+> # Why: 防止 [具体错误描述]（发现于 [日期, commit/issue/审计报告项]）
+> # What failure: Agent 如果 [具体错误行为]，此测试将 [具体失败信息]
+> # Superpowers gate: 此脚本对应 superpowers CLAUDE.md rule X (如：No speculative fixes)
+> ```
+> *(注：考虑到上下文窗口，本次会话我们先集中攻坚**最高发区 Phase 6 和 Phase 1-3** 的脚本。)*
+> 
+> ### 阶段二：通过 Shell 挂载子代理执行 10 项对抗审查 (Subagent Review)
+> 你在保存完一个（或一组）测试脚本后，**绝对禁止由你自己宣判合格**。
+> 你必须通过执行 Shell 命令（例如 `claude -p "..."` 或相应的无记忆 CLI 命令），拉起一个独立的审查子代理。
+> 
+> **执行动作**：在终端执行挂起子进程的命令，给子代理的 Prompt 必须包含以下要求：
+> `"你现在是代码审查子代理。请严格阅读 scripts/[脚本名] 的源码。对照 test_as_prior_knowledge_plan.md 第 7 节的 10 条门禁：[S1]真实bug引用, [S2]非前摄性假想, [S3]单一不变性, [S4]待人类Diff, [S5]确定性运行, [S6]完整文件头, [G7]独立运行, [G8]精确报错, [G9]边界覆盖, [G10]环境变量。请输出冷酷的结论：【审查通过】或【审查驳回：指出违规门禁编号和原因】。"`
+> 
+> - 如果子代理返回【审查驳回】，你必须根据原因修改脚本，并**再次拉起子代理重审**。
+> 
+> ### 阶段三：对抗压力测试 (Adversarial Pressure Testing)
+> 脚本通过审查后，你必须执行一次物理验证：
+> 1. 故意去修改现有的正确代码（引入该脚本旨在防范的错误，例如在 MLP 里乱用跨层 weight）。
+> 2. 运行你刚写的脚本，**断言它确实会失败（RED）**，且报错信息清晰。
+> 3. 恢复正确代码，运行脚本，**断言它确实通过（GREEN）**。
+> 
+> ### 阶段四：契约注入与 SOP 重写 (Blueprint & SOP Overhaul)
+> 在首批脚本通过所有测试落盘后：
+> 1. **更新 `inference_blueprint.json`**：在对应的 phase 节点注入 `test_interface_contracts`，严格按照计划文档第 9 节的 JSON 结构，注明 `file`、`guards_against` 和 `past_error_triggered_by`。
+> 2. **更新 `AGENT_SKILL.md`**：彻底推翻原 §6.1 节，重写为**【测试即规范（Tests as Specification）】**。明确立下铁律：`scripts/` 目录为先验知识，开发 Agent 仅有读取权限，绝对禁止修改；开发前先跑 script 见 RED，写代码后再跑见 GREEN。
+> 
+> ---
+> **行动约束**：
+> 1. 请先向我简要确认你对 10 条门禁和对抗压力测试流程的理解。
+> 2. 确认无误后，直接开始生成脚本。
+> 3. 脚本落盘后，请**立即当着我的面在终端执行子代理审查命令**，等待其返回结果。开始执行！
+
+
+
+
+
+
+
+
+> **系统最高指令：基于纯 Eager 物理 Tracing 的先验测试脚本重审与全量补齐**
+> 
+> **执行身份**：AutoLLM 首席测试架构师与物理性能核查官。
+> **输入依据**：
+> 1. `notebooks-cn/07_improvementPlan/test_scripts/test_as_prior_knowledge_plan.md`
+> 2. `.cursor/skills/inference_blueprint.json` & `.cursor/AGENT_SKILL.md`
+> 3. **【绝对真源】**：本地的 TP=4 无 torch.compile 无 cuda graph 的真实 Profiling Tracing 数据@meta-infer/notebooks-cn/07_improvementPlan/test_scrpits（请首先读取该 Trace 日志/文件）。
+> 
+> **核心目标**：引入物理 Tracing 作为最高裁决依据。用物理事实审视已生成的 4 个脚本是否具备真实的拦截力，并作为硬约束生成剩余的 22 个测试脚本。
+> 
+> 请严格按照以下 4 个阶段执行：
+> 
+> ### 阶段一：物理真源提取与旧脚本溯源重审 (Trace-Driven Audit)
+> 请深度读取 TP=4 纯 Eager 模式的 Profiling Trace，提取真实算子的调优时序、Kernel 执行数量、通信开销和 Tensor Shape。
+> 然后，严格复审第一轮生成的 脚本（Phase 1/2/3/6）：
+> - **审查要求**：`test_phase3_tp_linear.py` 里的 `gate_up=6144` 是否和 Trace 里真实发生的 GEMM 参数严丝合缝？`test_phase6_residual_chain.py` 的耗时断言是否符合 Eager 模式的物理上限？
+> - **执行动作**：如果发现旧脚本的断言纯属理论脑补而偏离了 Trace 物理事实，立即原地重写并重新触发子代理审查。
+> 
+> ### 阶段二：物理 Trace 驱动的剩余脚本生成 (Trace-Constrained Generation)
+> 开始生成计划中剩余的 22 个测试脚本（重点攻坚 Phase 4, 5, 7-10）。
+> **【强制物理对齐约束】**：
+> - 编写 **Phase 5 (Attention/KV)** 测试时：`flash_attn_varlen_func` 的 `cu_seqlens` 断言必须与 Trace 中捕获的 Ragged 批次真实长度阵列完全一致。
+> - 编写 **Phase 7 (Weight Loading)** 测试时：严禁脑补切分逻辑，必须对照 Trace 中显存分配的峰值（Peak VRAM）设置防双重加载的显存断言门限。
+> - 编写 **Phase 10 (E2E & Profiling)** 测试时：`test_phase10_no_compile_check.sh` 必须包含对 Trace 文件的 grep/awk 脚本，硬性断言 `cudaGraphLaunch` 次数必须为 **0**，且单层 CPU dispatch 耗时断言必须对齐真实 Eager Trace 的基线（如 `<15ms`）。
+> 
+> ### 阶段三：升维版对抗审查与子代理唤醒 (Trace-Aware Subagent Review)
+> 脚本落盘后，通过 Shell 挂起无上下文的审查子代理。此次审查增加第 11 条【物理真源门禁】。
+> **子代理唤醒命令要求**（在终端执行）：
+> ```bash
+> claude -p "你是代码审查子代理。审查 scripts/[脚本名]。对照 10条基础门禁（[S1]到[G10]），并强制检查第 11 条：[T11]物理溯源（该脚本中的核心断言数值/Shape/时间阈值，是否在文件头的注释中明确写明了来源于哪个 Profiling Trace 的对应行或事件？）。输出【审查通过】或【审查驳回：指出违规门禁编号和原因】。"
+> ```
+> *(必须收到【审查通过】才能推进，否则根据驳回意见重写重审。)*
+> 
+> ### 阶段四：对抗压力测试与蓝图闭环 (Adversarial & Blueprint Injection)
+> 1. **物理压力测试**：故意在引擎中改错一个张量维度或注释掉一个 kernel，确认刚生成的测试脚本能精准捕捉到该错误（RED），恢复后通过（GREEN）。
+> 2. **蓝图写入**：将新生效的 22 个 `test_interface_contracts` 注入 `inference_blueprint.json`，确保 `guards_against` 字段直接引用物理 Trace 暴露的风险点。
+> 
+> ---
+> **行动约束**：
+> 1. 请先向我汇报你从 TP=4 Profiling Tracing 中提取到了哪些直接影响断言的关键物理参数（Shape、耗时基线、通信算子调用频次）。
+> 2. 汇报对已生成的 4 个脚本的重审结论。
+> 3. 无误后，分批生成余下 22 个脚本，每次生成必须当着我的面执行子代理命令。开始执行！
+
+
+
+
+
+
+
+> **系统最高指令：【断点续传】防遗忘上下文重置与剩余 13 个先验测试脚本生成**
+> 
+> **执行身份**：AutoLLM 首席测试架构师与物理性能核查官。
+> **当前状态同步**：我们已经成功完成了 13/26 个测试脚本的生成与子代理审查（Batch 1-3 已 commit）。
+> **剩余任务**：完成最后 13 个脚本（Phase 1 sh, Phase 3 tp4, Phase 4 tp4, Phase 6 e2e, Phase 7 config/sh, Phase 8 sampler, Phase 9 ×2, Phase 10 ×3）。
+> 
+> ⚠️ **警告：为了防止长上下文导致的规则遗忘，在开始写代码前，你必须严格重载以下 5 大铁律。任何违反以下铁律的生成将被直接终止并驳回！** ⚠️
+> 
+> ### 铁律一：物理 Tracing 绝对真源约束 [T11]
+> 严禁脑补任何 Shape、耗时或调用次数！你在写这 13 个脚本（特别是 TP=4 和 Phase 10 E2E 脚本）时，必须重新查阅 `meta-infer/notebooks-cn/07_improvementPlan/test_scrpits/` 下的物理 Profiling Trace 数据。所有断言（如 `cudaGraphLaunch == 0`，`TTFT < 50ms`，张量切分维度）必须有 Trace 数据背书。
+> 
+> ### 铁律二：标准化防伪文件头
+> 每一个新生成的脚本，其头部必须一字不差地包含以下 5 行元数据：
+> ```python
+> # Why: 防止 [具体错误描述]
+> # What failure: Agent 如果 [具体错误行为]，此测试将 [具体失败信息]
+> # Superpowers gate: 对应 CLAUDE.md rule X
+> # Trace Source: 本脚本核心断言来源于 [具体 Trace 文件/事件]
+> ```
+> 
+> ### 铁律三：强制挂载子代理审查 (11 项门禁)
+> 脚本落盘后，**绝对禁止你自行宣判通过**。你必须当着我的面，在终端执行以下命令唤醒无上下文的子代理：
+> ```bash
+> claude -p "你是代码审查子代理。审查 scripts/[新脚本名]。对照 10条基础门禁（[S1]真实bug引用, [S2]非前摄性假想, [S3]单一不变性, [S4]待人类Diff, [S5]确定性运行, [S6]完整文件头, [G7]独立运行, [G8]精确报错, [G9]边界覆盖, [G10]环境变量），并强制检查第 11 条：[T11]物理溯源（断言必须有物理 Trace 来源标注）。输出【审查通过】或【审查驳回：指出违规门禁和原因】。"
+> ```
+> *(必须收到【审查通过】才能进行下一步。)*
+> 
+> ### 铁律四：对抗压力测试 (RED/GREEN)
+> 审查通过后，必须去业务代码中故意改错，证明该脚本能准确抛出 RED 报错，恢复后能 GREEN 通过。
+> 
+> ### 铁律五：蓝图与 SOP 契约闭环
+> 这 13 个脚本全部完成后，你必须：
+> 1. 读取 `.cursor/skills/inference_blueprint.json`，将新脚本作为 `test_interface_contracts` 注入对应 Phase。
+> 2. 读取 `.cursor/AGENT_SKILL.md`，确认 §6.1 节已正确约束了“必须先跑 scripts 见 RED，再写代码见 GREEN”的工作流，如有缺漏立即补齐。
+> 
+> ---
+> **行动计划**：
+> 请不要一次性生成 13 个，避免显存爆炸和丢失细节。我们将分批进行：
+> **当前批次 (Batch 4)**：请生成 `Phase 3 tp4`, `Phase 4 tp4`, `Phase 6 e2e`, `Phase 7 config`, `Phase 7 sh` 这 5 个脚本。
+> 
+> **行动约束**：
+> 1. 请简短回复“我已重载 5 大铁律，绝不遗忘子代理审查与物理 Trace 约束”。
+> 2. 立即开始查阅 Trace 数据并生成 Batch 4 的 5 个脚本。
+> 3. 每个脚本保存后，**立即在终端运行 `claude -p ...` 触发审查**。开始执行！
+
+
+
+> **系统最高指令：【终极闭环】Batch 5 全量生成与基建红线锁死 (The Final Batch)**
+> 
+> **执行身份**：AutoLLM 首席测试架构师与物理性能核查官。
+> **当前状态同步**：前 4 个 Batch 表现完美，已完成 18/26 个脚本。
+> **剩余任务**：在一个批次内完成最后的 8 个脚本（Phase 1 sh, Phase 8 sampler, Phase 9 ×2, Phase 10 ×3），并执行最终的架构图谱更新。
+> 
+> ⚠️ **警告：这是整个测试底座的最后一块拼图。你必须继续保持最高级别的物理对齐，绝不允许在最后的 E2E 验收脚本中出现任何理论脑补！** ⚠️
+> 
+> ### 铁律一：Phase 10 的绝对物理 Trace 门禁 [T11]
+> 在编写 Phase 10 的 3 个验收脚本（`benchmark.sh`, `no_compile_check.sh`, `vs_vllm_compare.sh`）时：
+> 1. `no_compile_check.sh` 必须包含硬核的文件解析逻辑（如 `grep`/`awk`），从 Profiling 输出中强断言 `cudaGraphLaunch` 次数严格等于 **0**，且单层 CPU dispatch 时间对齐真实 Trace。
+> 2. `vs_vllm_compare.sh` 必须正确设定端口并发出压测请求，其吞吐达标底线必须来源于文档或 Trace 记录的真实物理基线（如 `≥54 tok/s`）。
+> 
+> ### 铁律二：文件头防伪与子代理唤醒
+> - 每个脚本头部必须保留 5 行元数据，包含 `# Trace Source: [溯源]`。
+> - 脚本生成后，必须在终端拉起无上下文的子代理进行对抗审查：
+> ```bash
+> claude -p "你是代码审查子代理。审查 scripts/[新脚本名]。对照 10条基础门禁（[S1]真实bug引用, [S2]非前摄性假想, [S3]单一不变性, [S4]待人类Diff, [S5]确定性运行, [S6]完整文件头, [G7]独立运行, [G8]精确报错, [G9]边界覆盖, [G10]环境变量），并强制检查第 11 条：[T11]物理溯源。输出【审查通过】或【审查驳回：指出违规门禁和原因】。"
+> ```
+> 
+> ### 铁律三：全量蓝图更新与 SOP 闭环 (Final Injection)
+> 8 个脚本全部审查通过并完成 RED/GREEN 压测后，你必须执行最终的系统交接动作：
+> 1. 将这最后 8 个脚本的 `test_interface_contracts` 准确注入 `.cursor/skills/inference_blueprint.json` 对应的 Phase 节点。
+> 2. 核对 `.cursor/AGENT_SKILL.md`，确保先验测试工作流的描述字字无误。
+> 3. 在控制台输出一份简短冷酷的《26个先验测试脚本基建交付报告》。
+> 
+> ---
+> **行动计划**：
+> 本次 Batch 5 将一口气完成剩余的 8 个脚本：
+> - `test_phase1_kernel_wrappers.sh`
+> - `test_phase8_sampler_tp.py`
+> - `test_phase9_llm_engine_init.py`
+> - `test_phase9_generate_single_gpu.sh`
+> - `test_phase10_benchmark.sh`
+> - `test_phase10_no_compile_check.sh`
+> - `test_phase10_vs_vllm_compare.sh`
+> *(注：第 8 个脚本若与剩余清单有偏差，请自行根据 plans 补齐缺失的 1 个)*
+> 
+> **行动约束**：
+> 请直接确认并开始查阅 Trace 数据。每写完 1~2 个脚本，立即在终端触发 `claude -p` 子代理审查，不要积压到最后一起审。开始最终闭环！

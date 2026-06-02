@@ -1,0 +1,90 @@
+> **任务：执行推理框架全量知识图谱与物理工程实现的独立交叉审计**
+> 
+> **审计身份**：AutoLLM 系统独立三方审计官（Third-Party Auditor）。
+> **审计目标**：全面扫描 `meta-infer/.cursor/skills/inference_blueprint.json` 中所有知识节点，核验知识图谱记录的规范与自研工程代码的物理保真度。
+> 
+> ### 1. 审计资源清单与边界约束
+> 
+> #### 1.1 审计输入源
+> - **核心图谱**：`inference_blueprint.json`（目标组件列表见 `framework_layer.components`）。
+> - **输入变更文档**：`qwen3_effective_changes.md`（10 大核心改动点）、`cuda_graph_plan.md`（Raw CUDA Graph 最终技术决策）。
+> - **工程源码路径**：自研工程目录 `meta-infer/engine/`，参考工程目录 `meta-infer/ref_projects/`,参考doc目录'meta-infer/notebooks-cn'
+> 
+> ### 2. 三方交叉印证（Trinity Verification）SOP
+> 
+> 针对 `inference_blueprint.json` 内声明的每一个组件节点或全局约束，你必须依次提取其绑定的 `"ref_docs"`、`"ref_code"`、`"impl_code"` 字段，执行以下物理核对：
+> 
+> #### 2.1 标品与实现对齐核验
+> - **规则**：对比 `ref_code`（参考工程源码）与 `impl_code`（自研实现代码）。核对数据接口契约（Tensor Shape, Dtype, 连续性）是否完全对齐。
+> - **实例要求**：
+>   - 比如检查 `engine/kernels/vllm_wrappers.py` 中 `rms_norm` / `fused_add_rms_norm` / `silu_and_mul` / `rotary_embedding` 的函数签名与预分配 `out` 张量，是否与 vLLM 标品契约一致。
+>   - 比如检查 `engine/tp_layers/linear.py` 中 `QKVColumnParallelLinear` 和 `MergedColumnParallelLinear` 的合并投影代码，是否等价实现了标品 ColumnParallel 逻辑。
+>   - 其它知识点按照上面契约进行同样检查
+> 
+> #### 2.2 角色与实现对齐核验
+> - **规则**：对照 `ref_docs` 中定义的职责与图谱中的 `role` 说明，深入 `impl_code` 检索真实控制流（如 Scheduler 的 prefill 优先调度、BlockManager 的 may_append 扩容等），核对代码行是否满足架构设计描述。
+> 
+> #### 2.3 资源缺失补偿机制
+> - **规则**：若某个新增的高性能节点（如 CUDA Graph 静态图优化、自定义黑盒通信算子注册等）缺失 `ref_code` 或 `ref_docs`，**必须强制启用补偿机制**：
+>   - 使用 `cuda_graph_plan.md` 记录的 9 大物理 Trace 事实（TF-1 至 TF-9）进行全量补足。
+>   - 交叉检索 `engine/tp_layers/distributed.py` 中 `@torch.library.custom_op("meta_infer::all_reduce_sum")` 的真实注册状态与 Fake Tensor 推导逻辑，核验其是否达成了屏蔽 Dynamo 追踪的目标。
+> 
+> #### 2.4 故障模式与探针核验
+> - 扫描 `failure_mode_library` 中的所有 词条，进入 `impl_code` 确认是否注入了相对应的非阻塞防御性探针（如使用 `is_current_stream_capturing` 规避 `.item()` 触发的图捕获流死锁）。
+> 
+> ### 3. 审计输出规范
+> 
+> 审计结束后，禁止直接改动任何文件，必须输出格式严密的《知识图谱合规审计报告》，结构限定如下：
+> 
+> - **🟢 Passed (完全合规项)**：列出 `ref_docs`、`ref_code`、`impl_code` 三方证据链完美闭环、接口Shape与底层物理事实100%对齐的知识节点。
+> - **🔴 Critical Violations (严重缺陷项)**：列出图谱记录内容与实际代码物理失真、概念脑补、或者 Schema 结构错误的节点。必须给出精确的 **JSON Path**、对应的**代码冲突路径**以及**修正代码规格**。
+> - **🟡 Warnings (描述模糊项)**：列出图谱中虽有记录但内容泛化，缺乏具体变量名、Shape 参数或错误码守卫约束，无法直接指导后续 Sub-Agent 开发的“水节点”。
+> 
+> 请立即启动独立扫描，对齐工程事实，输出第一阶段审计分析。
+> 输出审计报告.md到meta-infer/notebooks-cn/07_improvementPlan/renew_prompt路径下
+
+
+
+
+
+
+
+
+
+
+> **任务：基于真实 Tracing 验证驱动的知识图谱全量自愈与缺陷清算（CRITICAL / WARNING / PENDING）**
+> 
+> **执行身份**：AutoLLM 系统首席架构师与自动化自愈引擎。
+> **物理真源**：自研工程目录 `meta-infer` 内的真实控制流代码、真实的物理 Profiling 抓取
+> 
+> 请严格按照以下 4 步物理闭环 SOP，对审计报告@meta-infer/notebooks-cn/07_improvementPlan/build_prompt/isolated_reconstructability_audit_v17.md中抛出的 Critical、Warning进行运行期（Runtime）核对与全量知识库自愈：
+> 
+> ---
+> 
+> ### 1. 物理运行期 Tracing 采集与交叉断言（Runtime Verification Gate）
+> 
+> 严禁仅靠阅读代码进行文字拼凑。在修改知识图谱前，你必须在环境中实际拉起 `torchrun --nproc_per_node=4 pytest tests/test_qwen_tp_real.py` 触发真实的物理 Profiling 抓取，并通过脚本精准解析 Trace，对Critical、Warning审计冲突点做物理事实断言：
+
+> ---
+> 
+> ### 2. 严格对齐 Schema 范式，全量更新 `meta-infer/.cursor/skills/inference_blueprint.json`
+> 
+> 验证物理事实后，必须严格遵循 JSON 原生 Schema 结构进行 100% 覆盖度的写入自愈（禁止删除原有路由和 MLA 并行逻辑，采用高性能分支契约并存）：
+> 
+> - **修正【CRITICAL】相关内容**：
+> - **修正【Warning】关内容**：
+> 
+> ### 3. 同步升级 `meta-infer/.cursor/skills/AGENT_SKILL.md` (执行 SOP 固化)
+> 
+> - **修正【CRITICAL】相关内容**：
+> - **修正【Warning】关内容**：
+> ---
+> 
+> ### 4. 审计与自愈交付报告规范
+> 
+> 完成两份核心系统文件（`.json` 和 `.md`）的增量写入和 Git Commit 后，请为我输出一份格式极度冷酷、没有任何修饰词的《自愈工程闭环总结报告》。报告必须包含：
+> - **1. 物理 Trace 证据链核验结果**：说明在真实多卡环境下抓取 Trace 后的各冲突项判决结论（提供 data_ptr 或关键调用栈）。
+> - **2. 图谱 JSON 、 SOP.md增量修改 Diff 摘要**：列出具体被修复或新开辟的节点路径。
+> - **3. 最终系统级性能与正确性指标断言**：确认通过此番自愈后，单步 CPU dispatch 延迟稳定控制在 `<50ms` 内，且 Greedy Decode 文本字字对齐。
+> 
+> 立即拉起多卡 Profiling，让数据说话，启动自愈流水线！
