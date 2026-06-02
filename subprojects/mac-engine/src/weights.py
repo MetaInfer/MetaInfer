@@ -20,10 +20,11 @@ from .model import Qwen3Config, Qwen3ForCausalLM
 
 
 def _load_safetensors(model_dir: str) -> dict[str, mx.array]:
-    """Load all weights from safetensors files, converting to MLX arrays."""
-    import safetensors
-    import torch
+    """Load all weights from safetensors files via mx.load().
 
+    Uses mx.load() directly to preserve native dtypes (bfloat16, float16, etc.)
+    without going through torch/numpy which would force float32 conversion.
+    """
     weights: dict[str, mx.array] = {}
     model_path = Path(model_dir)
 
@@ -32,12 +33,8 @@ def _load_safetensors(model_dir: str) -> dict[str, mx.array]:
         st_files = sorted(model_path.glob("model*.safetensors"))
 
     for st_file in st_files:
-        with safetensors.safe_open(str(st_file), framework="pt") as f:
-            for key in f.keys():
-                t = f.get_tensor(key)
-                if t.dtype == torch.bfloat16:
-                    t = t.to(torch.float32)
-                weights[key] = mx.array(t.numpy())
+        file_weights = mx.load(str(st_file))
+        weights.update(file_weights)
 
     return weights
 

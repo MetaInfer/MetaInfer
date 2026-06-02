@@ -27,6 +27,9 @@ def _compiled_sample(logits_last: mx.array, temperature: float) -> mx.array:
 
 _compiled_sample = mx.compile(_compiled_sample, shapeless=True)
 
+# Thread-local stream for async pipeline (see mlx_lm/generate.py:226)
+_generation_stream = mx.new_thread_local_stream(mx.gpu)
+
 
 class InferenceEngine:
     """Phase 1: KV cache incremental decode."""
@@ -64,15 +67,15 @@ class InferenceEngine:
         input_ids = mx.array([token_ids])
         logits = self.model(input_ids, cache=self._cache)
 
-        # Define inner step: forward + sample (no Python sync)
+        # Define inner step: forward + sample (runs on generation stream)
         def _step(tok_arr: mx.array) -> mx.array:
-            """One decode step: model forward + compiled argmax. Returns output logits."""
-            _in = tok_arr.reshape(1, 1)
-            _logits = self.model(_in, cache=self._cache)
-            return _compiled_sample(_logits[0, -1, :], temperature)
+            """One decode step on generation stream. Returns sampled token id."""
+            with mx.stream(_generation_stream):
+                _in = tok_arr.reshape(1, 1)
+                _logits = self.model(_in, cache=self._cache)
+                return _compiled_sample(_logits[0, -1, :], temperature)
 
-        # Pipeline: async_eval pattern (see mlx_lm/generate.py:396-470)
-        mx.new_stream(mx.gpu)
+        # Pipeline: async_eval pattern (see mlx_lm/generate.py:453-470)
         y = _compiled_sample(logits[0, -1, :], temperature)
 
         n = 0

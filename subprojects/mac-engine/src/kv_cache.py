@@ -72,8 +72,9 @@ class KVCache:
 
 def make_kv_cache(num_layers: int, n_kv_heads: int = 8, head_dim: int = 128,
                    max_len: int = 0) -> list[KVCache]:
-    """Create KV cache list. If max_len > 0, pre-allocate buffers."""
-    if max_len > 0:
-        return [KVCache.pre_allocated(n_kv_heads, head_dim, max_len) 
-                for _ in range(num_layers)]
+    """Create KV cache list.
+
+    Always uses dynamic growth (matching mlx_lm's KVCache).
+    The cache auto-detects dtype from the first K/V tensor stored.
+    """
     return [KVCache() for _ in range(num_layers)]
