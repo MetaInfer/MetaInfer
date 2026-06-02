@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+*.env.local
+
+# Temporary
+/tmp/
+*.log
+*.tmp
+
+# Large model files (should NEVER be committed)
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Claude Code internal (keep skills/, exclude sessions)
+.claude/sessions/
+.claude/worktrees/
+
+# Misc Python
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+coverage/
+htmlcov/

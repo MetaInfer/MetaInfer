@@ -1,0 +1,2939 @@
+{
+  "metadata": {
+    "name": "agent-infer TP/EP Inference Blueprint",
+    "version": "2.3.0",
+    "last_updated": "2026-04-30",
+    "scope": "Framework + Qwen3 TP + DeepSeek-V2 TP/EP",
+    "purpose": "给 Agent 提供可直接执行的推理框架搭建知识与 TP 适配约束。"
+  },
+  "agent_navigation": {
+    "ref_docs_policy": {
+      "rule": "ref_docs/source_refs 路径中的文档是蓝图信息的扩展存储，不是被动参考资料。当蓝图的 pseudocode/API spec 引用 ref_doc 章节时，该章节包含的信息视为蓝图的组成部分。Agent 在实现前必须实际打开并验证引用存在，不得假定'文档存在即信息完备'。",
+      "mandatory": [
+        "改动涉及 ref_docs 的组件前，必须先打开并阅读对应的 ref_doc 文件",
+        "审计时必须抽样打开至少 3 个 ref_doc，逐段验证至少 1 个引用的知识点确实存在",
+        "发现 ref_doc 与蓝图矛盾时以蓝图为准并记录差异",
+        "ref_doc 中找不到蓝图引用的知识点时标记为信息断裂，不得脑补"
+      ]
+    },
+    "how_to_find_tp_knowledge": "Qwen 与 DeepSeek-V2 的并行与层间契约分两处：routing/算子语义在 model_layer.architecture_knowledge_base；具体 shape 在 framework_layer.data_flow_contracts.tp_layer_interface_contracts。实现代码入口见各 source_impl / impl_code 字段。",
+    "qwen3_dense_tp": {
+      "json_paths": [
+        "model_layer.architecture_knowledge_base.qwen_series_dense",
+        "framework_layer.data_flow_contracts.tp_layer_interface_contracts.qwen3_tp_model_interfaces"
+      ],
+      "impl_entrypoints": [
+        "engine/models/qwen.py",
+        "engine/tp_layers/linear.py",
+        "engine/tp_layers/embedding.py",
+        "llm_engine.py"
+      ]
+    },
+    "deepseek_v2_mla_moe_tp": {
+      "json_paths": [
+        "model_layer.architecture_knowledge_base.deepseek_v2_v3_mla_moe",
+        "model_layer.lazy_loader_synthesis_rules.deepseek_mla_moe_loader",
+        "framework_layer.data_flow_contracts.tp_layer_interface_contracts.deepseek_v2_tp_model_interfaces",
+        "framework_layer.data_flow_contracts.tp_layer_interface_contracts.deepseek_v2_mla_kv_contract"
+      ],
+      "impl_entrypoints": [
+        "engine/models/deepseek_v2.py",
+        "engine/tp_layers/moe.py",
+        "engine/tp_layers/linear.py",
+        "engine/tp_layers/embedding.py",
+        "llm_engine.py"
+      ]
+    },
+    "execution_policy": {
+      "single_agent_only": true,
+      "monitor_subagent_exception": "允许 1 个只读监控子代理，仅采集 HCU/VRAM 指标，不得改代码。",
+      "note": "禁止并行 subagents 改同一套文件；长任务分 phase 执行，默认目标是一次会话完成 phase_1~phase_9（见 AGENT_SKILL.md）。"
+    }
+  },
+  "framework_layer": {
+    "project_context": {
+      "problem_statement": "成熟推理框架过于臃肿，包含大量多模型、多部署、多策略动态分派，降低可维护性与性能。",
+      "goal": "先搭建最小可用推理框架组件，再完成 Qwen3 与 DeepSeek-V2 的 TP 推理闭环。"
+    },
+    "components": [
+      {
+        "name": "Scheduler",
+        "role": "执行 prefill/decode 连续批调度；prefill 优先；资源不足时只排队不抢占；在 postprocess 中推进状态并触发 token 级块扩展。",
+        "ref_docs": [
+          "notebooks-cn/01_framework_design/02_scheduler.md",
+          "notebooks-cn/01_framework_design/07_request_lifecycle.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/scheduler.py"
+        ],
+        "impl_code": [
+          "engine/scheduler.py"
+        ],
+        "_dual_track_note": "LLMEngine block_size=16 仅对 RealModelRunner 有效。TP Runner 硬编码 _kv_block_size=256。",
+        "_nano_vllm_override": "nano-vllm scheduler.py 的 preempt() 逻辑 (line 52-57) 必须删除。block_size 所有引用必须替换为 self._block_size (由 LLMEngine 注入 16 或 256)。 nano-vllm scheduler.py line 52 can_append(seq) 和 line 60 may_append(seq) 需改为 can_append_one_more (num_free_blocks>=1) 逻辑。TP 路径下 BlockManager 已降级，不能直接调用其 can_append/may_append 方法。 preempt() 方法体 (L66-69) 完全删除。deallocate() 方法在 TP 路径下改为 no-op。schedule() 中 L54 self.running.pop() 替换为顺序迭代 (pop + re-append 在无抢占 TP 路径会导致序列丢失)。 TP 路径下 can_append_one_more = (runner.get_num_free_blocks() >= 1)。TP 路径不调用 BlockManager 的 can_append/may_append (已降级 no-op)。decode 调度使用 runner 来源的 num_free_blocks。 TP 路径下 Schedule.schedule() 方法体必须重写（非外部包装）。因为 nano-vllm 内部有 3 处 self.block_manager.xxx() 调用，全部需替换为 runner.get_num_free_blocks() 来源的 num_free 参数。参考 scheduler_tp_runner_bridge.prefill_timing_gap.pseudocode 的 schedule(num_free) 签名。"
+      },
+      {
+        "name": "KVMemoryPool",
+        "role": "管理 KV 逻辑块容量、块分配/释放与可扩展性检查；基于模型配置估算 KV 字节预算；提供可选 GPU KV 占位张量。",
+        "ref_docs": [
+          "notebooks-cn/01_framework_design/03_kv_cache.md",
+          "notebooks-cn/01_framework_design/06_memory_pool.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/block_manager.py",
+          "ref_projects/nano-vllm/nanovllm/engine/model_runner.py"
+        ],
+        "impl_code": [
+          "engine/memory_pool.py",
+          "engine/kv_specs.py"
+        ],
+        "_responsibility_boundary": "KVMemoryPool: 仅显存预算(estimate_num_blocks)+GPU placeholder。BlockManager: 运行时分配/释放/prefix caching+get_num_free_blocks() API。",
+        "tp_path_note": "TP Runner 路径下 KVMemoryPool 仅用于 LLMEngine.__init__ 时调用 estimate_num_blocks() 做显存预算日志。实际 KV cache tensor (_key_cache/_value_cache) 由 QwenAttentionTP 内部 torch.zeros 创建 (见 paged_kv_cache_contract.kv_cache_format.initialization)。TP 路径不使用 KVMemoryPool 的 GPU placeholder——这些 placeholder 仅为 RealModelRunner HF 路径预留。",
+        "_nano_vllm_override": "TP 路径下禁止调用 KVMemoryPool 的 GPU placeholder 创建逻辑 (nano-vllm model_runner.py 的 allocate_kv_cache 模式)。实际 KV cache 由 QwenAttentionTP 内部 torch.zeros 创建。"
+      },
+      {
+        "name": "BlockManager",
+        "role": "分页块分配器；维护 free/used block 集合；通过链式哈希执行 prefix caching 与 ref_count 共享；支持 may_append 增量扩展。",
+        "ref_docs": [
+          "notebooks-cn/01_framework_design/03_kv_cache.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/block_manager.py"
+        ],
+        "impl_code": [
+          "engine/block_manager.py"
+        ],
+        "api_spec": {
+          "compute_hash": {
+            "signature": "compute_hash(token_ids: tuple[int,...]) -> int",
+            "purpose": "prefix caching — 相同前缀共享 KV block",
+            "algorithm_detail": "hash(tuple(token_ids[block_start:block_start+block_size])) — Python builtin hash 跨进程一致。hash→block_id 映射表实现 prefix caching。",
+            "hash_structure": "dict[int, int] — hash_value → block_id。冲突时沿用现有 block（不链式）。prefix caching 查找: hash_id = hash(prefix_tokens); if hash_id in table: ref_count[block_id] += 1; return block_id",
+            "hash_policy": "推荐使用 Python builtin hash(tuple(token_ids))，当前单进程部署足够。跨进程场景使用 hashlib.md5。默认实现选 Python hash。",
+            "_nano_vllm_override": "nano-vllm 使用 xxhash.xxh64()+numpy.tobytes()，蓝图使用 Python builtin hash(tuple())。TP 路径不使用 compute_hash (prefix caching disabled)，此差异无功能影响。实现时选 Python hash 即可。"
+          },
+          "allocate": {
+            "signature": "allocate(seq, num_blocks) -> list[int]",
+            "side_effect": "ref_count += 1 per block"
+          },
+          "free": {
+            "signature": "free(block_id) -> None",
+            "algorithm": "ref_count -= 1; if 0: return to free_pool"
+          },
+          "may_append": {
+            "signature": "may_append(seq) -> bool",
+            "formula": "num_free_blocks >= 1"
+          },
+          "ref_count_lifecycle": [
+            "+1: allocate 时",
+            "+1: prefix cache 命中时",
+            "-1: Sequence FINISHED 时 free()"
+          ],
+          "get_num_free_blocks": {
+            "signature": "get_num_free_blocks() -> int",
+            "formula": "len(free_pool)"
+          }
+        },
+        "_nano_vllm_override": "TP 路径下 BlockManager 降级为纯计数器。allocate/free 改为 no-op (仅 count+=1/count-=1)。get_num_free_blocks() 保留原逻辑 (len(free_pool)) 但在 LLMEngine 中改为调用 runner.get_num_free_blocks()。compute_hash/may_append 在 TP 路径下不被调用。",
+        "_tp_degradation_fork_interface": {
+          "description": "BlockManager 的 TP 降级通过 LLMEngine.__init__ 中的 inference_backend 路由实现条件分叉。不推荐继承/子类化——使用同一类，在方法开头检查 self._tp_mode 标志。",
+          "implementation": [
+            "class BlockManager:",
+            "    def __init__(self, ..., tp_mode=False):",
+            "        self._tp_mode = tp_mode",
+            "        self._free_pool = set(range(num_blocks))",
+            "        self._ref_count = {}",
+            "    def allocate(self, seq, num_blocks):",
+            "        if self._tp_mode: return list(range(num_blocks))  # 假分配，返回占位符",
+            "        # ... normal logic ...",
+            "    def free(self, block_id):",
+            "        if self._tp_mode: return  # no-op",
+            "        # ... normal logic ...",
+            "    def get_num_free_blocks(self):",
+            "        return len(self._free_pool)  # 两种模式均可用"
+          ],
+          "injection": "LLMEngine.__init__: self.block_manager = BlockManager(tp_mode=(inference_backend in ('qwen_tp','deepseek_tp')))"
+        }
+      },
+      {
+        "name": "ModelRunner",
+        "role": "加载 tokenizer 与模型 Runner；执行 prefill/decode 前向并调用采样器输出 next token。",
+        "ref_docs": [
+          "notebooks-cn/01_framework_design/04_model_runner.md",
+          "notebooks-cn/01_framework_design/07_request_lifecycle.md",
+          "notebooks-cn/07_improvementPlan/improvement_plan.md",
+          "notebooks-cn/07_improvementPlan/qwen3_effective_changes.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/model_runner.py"
+        ],
+        "impl_code": [
+          "llm_engine.py::RealModelRunner",
+          "engine/models/qwen.py::QwenTPModelRunner",
+          "engine/models/deepseek_v2.py::DeepseekTPModelRunner"
+        ],
+        "tp_runner_actual_flow": {
+          "_note": "TP Runner (QwenTPModelRunner/DeepseekTPModelRunner) 不走 blueprint 旧 HF 路径；实际使用 paged KV cache + 自定义 TP attention + flash_attn_with_kvcache",
+          "prefill": "model.forward(input_ids, past_key_values=None) → embed_tokens → layer.forward() (含 prefill KV allocation + flash_attn_varlen_func)",
+          "decode": "model.forward(input_ids, past_key_values=kv_lens) → embed_tokens → 逐层 layer.forward_decode(hidden_states, pos, kv_len, residual=residual)",
+          "kv_lens_update": "decode 后 batch 读取 layer.self_attn._kv_len_gpu[0].item() — 必须在 compiled region 外部执行",
+          "sampling": "sample_next_tokens(logits[:, -1, :], temperature, top_p) → 返回 token ids",
+          "engine_integration": "num_free = block_mgr.get_num_free_blocks() or runner.get_num_free_blocks(); batch, is_prefill = scheduler.schedule(num_free); tokens = runner.run(batch, is_prefill=is_prefill, temperature=temperature, top_p=top_p); scheduler.postprocess(batch, is_prefill, generated_tokens=tokens)",
+          "decode_batch_mode": "当前 B=1 单序列。多序列时逐序列 for-loop 调用 forward_decode（非 batch tensor）。因 _block_table 和 _kv_len_gpu 各序列不同值，batch 需扩展所有 attention 层为 [B,...] 数据结构。",
+          "get_num_free_blocks": "QwenTPModelRunner 必须暴露 get_num_free_blocks() -> int 方法。实现见 scheduler_tp_runner_bridge.num_free_blocks_source.TP_Runner.impl。",
+          "run_method_impl": [
+            "def run(self, seqs, is_prefill, temperature, top_p):",
+            "  if not seqs: return []",
+            "  if is_prefill:",
+            "    input_ids = torch.cat([s.input_ids_tensor() for s in seqs], dim=1)  # [1,total_tokens]",
+            "    positions = torch.cat([torch.arange(s.seq_len(),device=self.device) for s in seqs])",
+            "    logits, kv_lens = self.model(input_ids, past_key_values=None, position_offset=0, max_seq_len=self.max_seq_len)",
+            "    for s in seqs: s.kv_len = s.seq_len()",
+            "  else:",
+            "    kv_lens = [s.kv_len for s in seqs]",
+            "    input_ids = torch.tensor([[s.output_ids[-1]] for s in seqs], dtype=torch.long, device=self.device)",
+            "    logits, new_kv_lens = self.model(input_ids, past_key_values=kv_lens, position_offset=seqs[0].kv_len, max_seq_len=self.max_seq_len)",
+            "    for s,l in zip(seqs, new_kv_lens): s.kv_len = l",
+            "  tokens = self._sample(logits[:,-1,:], temperature, top_p)  # TP: rank 0 only + broadcast",
+            "  return tokens"
+          ],
+          "_nano_vllm_override": "删除 nano-vllm 的 model(input_ids, use_cache=False, return_dict=True) 调用模式。TP Runner prefill 调用 model.forward(input_ids, past_key_values=None)，decode 调用 model.forward(input_ids, past_key_values=kv_lens)。不使用 HF 的 use_cache/return_dict 语义。",
+          "_nano_vllm_per_function": {
+            "allocate_kv_cache()": "DELETE — KV 由 QwenAttentionTP 自管",
+            "prepare_prefill()": {
+              "status": "PARTIAL — KEEP vs REPLACE 精确边界",
+              "keep": [
+                "L129-150: cu_seqlens 构造逻辑 — 逐序列累加 seq_len，构造 cu_seqlens_q/cu_seqlens_k",
+                "L129-150: positions 逐序列 torch.arange(seq_len)",
+                "L129-150: input_ids torch.cat concatenation"
+              ],
+              "replace": [
+                "L154-162: nano-vllm contiguous slot_mapping (block_table[i]*block_size + offset → range(slot_start, slot_end))",
+                "→ 替换为蓝图 paged_slot_mapping_algorithm: block_table[0, i//256] * 256 + (i%256) per-token 计算",
+                "block_size 16→256, slot_mapping dtype int32→int64, 数据结构 list[int]→Tensor[1,max_blocks] int32"
+              ],
+              "integration_note": "保留的 cu_seqlens 代码与替换的 slot_mapping 代码之间的集成由重建者编写。cu_seqlens 依赖 seq.seq_len() 列表；slot_mapping 依赖 block_table Tensor。这两个数据结构的来源不同，集成点需注意 device 和 dtype 一致性。"
+            },
+            "prepare_decode()": "DELETE — 完全不同的 contiguous vs paged slot_mapping",
+            "capture_cudagraph()": "DELETE — 不在此次重构范围",
+            "run_model()": "DELETE — 替换为 QwenTPModelRunner.run() 的 forward_decode 调用",
+            "IPC SharedMemory (L43-48)": "DELETE — TP Runner 不使用 IPC SharedMemory"
+          }
+        }
+      },
+      {
+        "name": "Sampler",
+        "role": "根据 temperature/top_p 执行 greedy 或随机采样，将 logits 转换为 token ids。",
+        "ref_docs": [
+          "notebooks-cn/01_framework_design/05_sampler.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/layers/sampler.py"
+        ],
+        "impl_code": [
+          "engine/sampler.py"
+        ],
+        "tp_sampling_protocol": {
+          "hard_rule": "TP 多卡仅 rank 0 采样，broadcast 给所有 rank。严禁各 rank 独立采样。",
+          "pseudocode": [
+            "if world_size > 1:",
+            "  if rank == 0: tokens = [sample(logits[i,-1,:]) for i in range(B)]",
+            "  else: tokens = [0] * B",
+            "  for i,t in enumerate(tokens):",
+            "    tt = torch.tensor([t], dtype=torch.long, device=device); dist.broadcast(tt, src=0)",
+            "    tokens[i] = tt.item()",
+            "else: tokens = [sample(logits[i,-1,:]) for i in range(B)]"
+          ],
+          "_nano_vllm_override": "nano-vllm sampler.py 是单卡实现。TP 模式下在 runner._sample() 中包裹 if world_size>1 分支 (rank 0 采样 + broadcast)，不修改 sampler.py 本身。broadcast 使用 src=0 参数。"
+        }
+      },
+      {
+        "name": "Sequence",
+        "role": "请求级状态容器：维护 input/output token、block_table、缓存 token 计数、状态机转移与分块视图。",
+        "ref_docs": [
+          "notebooks-cn/01_framework_design/01_architecture.md",
+          "notebooks-cn/01_framework_design/07_request_lifecycle.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/sequence.py"
+        ],
+        "impl_code": [
+          "engine/structs.py"
+        ]
+      },
+      {
+        "name": "LLMEngine",
+        "role": "系统编排器：路由 inference_backend → 创建 Runner → 估算 KV 池 → 初始化 Scheduler，驱动 while-loop / step-loop 完成生成。是 Scheduler 与 ModelRunner 之间的胶水层。",
+        "ref_docs": [
+          "notebooks-cn/01_framework_design/01_architecture.md",
+          "notebooks-cn/01_framework_design/07_request_lifecycle.md"
+        ],
+        "ref_code": [
+          "ref_projects/nano-vllm/nanovllm/engine/llm_engine.py"
+        ],
+        "impl_code": [
+          "llm_engine.py::LLMEngine"
+        ],
+        "full_api_surface": {
+          "__init__": {
+            "signature": "__init__(self, model_dir, inference_backend='hf', block_size=16, mem_utilization=0.85, reserve_bytes=2*1024**3, max_num_seqs=4, max_num_batched_tokens=4096)",
+            "flow": [
+              "1. torch.cuda.set_device(local_rank); self.device=torch.device(f'cuda:{local_rank}'); self.dtype=torch.bfloat16",
+              "2. 路由 inference_backend: 'tp' → _select_tp_backend(model_dir) 自动检测 Qwen/DeepSeek; 'qwen_tp'/'deepseek_tp'/'hf' 直接使用",
+              "3. 创建 Runner: QwenTPModelRunner / DeepseekTPModelRunner / RealModelRunner (HF fallback)",
+              "4. self.eos_token_id = self.runner.tokenizer.eos_token_id",
+              "5. num_blocks = self._estimate_kv_blocks()  # 基于剩余显存 + block_size 估算",
+              "6. self.memory_pool = KVMemoryPool(num_blocks, block_size, ...)  # TP 路径仅做预算日志",
+              "7. self.scheduler = Scheduler(memory_pool, max_num_seqs, max_num_batched_tokens)"
+            ],
+            "_select_tp_backend": "读取 model_dir/config.json architectures[0] → Qwen2/3→'qwen_tp', DeepseekV2/3→'deepseek_tp', else raise ValueError",
+            "_estimate_kv_blocks": {
+              "_note": "KVMemoryPool.estimate_num_blocks 仅实现 MLA 公式。Qwen3 Dense 模型需独立实现。",
+              "dense_pseudocode": [
+                "def _estimate_kv_blocks(self):",
+                "    free_bytes, total = torch.cuda.mem_get_info(device=self.device)",
+                "    cfg = self.runner.model.config",
+                "    if hasattr(cfg, 'qk_nope_head_dim'):  # MLA (DeepSeek)",
+                "        return KVMemoryPool.estimate_num_blocks(cfg, block_size=self.block_size, dtype=self.dtype, free_bytes=free_bytes, reserve_bytes=self.reserve_bytes, mem_utilization=self.mem_utilization)",
+                "    # Dense (Qwen): K+V per token = layers * kv_heads * head_dim * 2 * elem_bytes",
+                "    elem = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4",
+                "    kv_head_dim = int(getattr(cfg, 'head_dim', cfg.hidden_size // cfg.num_attention_heads))",
+                "    kv_heads = int(getattr(cfg, 'num_key_value_heads', cfg.num_attention_heads))",
+                "    layers = int(cfg.num_hidden_layers)",
+                "    bytes_per_token = layers * kv_heads * kv_head_dim * 2 * elem  # K+V",
+                "    bytes_per_block = bytes_per_token * self.block_size",
+                "    budget = max(0, int((free_bytes - self.reserve_bytes) * self.mem_utilization))",
+                "    return max(1, budget // max(bytes_per_block, 1))"
+              ]
+            }
+          },
+          "generate": {
+            "signature": "generate(self, prompt: str|list[str], max_new_tokens: int, temperature=0.0, top_p=None) → str|list[str]",
+            "flow": [
+              "1. _enqueue(prompts): tokenizer.encode → Sequence(input_ids, sampling_params={max_tokens,temperature,top_p}) → seq.block_size=self.block_size → scheduler.add_request(seq)",
+              "2. while-loop: step+=1; batch,is_prefill=scheduler.schedule()",
+              "3.   if not batch: 检查 _all_finished(seqs) → break; else raise 'empty batch before all finished'",
+              "4.   if is_prefill: first_tokens=runner.run(batch,True,temp,top_p); scheduler.postprocess(batch,True,first_tokens)",
+              "5.   else: next_tokens=runner.run(batch,False,temp,top_p); scheduler.postprocess(batch,False,next_tokens); 逐 seq _finish_check_and_cleanup",
+              "6. tokenizer.decode(seq.output_ids) → return text"
+            ],
+            "_finish_check_and_cleanup": "检查 seq.output_ids 是否达到 EOS 或 max_tokens → 调用 seq.transition_to(FINISHED) → scheduler.running.remove(seq) → memory_pool.free_sequence(seq) → seq.past_key_values=None。返回 True/False。",
+            "_all_finished": "all(seq.status == SequenceStatus.FINISHED for seq in seqs)"
+          },
+          "step": {
+            "signature": "step(self, temperature=0.0, top_p=None) → list[Sequence]",
+            "purpose": "单步推进（供 OpenAI server / has_unfinished_requests 循环使用）",
+            "flow": [
+              "1. batch, is_prefill = self.scheduler.schedule()",
+              "2. if not batch: 清理 running 中已达 max_tokens 的 seq (_finish_check_and_cleanup) → return finished",
+              "3. if is_prefill: tokens=runner.run(batch,True,...); scheduler.postprocess(batch,True,tokens)",
+              "4. else: tokens=runner.run(batch,False,...); scheduler.postprocess(batch,False,tokens); 逐 seq _finish_check_and_cleanup → finished.append(seq)",
+              "5. return finished"
+            ]
+          },
+          "begin_generation": {
+            "signature": "begin_generation(self, prompts, max_new_tokens, temperature, top_p) → None",
+            "purpose": "批量加入 prompt 到调度器，配合 has_unfinished_requests()+step() 分步推进（OpenAI server 使用）"
+          },
+          "has_unfinished_requests": {
+            "signature": "has_unfinished_requests(self) → bool",
+            "purpose": "检查 scheduler.waiting/running 和 _active_gen_seqs 是否还有未完成序列"
+          },
+          "get_generation_outputs": {
+            "signature": "get_generation_outputs(self) → list[str]",
+            "purpose": "返回 _active_gen_seqs 的 decode 文本"
+          },
+          "_enqueue": {
+            "signature": "_enqueue(self, prompts, max_new_tokens, temperature, top_p, request_ids=None) → list[Sequence]",
+            "flow": "tokenizer.encode → Sequence(input_ids, sampling_params) → seq.block_size=self.block_size → scheduler.add_request(seq)"
+          }
+        }
+      },
+      {
+        "name": "OpenAITPServer",
+        "role": "OpenAI 兼容 HTTP API 服务。基于 ThreadingHTTPServer 提供 /v1/completions 端点，封装 LLMEngine.generate/step API，支持 TP 多卡同步（broadcast 机制）和 streaming 输出。用于 benchmark 压测。",
+        "impl_code": [
+          "openai_tp_server.py"
+        ],
+        "_phase": "phase_10 — E2E 验收的 benchmark 接口。Phase 9 完成后才可构建。",
+        "architecture": {
+          "server_type": "ThreadingHTTPServer（BaseHTTPRequestHandler）",
+          "endpoints": [
+            "GET /health",
+            "POST /v1/completions"
+          ],
+          "tp_sync_mechanism": {
+            "description": "TP 多卡场景下所有 rank 按严格相同顺序执行 collective。non-rank0 等待 broadcast_obj 命令，rank0 处理 HTTP 请求后广播。",
+            "rank0_flow": "接收请求 → broadcast_obj({action,prompt,max_tokens,...}) → engine.generate() → 返回响应",
+            "non_rank0_flow": "while True: cmd=broadcast_obj({}); if shutdown→break; 执行相同 engine.generate()/generate_stream()",
+            "request_lock": "threading.Lock 序列化所有请求。并行请求导致跨 rank NCCL collective 顺序不一致 → 超时/死锁。",
+            "broadcast_obj": "dist.broadcast_object_list([payload if rank0 else None], src=0) → 所有 rank 返回 payload[0]"
+          },
+          "streaming": {
+            "flow": "engine.generate_stream() → SSE data chunks → final chunk finish_reason='stop' → data: [DONE]"
+          },
+          "non_streaming": {
+            "flow": "engine.generate() → JSON response with choices/text/usage"
+          }
+        },
+        "startup_sequence": [
+          "1. parse_args: --model-dir, --backend(tp/qwen_tp/deepseek_tp/hf), --host, --port, --max-num-seqs, --max-num-batched-tokens, --max-new-tokens-cap",
+          "2. init_dist_if_needed(): WORLD_SIZE>1 时 dist.init_process_group('nccl')",
+          "3. LLMEngine(model_dir, inference_backend, max_num_seqs, max_num_batched_tokens)",
+          "4. run_tp_generation_loop(engine, host, port, max_new_tokens_cap)"
+        ],
+        "benchmark_usage": {
+          "start_server": "TP_SIZE=4 PORT=9000 bash start_tp_infer_service.sh dsv2",
+          "run_benchmark": "PORT=9000 NUM_PROMPTS=50 REQUEST_RATE=1 MAX_CONCURRENCY=1 bash run_myengine_benchmark.sh dsv2",
+          "key_metrics": [
+            "Output throughput (tok/s)",
+            "Mean TTFT (ms)",
+            "Duration (s)"
+          ]
+        }
+      }
+    ],
+    "data_flow_contracts": {
+      "request_level": {
+        "sequence_fields": {
+          "input_ids": "list[int]",
+          "output_ids": "list[int]",
+          "token_ids": "input_ids + output_ids",
+          "block_table": "list[int] (HF 路径) 或 torch.Tensor [1, max_blocks] int32 (TP Runner 路径)。Sequence 类需同时支持两种表示。",
+          "num_cached_tokens": "int",
+          "status": "WAITING|RUNNING_PREFILL|RUNNING_DECODE|FINISHED",
+          "block_table_dual_repr": {
+            "hf_path": "list[int] — BlockManager 分配的逻辑 block ID 列表",
+            "tp_path": "torch.Tensor [1, max_blocks] int32 — QwenAttentionTP 自管。prefill 时 torch.arange 填入，decode 时不变。",
+            "switch_logic": {
+              "_switch_mechanism": "通过 LLMEngine.__init__ 传入 max_blocks 和 device 参数。Sequence 构造时不区分 HF/TP 路径——双轨数据结构同时初始化，由调用方根据 inference_backend 选择调用哪个方法。",
+              "construction": [
+                "# LLMEngine.__init__:",
+                "config = json.load(open(model_dir / 'config.json'))",
+                "max_blocks = config['max_position_embeddings'] // 256  # 40960//256=160",
+                "device = torch.device(f'cuda:{local_rank}')",
+                "# 传入 Sequence 构造:",
+                "class Sequence:",
+                "    def __init__(self, ..., max_blocks=None, device=None):",
+                "        self._block_table_list = []  # HF 路径: list[int]",
+                "        self._max_blocks = max_blocks  # TP 路径需要",
+                "        self._device = device",
+                "        self._block_table_tensor = None  # 惰性初始化",
+                "    def block_table_tensor(self):  # TP Runner 调用",
+                "        if self._block_table_tensor is None:",
+                "            self._block_table_tensor = torch.zeros(1, self._max_blocks, dtype=torch.int32, device=self._device)",
+                "        return self._block_table_tensor",
+                "    def block_table_list(self):  # HF Runner 调用",
+                "        return self._block_table_list"
+              ],
+              "caller_side_routing": [
+                "# TP Runner: seq.block_table_tensor() — 返回 Tensor[1,max_blocks] int32",
+                "# HF Runner: seq.block_table_list() — 返回 list[int]",
+                "# 切换不是通过 Sequence 内部 if-else，而是调用方知道自己的路径并调用对应方法。",
+                "# Sequence 不需要知道 inference_backend——它只是数据的被动词典。"
+              ]
+            }
+          }
+        },
+        "status_transitions": [
+          "WAITING -> RUNNING_PREFILL",
+          "RUNNING_PREFILL -> RUNNING_DECODE",
+          "RUNNING_DECODE -> FINISHED"
+        ]
+      },
+      "scheduler_to_runner": {
+        "batch_type": "list[Sequence]",
+        "prefill_trigger": "schedule() 优先从 waiting 组 batch；必须满足 max_num_batched_tokens 与 can_allocate",
+        "decode_trigger": "waiting 无可调度项时，从 running 中选择 can_append_one_more 的序列",
+        "preemption_policy": "disabled; 资源不足时不抢占，只等待",
+        "max_num_batched_tokens": {
+          "formula": "max(1, num_free_blocks * block_size)",
+          "block_size_framework": 16,
+          "block_size_tp_runner": 256,
+          "block_size_selection": {
+            "hf": 16,
+            "qwen_tp": 256,
+            "deepseek_tp": 256,
+            "injection_point": "LLMEngine.__init__ → Scheduler._block_size (见 scheduler_tp_runner_bridge)"
+          }
+        },
+        "can_allocate": {
+          "formula": "num_free_blocks >= seq.required_blocks()",
+          "required_blocks": "ceil(len(seq.input_ids) / block_size)"
+        },
+        "can_append_one_more": {
+          "formula": "num_free_blocks >= 1"
+        },
+        "schedule_algorithm": {
+          "phase1_prefill": "从 waiting 队列取 seq，满足 can_allocate 且累计 tokens ≤ max_num_batched_tokens",
+          "phase2_decode": "waiting 空时从 running 取 seq，满足 can_append_one_more",
+          "empty_return": "([], False) — 调用方忙等重试或检查 all_finished 退出",
+          "chunked_prefill_rule": "prefill/decode 不混批。schedule()先prefill后decode。同batch序列同阶段。",
+          "state_transition_safety": "序列状态在 postprocess 中更新 (PREFILL→DECODE, DECODE→FINISHED)。schedule() 返回的 batch 内所有序列为同一阶段。不存在 prefill/decode 混批竞态——Scheduler 在 schedule() 内部已按阶段分组。",
+          "overlength_rejection": "enqueue 时检测: seq.required_blocks() > max_blocks → 拒绝或截断。新增 status='REJECTED'，已拒绝不参与调度。防止超长 prompt 永久 WAITING 导致死循环。",
+          "schedule_complete_method": [
+            "# Scheduler.schedule(num_free) — 完整实现 (B=1, nocompile, TP=4)",
+            "class Scheduler:",
+            "    def __init__(self, memory_pool, max_num_seqs, max_num_batched_tokens):",
+            "        self.waiting = []    # list[Sequence] — 待 prefill",
+            "        self.running = []    # list[Sequence] — 运行中 (decode 阶段)",
+            "        self.memory_pool = memory_pool",
+            "        self.max_num_seqs = max_num_seqs",
+            "        self.max_num_batched_tokens = max_num_batched_tokens",
+            "        self._block_size = 16  # LLMEngine 注入: TP→256, HF→16",
+            "        self._reserved_blocks = 0",
+            "            if req > self._max_blocks:  # e.g. (40960+255)//256 = 160, injected by LLMEngine",
+            "    def schedule(self, num_free):",
+            "        \"\"\"num_free: BlockManager.get_num_free_blocks() or runner.get_num_free_blocks()\"\"\"",
+            "        # Phase 1: prefill (prefill-first policy)",
+            "        batch = []",
+            "        reserved = 0",
+            "        current_tokens = 0",
+            "        for seq in list(self.waiting):  # iterate copy, may remove REJECTED",
+            "            req = (len(seq.input_ids) + self._block_size - 1) // self._block_size",
+            "            # Check REJECTED: prompt too long",
+            "            if req > max_blocks_for_model:  # e.g. (40960+255)//256 = 160",
+            "                seq.transition_to(SequenceStatus.REJECTED)",
+            "                self.waiting.remove(seq)",
+            "                continue",
+            "            # Can allocate?",
+            "            if reserved + req > num_free:",
+            "                break  # insufficient free blocks, stop prefill for this round",
+            "            if current_tokens + len(seq.input_ids) > self.max_num_batched_tokens:",
+            "                break  # token budget exhausted",
+            "            batch.append(seq); reserved += req",
+            "            current_tokens += len(seq.input_ids)",
+            "        if batch:",
+            "            self._reserved_blocks += reserved",
+            "            return [s for s in batch], True  # (batch, is_prefill=True)",
+            "        # Phase 2: decode",
+            "        for seq in list(self.running):",
+            "            if num_free - reserved >= 1:  # can_append_one_more",
+            "                batch.append(seq); reserved += 1",
+            "        if batch:",
+            "            self._reserved_blocks += reserved",
+            "            return [s for s in batch], False  # (batch, is_prefill=False)",
+            "        # Empty: no schedulable work",
+            "        return [], False"
+          ],
+          "max_blocks_for_model": {
+            "definition": "max_blocks_for_model = config.max_position_embeddings // block_size  # e.g. 40960//256=160",
+            "source": "由 LLMEngine.__init__ 从 config.json 读取后注入 Scheduler: self.scheduler._max_blocks = config.max_position_embeddings // 256",
+            "injection_code": "# in LLMEngine.__init__: self.scheduler._max_blocks = config.max_position_embeddings // 256"
+          }
+        },
+        "batch_assembly_contract": {
+          "prefill_ragged": {
+            "input_ids": "torch.cat([seq.input_ids_tensor() for seq in batch], dim=1)  # [1, total_tokens] ragged concat",
+            "positions": "torch.cat([torch.arange(len(seq), device=device) for seq in batch])  # [total_tokens]",
+            "block_tables": "[seq.block_table_tensor() for seq in batch]  # 每序列独立 block_table",
+            "note": "TP Runner 使用 ragged concatenation，非 padding。embedding 直接接受 [1, total_tokens]"
+          },
+          "decode_single": {
+            "input_ids": "torch.tensor([[seq.output_ids[-1]]], dtype=torch.long, device=device)  # [1, 1] 最新 token",
+            "note": "decode 每步只处理最新 token，batch 中多序列分别调用 forward_decode"
+          }
+        },
+        "postprocess_complete_method": [
+          "# Scheduler.postprocess(batch, is_prefill, tokens) — 完整实现",
+          "def postprocess(self, batch, is_prefill, tokens):",
+          "    for i, seq in enumerate(batch):",
+          "        if is_prefill:",
+          "            # Prefill: write first token to output_ids",
+          "            seq.output_ids.append(tokens[i])",
+          "            seq.status = SequenceStatus.RUNNING_DECODE",
+          "            if seq not in self.running: self.running.append(seq)",
+          "        else:  # decode",
+          "            seq.output_ids.append(tokens[i])",
+          "            # Check finish conditions",
+          "            if tokens[i] == self.eos_token_id:",
+          "                seq.status = SequenceStatus.FINISHED",
+          "                self._release(seq)",
+          "            elif len(seq.output_ids) >= seq.sampling_params.get('max_tokens', 0):",
+          "                seq.status = SequenceStatus.FINISHED",
+          "                self._release(seq)",
+          "    def _release(self, seq):",
+          "        if seq in self.running: self.running.remove(seq)",
+          "        self.memory_pool.free_sequence(seq)  # TP 路径: no-op or release KV blocks",
+          "        seq.block_table = []  # 清空",
+          "        self._reserved_blocks = 0  # 重置计数器 (当前单序列 B=1 简单处理)"
+        ]
+      },
+      "runner_prefill_tensors": {
+        "_note": "以下为 RealModelRunner（HF 兜底路径）的契约。QwenTPModelRunner / DeepseekTPModelRunner 使用自定义 TP attention + paged KV cache，不走此路径。",
+        "input_ids": {
+          "shape": "[1, L_prompt] per sequence",
+          "dtype": "torch.int64",
+          "device": "cuda"
+        },
+        "forward_call": "model(input_ids=ids, use_cache=False, return_dict=True)  <- 仅 RealModelRunner 使用",
+        "logits_shape": "[1, L_prompt, vocab_size]",
+        "sampling_input": {
+          "shape": "[1, vocab_size]",
+          "source": "logits[0, -1, :].unsqueeze(0)"
+        },
+        "sampling_output": {
+          "shape": "[1]",
+          "dtype": "torch.int64"
+        }
+      },
+      "runner_decode_tensors": {
+        "_note": "以下为 RealModelRunner（HF 兜底路径）的契约。TP Runner 的 prefill/decode 见 tp_layer_interface_contracts.qwen3_tp_model_interfaces.decode_forward_pattern。",
+        "input_ids": {
+          "shape": "[B, L_max] (left padding)",
+          "dtype": "torch.int64",
+          "device": "cuda"
+        },
+        "attention_mask": {
+          "shape": "[B, L_max]",
+          "dtype": "torch.int64",
+          "device": "cuda",
+          "rule": "pad=0, valid_token=1"
+        },
+        "forward_call": "model(input_ids=ids, attention_mask=m, use_cache=False, return_dict=True)  <- 仅 RealModelRunner 使用",
+        "logits_shape": "[B, L_max, vocab_size]",
+        "sampling_input": {
+          "shape": "[B, vocab_size]",
+          "source": "logits[:, -1, :]"
+        },
+        "sampling_output": {
+          "shape": "[B]",
+          "dtype": "torch.int64"
+        },
+        "_tp_runner_actual_path": {
+          "input": "[1,1,hidden_size] (仅最新 token embedding)",
+          "layer_call": "逐层 layer.forward_decode(hidden_states, positions, kv_len, max_seq_len, residual=residual)",
+          "kv_write": "index_copy_ 到 paged KV cache [_num_blocks, 256, heads, dim]",
+          "kv_read": "flash_attn_with_kvcache(q, _key_cache, _value_cache, _kv_len_gpu, _block_table, scale, causal=False)",
+          "causal_rule": "prefill causal=True, decode causal=False (past_key_values is None → prefill)",
+          "kv_len_tracking": "_kv_len_gpu GPU tensor (非 Python int), .item() 在非编译 forward() 中读取"
+        }
+      },
+      "paged_kv_cache_contract": {
+        "_note": "P0 增量 KV Cache — TP Runner 实际使用 paged KV cache，非 contiguous buffer。block_size=256（flash_attn_with_kvcache 最低要求）。",
+        "source_impl": [
+          "engine/models/qwen.py::QwenAttentionTP"
+        ],
+        "source_refs": [
+          "notebooks-cn/07_improvementPlan/improvement_plan.md §P0",
+          "notebooks-cn/07_improvementPlan/qwen3_effective_changes.md #8"
+        ],
+        "_ref_doc_contradiction_warning": "improvement_plan.md §P0 (L201-260) 描述的是旧版 HF past_key_values + contiguous KV buffer 方案（use_cache=True, 未分页）。当前蓝图使用 paged KV cache + flash_attn_with_kvcache（分页 buffer [num_blocks,256,heads,dim]）。二者架构不兼容。以本蓝图为权威——§P0 仅作为历史参考，不可用于实现。",
+        "_vg3_fix_verified": "2026-05-27 物理 tracing 确认：prefill 使用 flash_attn_varlen_func + KV cache lazy alloc torch.zeros max_blocks；decode 使用 flash_attn_with_kvcache paged。无 HF past_key_values 机制。",
+        "kv_cache_format": {
+          "key_cache": "[num_blocks, 256, num_kv_heads, head_dim] bf16",
+          "value_cache": "[num_blocks, 256, num_kv_heads, head_dim] bf16",
+          "block_table": "[1, max_blocks] int32 — 固定 shape，prefill 时分配，decode 时不变",
+          "kv_len_gpu": "[1] int32 GPU tensor — 追踪当前 KV 长度，非 Python int",
+          "slot_mapping_decode": "[1] int64 — decode 步写入目标槽位",
+          "hard_rule": "block_size 必须 >= 256（flash_attn_with_kvcache 硬性要求）；block_table 必须 int32",
+          "max_blocks_formula": {
+            "calculation": "max_blocks = (config.max_position_embeddings + 256 - 1) // 256",
+            "qwen3_8b": 128,
+            "init": "block_table = torch.zeros(1, max_blocks, dtype=torch.int32)",
+            "dynamic": "有效条目=num_blocks，decode扩展时在[:,num_blocks]追加"
+          },
+          "initialization": "num_blocks=(config.max_position_embeddings+255)//256; _key_cache=torch.zeros(num_blocks,256,num_kv_heads,head_dim,dtype=bf16,device=cuda)",
+          "multi_seq_block_table_expansion": {
+            "B_1": "_block_table = torch.zeros(1, max_blocks, dtype=torch.int32)  # single-sequence (current)",
+            "B_gt_1": "扩展为 _block_table = torch.zeros(B, max_blocks, dtype=torch.int32)。prefill 时逐序列 block_table[i,:nb] = torch.arange(...)。flash_attn_with_kvcache 按 batch dim 索引各序列 block_table。",
+            "injection": "QwenForCausalLMTP.forward() prefill 分支中: self._expand_block_table_if_needed(B); for i,layer in enumerate(layers): layer.self_attn._block_table = self._block_table[i:i+1]  # per-sequence slice"
+          },
+          "_b1_scope": "当前 B=1: _block_table=[1,max_blocks], _kv_len_gpu=[1]。B>1 扩展不在本次构建范围——需 _block_table→[B,max_blocks], _kv_len_gpu→[B], flash_attn_with_kvcache batch dim 索引。"
+        },
+        "prefill_kv_write": {
+          "description": "torch.arange(num_blocks) → block_table → 按 slot_mapping 顺序写入 _key_cache/_value_cache (index_copy_)",
+          "slot_mapping_algorithm": {
+            "formula": "slot_mapping[i] = block_table[0, i//256] * 256 + (i%256)",
+            "pseudocode": [
+              "num_tokens=input_ids.shape[1]; num_blocks=(num_tokens+255)//256",
+              "block_table[0,:num_blocks]=torch.arange(num_blocks,dtype=torch.int32,device=device)",
+              "slot_mapping=torch.zeros(num_tokens,dtype=torch.int64,device=device)",
+              "for i in range(num_tokens): slot_mapping[i]=block_table[0,i//256].item()*256+(i%256)",
+              "_key_cache.index_copy_(0,slot_mapping,k_flat)"
+            ],
+            "multi_seq": [
+              "offset = 0; next_block_id = 0",
+              "for seq in batch:",
+              "  n = seq.seq_len(); nb = (n + 255) // 256",
+              "  blk = torch.arange(next_block_id, next_block_id + nb, dtype=torch.int32, device=device)",
+              "  bt_padded = F.pad(blk.unsqueeze(0), (0, max_blocks - nb))",
+              "  seq.block_table = bt_padded",
+              "  for i in range(n):",
+              "    slot_mapping[offset + i] = blk[i // 256].item() * 256 + (i % 256)",
+              "  offset += n; next_block_id += nb"
+            ],
+            "vectorized": [
+              "# 向量化替代方案 (避免 .item() GPU sync)",
+              "num_tokens = input_ids.shape[1]",
+              "indices = torch.arange(num_tokens, device=device)",
+              "slot_mapping = block_table[0, indices // 256] * 256 + (indices % 256)",
+              "# 一行完成, 无需 for 循环 + .item()。短 prompt (<512 tokens) 用 for 循环也可接受",
+              "# 长 prompt (40K tokens) 必须用向量化，否则 40960 次 .item() ≈ 200ms GPU sync 延迟"
+            ]
+          },
+          "full_reshape_chain": {
+            "pseudocode": [
+              "# QKV 投影产出 K: [num_tokens, num_kv_heads, head_dim]",
+              "k_flat = k.reshape(num_tokens, num_kv_heads, head_dim)  # ensure contiguous",
+              "v_flat = v.reshape(num_tokens, num_kv_heads, head_dim)",
+              "# View KV cache as flat [total_slots, num_kv_heads, head_dim]",
+              "kc_flat = _key_cache.view(-1, num_kv_heads, head_dim)",
+              "vc_flat = _value_cache.view(-1, num_kv_heads, head_dim)",
+              "# index_copy_ on dim=0",
+              "kc_flat.index_copy_(0, slot_mapping, k_flat)",
+              "vc_flat.index_copy_(0, slot_mapping, v_flat)",
+              "# 约束: slot_mapping.max() < num_blocks * 256"
+            ]
+          },
+          "integrated_timeline": [
+            "单序列 prefill:",
+            "  1. qkv_proj → Q,K,V",
+            "  2. flash_attn_varlen_func(Q, K, V, cu, causal=True)  # K,V 来自投影",
+            "  3. k_flat = k.reshape(...); kc_flat = _key_cache.view(-1, heads, dim); kc_flat.index_copy_(0, slot_mapping, k_flat)",
+            "多序列 prefill:",
+            "  1. 按 multi_seq 构建 slot_mapping 和 block_table",
+            "  2. qkv_proj → Q,K,V (all tokens)",
+            "  3. flash_attn_varlen_func(Q, K, V, cu, causal=True)",
+            "  4. 按 multi_seq 伪代码逐序列 index_copy_ 写入 cache",
+            "逐层处理:",
+            "  每层的 QKV 投影和 attention 使用本层投影产出 (非 cache)。逐层 projection→attention→cache_write 顺序执行。"
+          ]
+        },
+        "decode_kv_write": "_slot_mapping_decode[0] = _kv_len_gpu[0]; index_copy_ 写入当前 token; _kv_len_gpu[0] += 1",
+        "decode_attention": "flash_attn_with_kvcache_op(q_reshape, _key_cache, _value_cache, _kv_len_gpu, _block_table, scale, causal=False) softmax_scale=1.0/sqrt(head_dim)",
+        "decode_kv_len_reading": "kv_lens = [int(l.self_attn._kv_len_gpu[0].item()) for l in self.layers] — 必须在 compiled region 外部执行（.item() 触发 CPU sync）",
+        "failure_modes": [
+          "FM-008: block_size < 256 导致 flash_attn_with_kvcache 报错",
+          "FM-009: .item() 在 compiled region 内触发 SIGABRT"
+        ],
+        "prefill_failure_rollback": "prefill 期间 RuntimeError → memory_pool.free_sequence(seq) 释放已分配 KV blocks。seq.block_table = []。向上传播异常。"
+      },
+      "torch_compile_contract": {
+        "_note": "P2 torch.compile kernel fusion — Qwen3 TP 使用 per-layer fullgraph=True + reduce-overhead（inductor 内部 CUDA Graph）。",
+        "source_impl": [
+          "engine/models/qwen.py::QwenTPModelRunner._setup_cuda_graph_piecewise"
+        ],
+        "source_refs": [
+          "notebooks-cn/07_improvementPlan/improvement_plan.md §P2",
+          "notebooks-cn/07_improvementPlan/qwen3_effective_changes.md #9"
+        ],
+        "compile_strategy": {
+          "mode": "reduce-overhead (inductor cudagraph_trees, 对标 vLLM BB-9)",
+          "fullgraph": true,
+          "dynamic": true,
+          "per_layer_compilation": "torch.compile(layer.forward_decode_graph, fullgraph=True, mode='reduce-overhead') — 每层独立编译为一个 FX graph",
+          "cuda_graph_trigger": "torch._inductor.config.triton.cudagraphs = True (PyTorch 2.9.1 需手动开启)"
+        },
+        "forward_decode_design": {
+          "eager_path": "QwenDecoderLayerTP.forward_decode() — 无 clone，无控制流，torch.compile 兼容",
+          "graph_path": "QwenDecoderLayerTP.forward_decode_graph() — 开头 clone(hidden_states) + clone(residual)，消除 fused_add_rms_norm 的 mutated inputs 警告",
+          "swap_mechanism": {
+            "desc": "CUDA_GRAPH=1 时 _setup_cuda_graph_piecewise 将 layer.forward_decode 替换为 torch.compile(forward_decode_graph)",
+            "implementation": "types.MethodType(torch.compile(layer.forward_decode_graph, fullgraph=True, mode='reduce-overhead', dynamic=True), layer)  # 必须用 MethodType 绑定 self，否则 forward_decode(hidden_states,...) 调用缺 self 参数"
+          }
+        },
+        "constraints": {
+          "no_moe_compile": "MoE 模块有 .item() GPU→CPU 同步 → graph break，不可 fullgraph 编译",
+          "fixed_shape": "decode 路径必须固定 shape（B=1, S=1），动态 shape 会触发重编译",
+          "clone_necessity": "forward_decode_graph 的 clone 是 CUDA Graph 正确性必需的 — fused_add_rms_norm 原地修改输入，不 clone 会污染 CUDAGraphEntry 存储的上一层输出"
+        },
+        "failure_modes": [
+          "FM-010: mode='reduce-overhead' 与 KV cache buffer 跨步复用冲突 → RuntimeError",
+          "FM-011: 动态切片 k[:, :kv_len] 每步 shape 变化 → 编译重编译开销",
+          "FM-012: 无条件 clone 在 eager 模式造成 ~15% 性能回退"
+        ]
+      },
+      "flash_attention_integration_contract": {
+        "_note": "P3-FA Flash Attention 集成 — Qwen3 prefill 用 flash_attn_varlen_func，decode 用 flash_attn_with_kvcache（custom op 注册为 meta_infer::flash_attn_with_kvcache）。",
+        "source_impl": [
+          "engine/models/qwen.py::QwenAttentionTP",
+          "engine/kernels/custom_ops.py"
+        ],
+        "source_refs": [
+          "notebooks-cn/07_improvementPlan/improvement_plan.md §P3-FA",
+          "notebooks-cn/07_improvementPlan/qwen3_effective_changes.md #10"
+        ],
+        "prefill_path": {
+          "kernel": "flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=True)",
+          "qk_format": "[num_tokens, num_heads, head_dim] 3D ragged — 无需 permute",
+          "kv_source": "paged KV cache 中已写入的 prefill 位置",
+          "cu_seqlens_construction": {
+            "cu_seqlens_q": "torch.zeros(len(batch)+1,dtype=torch.int32,device='cuda'); cu_seqlens_q[1:]=torch.tensor([seq.seq_len() for seq in batch]).cumsum(0).to(device)",
+            "cu_seqlens_k": "cu_seqlens_q.clone()",
+            "max_seqlen_q": "max(seq.seq_len() for seq in batch)",
+            "max_seqlen_k": "max_seqlen_q"
+          },
+          "kv_source_correction": "正确顺序: 1. QKV投影得Q,K,V → 2. flash_attn_varlen_func(Q,K,V) → 3. index_copy_ 将K,V写入cache。K/V来自当前投影产出，非从cache读取。",
+          "hard_rule": "prefill 的 flash_attn_varlen_func 必须使用投影产出的 K,V (非从 KV cache 读取)。投影 K/V == cache K/V (RoPE 后数值相同)，但从 cache 读取在 B>1 paged 场景下要求额外的 slot_mapping 反向查找——B=1 时二者等价但禁止从 cache 读取以保持接口一致性。"
+        },
+        "decode_path": {
+          "kernel": "flash_attn_with_kvcache_op(q, _key_cache, _value_cache, _kv_len_gpu, _block_table, softmax_scale, causal=False)",
+          "custom_op_registration": {
+            "desc": "kernel_replacement_plan.md (custom_op 注册) — @torch.library.custom_op('meta_infer::flash_attn_with_kvcache', mutates_args=()) + register_fake",
+            "complete_template": {
+              "registration": "@torch.library.custom_op('meta_infer::flash_attn_with_kvcache',mutates_args=())",
+              "impl": "def flash_attn_with_kvcache_op(q,k_cache,v_cache,cache_seqlens,block_table,softmax_scale,causal):\n    # _fa_kvcache = flash_attn.flash_attn_interface.flash_attn_with_kvcache (import above)\n    return _fa_kvcache(q,k_cache,v_cache,cache_seqlens=cache_seqlens,block_table=block_table,softmax_scale=softmax_scale,causal=causal)",
+              "fake": "@flash_attn_with_kvcache_op.register_fake\ndef _(q,k_cache,v_cache,cache_seqlens,block_table,softmax_scale,causal):\n    return torch.empty_like(q)",
+              "dynamic_shape_note": "KV cache (k_cache/v_cache) 的 num_blocks 维度在推理期间固定 (prefill 时分配 max_blocks)。decode 扩容 block_table 不会改变 k_cache shape，仅 block_table 内容变化。因此 fake tensor shape 与实际运行时一致，不会触发重编译。若未来实现动态扩容，需使用 torch._dynamo.mark_dynamic(k_cache, 0) 告知 inductor。",
+              "import_statement": "from flash_attn.flash_attn_interface import flash_attn_with_kvcache as _fa_kvcache"
+            }
+          },
+          "q_format": "[1, 1, num_heads, head_dim] → reshape 为 [1, num_heads, head_dim]",
+          "softmax_scale": "1.0 / sqrt(head_dim)  # 从 config.json 动态读取 head_dim。Qwen3-8B: 1/sqrt(128)≈0.08839"
+        },
+        "attempted_alternatives": {
+          "方案A_切片KV_SDPA无mask": "-20% 回退 — torch.compile 动态 shape 重编译",
+          "方案B_切片KV_SDPA去compile": "-12% 回退 — 切片开销 > 消除 attn_mask 收益",
+          "方案C_Vpadding_flash_attn": "-15% 回退 — F.pad/unpad 开销 + full buffer 浪费"
+        },
+        "failure_modes": [
+          "FM-013: flash_attn pybind11 扩展无法 torch.compile trace → 必须注册为 custom_op"
+        ]
+      },
+      "tp_layer_interface_contracts": {
+        "tp_distributed_runtime": {
+          "source_impl": [
+            "engine/tp_layers/distributed.py"
+          ],
+          "rank_size_contract": {
+            "tp_rank": "dist.get_rank() or env RANK",
+            "tp_size": "dist.get_world_size() or env WORLD_SIZE"
+          },
+          "collectives": {
+            "all_reduce_sum": {
+              "registration": "@torch.library.custom_op('meta_infer::all_reduce_sum', mutates_args=())",
+              "pseudocode": [
+                "def all_reduce_sum(x):",
+                "    if not is_tp_enabled(): return x.clone()  # tp_size=1, no-op, must return new tensor",
+                "    if _custom_ar_handle is not None:",
+                "        return _custom_ar_handle.all_reduce(x, registered=False)  # CustomAR P2P staging buffer",
+                "    y = x.clone()",
+                "    dist.all_reduce(y, op=dist.ReduceOp.SUM)  # NCCL fallback",
+                "    return y",
+                "@all_reduce_sum.register_fake",
+                "def _(x): return torch.empty_like(x)"
+              ],
+              "note": "custom_op 注册使 torch.compile 视其为黑盒原子节点，不追踪内部 (Dynamo guard immune)。TP=1 时返回 x.clone() (非 x 自身) — custom_op 禁止输出别名输入。",
+              "_ncc_fallback_contract": "⚠️ CustomAR→NCCL 回退是硬性生存要求。init_custom_ar 的 try/except 保证失败后 _custom_ar_handle=None（见 custom_ar_all_reduce.init_state_machine._failure_fallback_contract）。本函数的 if _custom_ar_handle is not None ... else dist.all_reduce 是自动生效的——不需要额外配置。Agent 实现时两个函数必须配合：init 置 None + all_reduce 判 None。"
+            },
+            "all_gather_last_dim": {
+              "signature": "def all_gather_last_dim(x: Tensor) -> Tensor",
+              "pseudocode": [
+                "if not is_tp_enabled(): return x",
+                "outs = [torch.empty_like(x) for _ in range(get_tp_size())]",
+                "dist.all_gather(outs, x)",
+                "return torch.cat(outs, dim=-1)"
+              ],
+              "note": "使用 dist.all_gather (非 all_gather_into_tensor)。输入 [..., local_dim] → 输出 [..., local_dim * tp_size]。"
+            }
+          },
+          "_deprecated_artifact_note": "model_runner.py（已废弃）使用旧模块 tp_distributed，仅用于 TDD 测试。生产代码见 kernel_replacement_plan.md §九 (CustomAR)。",
+          "init_sequence": [
+            "1. torchrun: env LOCAL_RANK=0..N-1, RANK=0..N-1, WORLD_SIZE=N",
+            "2. torch.cuda.set_device(int(os.environ['LOCAL_RANK']))  # 每进程",
+            "3. dist.init_process_group(backend='nccl', init_method='env://')  # LLMEngine 或 runner __init__",
+            "4. 模型 load_weights 后: init_custom_ar(device) — gloo secondary group + IPC exchange",
+            "5. dist.barrier()  # 所有 rank 同步后进入 forward",
+            "device: 手动 .to(device)，不依赖 torch.set_default_device"
+          ]
+        },
+        "tp_embedding_and_lm_head": {
+          "source_impl": [
+            "engine/tp_layers/embedding.py"
+          ],
+          "vocab_parallel_embedding": {
+            "input_ids": "[B, T] int64",
+            "local_weight": "[vocab_size/tp, hidden_size]",
+            "local_embedding": "[B, T, hidden_size] (masked local vocab)",
+            "output_after_all_reduce": "[B, T, hidden_size]",
+            "forward_pseudocode": [
+              "def forward(self, input_ids):  # [B,T] int64",
+              "    mask = (input_ids >= self.vocab_start) & (input_ids < self.vocab_end)",
+              "    local_ids = (input_ids - self.vocab_start).masked_fill(~mask, 0)",
+              "    out = F.embedding(local_ids, self.weight)  # [B,T,embedding_dim]",
+              "    out = out.masked_fill((~mask).unsqueeze(-1), 0)",
+              "    return all_reduce_sum(out)  # CustomAR P2P or NCCL fallback",
+              "# vocab_start = tp_rank * (vocab_size // tp_size); vocab_end = vocab_start + local_vocab_size"
+            ]
+          },
+          "parallel_lm_head": {
+            "input_hidden": "[B, T, hidden_size]",
+            "local_logits": "[B, T, vocab_size/tp]",
+            "output_logits_gather": "[B, T, vocab_size]",
+            "forward_pseudocode": [
+              "def forward(self, hidden_states):  # [B, T, hidden_size]",
+              "    local_logits = F.linear(hidden_states, self.weight)  # [B, T, vocab_size/tp]",
+              "    # all_gather along last dim to get full vocab",
+              "    logits = all_gather_last_dim(local_logits)  # [B, T, vocab_size]",
+              "    return logits"
+            ]
+          }
+        },
+        "tp_linear_layers": {
+          "source_impl": [
+            "engine/tp_layers/linear.py"
+          ],
+          "column_parallel_linear": {
+            "weight_shape": "[out/tp, in]",
+            "input": "[B, T, in]",
+            "output_no_gather": "[B, T, out/tp]",
+            "output_with_gather": "[B, T, out]"
+          },
+          "row_parallel_linear": {
+            "weight_shape": "[out, in/tp]",
+            "input": "[B, T, in/tp]",
+            "partial_output": "[B, T, out]",
+            "output_after_all_reduce": "[B, T, out]"
+          },
+          "qkv_column_parallel_forward": [
+            "# QKVColumnParallelLinear.forward():",
+            "def forward(self, x):  # x: [B, T, hidden_size] e.g. [1,1,4096]",
+            "    y = F.linear(x, self.weight)  # [1,1, q_size+2*kv_size] = [1,1,1536]",
+            "    if self.gather_output and self.tp_size > 1:",
+            "        y = all_gather_last_dim(y)",
+            "    q, k, v = y.split([self.q_size, self.kv_size, self.kv_size], dim=-1)",
+            "    return q, k, v  # q:[1,1,1024], k:[1,1,256], v:[1,1,256]",
+            "",
+            "# Caller-side reshape (in QwenAttentionTP.forward):",
+            "# q = q.view(B, T, self.num_heads, self.head_dim)       # [1,1,8,128]  — use num_heads=32/4=8",
+            "# k = k.view(B, T, self.num_kv_heads, self.head_dim)    # [1,1,2,128]  — use num_kv_heads_local=max(1,8//4)=2, NOT num_heads",
+            "# v = v.view(B, T, self.num_kv_heads, self.head_dim)    # [1,1,2,128]",
+            "# WARNING: K/V reshape MUST use self.num_kv_heads (per-rank local), NOT self.num_heads.",
+            "# For Qwen3-8B TP=4: num_kv_heads_local = max(1, 8//4) = 2. Head dim = 128. 2*128=256 = kv_size. Correct.",
+            "# If mistakenly using num_heads=8: 8*128=1024 != kv_size=256 → RuntimeError shape mismatch. Safe.",
+            "",
+            "# MergedColumnParallelLinear.forward():",
+            "def forward(self, x):",
+            "    y = F.linear(x, self.weight)  # [B, T, 2*intermediate/tp] e.g. [1,1,6400]",
+            "    return y  # first half=gate, second half=up (for silu_and_mul input)"
+          ],
+          "row_parallel_linear_forward": [
+            "def forward(self, x):  # x: [B,T,in/tp]",
+            "    y = F.linear(x, self.weight, None)  # [B,T,out]",
+            "    y = all_reduce_sum(y)  # CustomAR P2P or NCCL fallback (always called, even tp_size=1 → no-op)",
+            "    if self.bias is not None: y = y + self.bias",
+            "    return y"
+          ]
+        },
+        "qwen3_tp_model_interfaces": {
+          "source_impl": [
+            "engine/models/qwen.py"
+          ],
+          "decoder_input_hidden": "[B, T, hidden_size]",
+          "qkv_projection": {
+            "_note": "实际使用 QKVColumnParallelLinear 合并投影（单次 GEMM → split → Q/K/V），非 3 个独立 ColumnParallelLinear",
+            "qkv_merged_weight": "[q_size + 2*kv_size, hidden_size] per rank (前半 Q，中 K，后 V)",
+            "qkv_output": "tuple(q:[B,T,num_heads/tp,head_dim], k:[B,T,num_kv_heads_local,head_dim], v:[B,T,num_kv_heads_local,head_dim])"
+          },
+          "attention": {
+            "_note": "实际使用 paged KV cache + flash_attn_with_kvcache；kv_len_gpu GPU scalar 替代 Python int",
+            "kv_cache_format": "paged: _key_cache[num_blocks, 256, num_kv_heads, head_dim], _value_cache 同理",
+            "block_table": "[1, max_blocks] int32, 固定 shape",
+            "decode_attention": "flash_attn_with_kvcache(q, _key_cache, _value_cache, _kv_len_gpu, _block_table, scale, causal=False)",
+            "prefill_kv_len_semantics": "prefill前_kv_len_gpu=0; 写入后=prefill_token_count。flash_attn_varlen_func使用cu_seqlens_k标记有效长度，不使用_kv_len_gpu。"
+          },
+          "mlp": {
+            "_note": "实际使用 MergedColumnParallelLinear 合并 gate+up（单次 GEMM），非 2 个独立 ColumnParallelLinear",
+            "gate_up_merged": "[B, T, 2*intermediate_size/tp] → silu_and_mul → [B, T, intermediate_size/tp]",
+            "down_out": "[B, T, hidden_size]"
+          },
+          "decode_forward_pattern": {
+            "_note": "decode 路径统一走 forward_decode（无控制流，torch.compile 兼容）；CUDA_GRAPH=1 时走 forward_decode_graph（含 clone）",
+            "entry": "QwenForCausalLMTP.forward() 中 is_decode 分支调用 layer.forward_decode()",
+            "kv_len_tracking": "_kv_len_gpu GPU tensor（非 Python int），decode 步 forward 后 batch 读取 .item()",
+            "unified_signature": {
+              "function": "layer.forward_decode(hidden_states,positions,kv_len,max_seq_len,residual=None)",
+              "hidden_states": "[1,1,hidden_size]",
+              "positions": "[1] int64 = kv_len",
+              "kv_len": "int — 当前 KV 长度",
+              "max_seq_len": "int — max_model_len",
+              "residual": "Tensor|None — 首次为 None",
+              "return": "(hidden_states,residual)"
+            },
+            "kv_len_timing": {
+              "per_layer": "各层独立 _kv_len_gpu[1] GPU tensor，decode 步开始时各层值相同",
+              "write": "层内: slot=_kv_len_gpu[0]; index_copy_; _kv_len_gpu[0]+=1",
+              "read": "所有层完成后 batch 读取 .item() — 必须在非编译 forward() 中",
+              "hard_rule": ".item() 严禁在 forward_decode(编译函数)内执行"
+            },
+            "full_method_body": [
+              "# === QwenAttentionTP.forward_decode() — 完整 decode 热路径 ===",
+              "def forward_decode(self, hidden_states, positions, kv_len, max_seq_len):",
+              "    B, S, H = hidden_states.shape  # B=1, S=1",
+              "    # 1. QKV projection + split",
+              "    q, k, v = self.qkv_proj(hidden_states)  # q:[1,1,q_size], k:[1,1,kv_size], v:[1,1,kv_size]",
+              "    q = q.view(B, S, self.num_heads, self.head_dim)   # [1,1,8,128]",
+              "    k = k.view(B, S, self.num_kv_heads, self.head_dim) # [1,1,2,128]",
+              "    v = v.view(B, S, self.num_kv_heads, self.head_dim)",
+              "    # 2. Q/K norm",
+              "    q = self.q_norm(q); k = self.k_norm(k)",
+              "    # 3. RoPE (flatten to 2D)",
+              "    q_flat = q.reshape(S, self.num_heads, self.head_dim)",
+              "    k_flat = k.reshape(S, self.num_kv_heads, self.head_dim)",
+              "    rotary_embedding(positions, q_flat, k_flat, self.head_dim, self._cos_sin_cache_gpu, is_neox=True)",
+              "    q = q_flat.view(B, S, self.num_heads, self.head_dim)",
+              "    k = k_flat.view(B, S, self.num_kv_heads, self.head_dim)",
+              "    # 4. KV cache write (decode: write 1 token to slot=kv_len)",
+              "    self._slot_mapping_decode[0] = self._kv_len_gpu[0]",
+              "    k_write = k.reshape(1, self.num_kv_heads, self.head_dim)",
+              "    v_write = v.reshape(1, self.num_kv_heads, self.head_dim)",
+              "    kc_flat = self._key_cache.view(-1, self.num_kv_heads, self.head_dim)",
+              "    vc_flat = self._value_cache.view(-1, self.num_kv_heads, self.head_dim)",
+              "    kc_flat.index_copy_(0, self._slot_mapping_decode, k_write)",
+              "    vc_flat.index_copy_(0, self._slot_mapping_decode, v_write)",
+              "    self._kv_len_gpu[0] += 1",
+              "    # 5. flash_attn_with_kvcache (read KV from paged cache)",
+              "    q_attn = q.reshape(1, 1, self.num_heads, self.head_dim)",
+              "    out = flash_attn_with_kvcache_op(q_attn, self._key_cache, self._value_cache, self._kv_len_gpu, self._block_table, self.scaling, causal=False)",
+              "    # 6. o_proj + all_reduce",
+              "    out = out.reshape(B, S, self.q_size)",
+              "    return self.o_proj(out)  # RowParallelLinear internally calls all_reduce_sum",
+              "",
+              "# === QwenDecoderLayerTP.forward_decode() ===",
+              "def forward_decode(self, hidden_states, positions, kv_len, max_seq_len, residual=None):",
+              "    hs, res = hidden_states, residual  # (eager path: no clone; graph path: clone first)",
+              "    if res is None:",
+              "        res = hs.clone(); rms_norm(hs, res, self.input_layernorm.weight, self.input_layernorm.eps)  # first layer only",
+              "    else:",
+              "        fused_add_rms_norm(hs, res, self.input_layernorm.weight, self.input_layernorm.eps)  # res+=hs; hs=rms_norm(res)",
+              "    hs = self.self_attn.forward_decode(hs, positions, kv_len, max_seq_len)  # attention (see above)",
+              "    fused_add_rms_norm(hs, res, self.post_attention_layernorm.weight, self.post_attention_layernorm.eps)",
+              "    mlp_out = self.mlp(hs)  # gate_up_proj → silu_and_mul → down_proj",
+              "    return mlp_out, res"
+            ]
+          },
+          "model_output": "[B, T, vocab_size]",
+          "prefill_forward_pattern": {
+            "is_prefill_detection": "past_key_values is None → prefill 路径；past_key_values is not None → decode 路径",
+            "full_dataflow": [
+              "1. input_ids: [B, L_prompt] ragged concat, embed_tokens → hidden_states [B, L_prompt, hidden_size]",
+              "2. 逐层 QwenDecoderLayerTP.forward(hidden_states, positions, layer_cache=None, max_seq_len, residual=None)",
+              "3.   层内: input_layernorm → attention.forward (prefill) → post_attn_layernorm → mlp",
+              "4.     attention.forward: qkv_proj → Q/K norm → rotary_embedding → flash_attn_varlen_func(Q,K,V, cu_seqlens, causal=True) → K,V index_copy_ 写入 paged cache → o_proj → all_reduce_sum",
+              "5.   注意: flash_attn_varlen_func 的 K,V 来自当前投影产出 (非从 cache 读取)。attention 之后才 index_copy_ 写入 cache。",
+              "6.   多序列时: 按 multi_seq 伪代码构建 slot_mapping 和 block_table, K/V reshape 为 [total_tokens, heads, dim], index_copy_ 到 cache flat view",
+              "7. 所有层完成后: model.norm(hidden_states, residual) → lm_head → logits [B, L_prompt, vocab_size]",
+              "8. 每序列 _kv_len_gpu[0] 分别初始化为各自的 seq.seq_len()（非 batch 总 token 数）。各序列 _kv_len_gpu 在 prefill 后独立维护，供后续 decode 使用。"
+            ],
+            "key_differences_vs_decode": [
+              "attention kernel: flash_attn_varlen_func (ragged) vs flash_attn_with_kvcache (paged)",
+              "causal: True vs False",
+              "KV cache: allocate+write vs read+append",
+              "layer method: forward() vs forward_decode()"
+            ],
+            "layer_forward_pseudocode": [
+              "# B=1 single-seq: cu_seqlens 由 attention 内部自动构造，不通过参数传递",
+              "# === QwenDecoderLayerTP.forward(prefill, B=1) ===",
+              "def forward(self, hidden_states, positions, layer_cache, max_seq_len, residual=None):",
+              "    if residual is None:",
+              "        residual = hidden_states.clone()",
+              "        rms_norm(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.eps)",
+              "    else:",
+              "        fused_add_rms_norm(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.eps)",
+              "    attn_out = self.self_attn.forward(hidden_states, positions, max_seq_len)  # B=1, no cu_seqlens params",
+              "    fused_add_rms_norm(attn_out, residual, self.post_attention_layernorm.weight, self.post_attention_layernorm.eps)",
+              "    mlp_out = self.mlp(attn_out)",
+              "    return mlp_out, residual",
+              "",
+              "# === QwenAttentionTP.forward(prefill, B=1) ===",
+              "def forward(self, hidden_states, positions, max_seq_len):",
+              "    B, S, H = hidden_states.shape  # B=1",
+              "    q, k, v = self.qkv_proj(hidden_states)",
+              "    q = q.view(B, S, self.num_heads, self.head_dim)    # [1,S,8,128]",
+              "    k = k.view(B, S, self.num_kv_heads, self.head_dim) # [1,S,2,128]",
+              "    v = v.view(B, S, self.num_kv_heads, self.head_dim) # [1,S,2,128]",
+              "    q = self.q_norm(q); k = self.k_norm(k)",
+              "    num_tokens = B * S",
+              "    q_flat = q.reshape(num_tokens, self.num_heads, self.head_dim)",
+              "    k_flat = k.reshape(num_tokens, self.num_kv_heads, self.head_dim)",
+              "    rotary_embedding(positions, q_flat, k_flat, self.head_dim, self._cos_sin_cache_gpu, is_neox=True)",
+              "    # KV cache allocation (first prefill only)",
+              "    if self._key_cache is None:",
+              "        max_blocks = (max_seq_len + 255) // 256",
+              "        self._key_cache = torch.zeros(max_blocks, 256, self.num_kv_heads, self.head_dim, dtype=torch.bfloat16, device=q.device)",
+              "        self._value_cache = torch.zeros_like(self._key_cache)",
+              "        self._block_table = torch.zeros(1, max_blocks, dtype=torch.int32, device=q.device)",
+              "    # B=1: cu_seqlens auto-constructed",
+              "    cu = torch.tensor([0, num_tokens], dtype=torch.int32, device=q.device)",
+              "    v_flat = v.reshape(num_tokens, self.num_kv_heads, self.head_dim)",
+              "    out = flash_attn_varlen_func(q_flat, k_flat, v_flat, cu, cu, num_tokens, num_tokens, causal=True)",
+              "    # Write KV to paged cache (B=1: sequential slot_mapping)",
+              "    num_blocks = (num_tokens + 255) // 256",
+              "    self._block_table[0, :num_blocks] = torch.arange(num_blocks, dtype=torch.int32, device=q.device)",
+              "    slot_mapping = torch.zeros(num_tokens, dtype=torch.int64, device=q.device)",
+              "    for i in range(num_tokens): slot_mapping[i] = self._block_table[0, i//256].item() * 256 + (i % 256)",
+              "    kc_flat = self._key_cache.view(-1, self.num_kv_heads, self.head_dim)",
+              "    vc_flat = self._value_cache.view(-1, self.num_kv_heads, self.head_dim)",
+              "    kc_flat.index_copy_(0, slot_mapping, k_flat)",
+              "    vc_flat.index_copy_(0, slot_mapping, v_flat)",
+              "    self._kv_len_gpu[0] = num_tokens",
+              "    out = out.view(B, S, self.q_size)",
+              "    return self.o_proj(out)"
+            ],
+            "cu_seqlens_injection_path": {
+              "single_seq": "cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device). max_seqlen = num_tokens. QwenAttentionTP 内部直接从 hidden_states.shape[1] 构造。",
+              "multi_seq": [
+                "cu_seqlens 由 QwenTPModelRunner.run() 构造:",
+                "cu_seqlens_q = torch.zeros(len(batch)+1, dtype=torch.int32, device=device)",
+                "cu_seqlens_q[1:] = torch.tensor([s.seq_len() for s in batch]).cumsum(0).to(device)",
+                "cu_seqlens_k = cu_seqlens_q.clone()",
+                "max_seqlen = max(s.seq_len() for s in batch)",
+                "通过 model.forward() 的参数传入 QwenAttentionTP:",
+                "  model.forward(input_ids, past_key_values=None, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_prefill=max_seqlen)",
+                "  → 逐层 layer.forward(..., cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen=max_seqlen)",
+                "  → layer.self_attn.forward(..., cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen=max_seqlen)",
+                "单序列 shortcut: 不传 cu_seqlens → QwenAttentionTP 内部自动构造 [0, num_tokens]"
+              ],
+              "_b1_note": "B=1 时 cu_seqlens 由 QwenAttentionTP 内部自动构造 [0, num_tokens]，不需外部注入。上述 multi_seq 注入路径仅在 B>1 时需要，不在当前构建范围。"
+            },
+            "model_forward_pseudocode": [
+              "# QwenForCausalLMTP.forward() — 顶层编排器 (B=1 single-seq authoritative)",
+              "def forward(self, input_ids, past_key_values=None, position_offset=0, max_seq_len=528):",
+              "    hidden_states = self.embed_tokens(input_ids)  # [B=1, S, hidden_size]",
+              "    seq_len = input_ids.shape[1]",
+              "    positions = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)",
+              "    residual = None",
+              "    is_decode = past_key_values is not None",
+              "    if not is_decode:  # === prefill (B=1) ===",
+              "        # B=1 单序列: cu_seqlens 由 QwenAttentionTP 内部自动构造 [0, num_tokens]",
+              "        # 不需传递 cu_seqlens 参数。单序列时 cu_seqlens_q = [0, num_tokens]",
+              "        for i, layer in enumerate(self.layers):",
+              "            hidden_states, residual = layer.forward(",
+              "                hidden_states, positions, layer_cache=None, max_seq_len=max_seq_len, residual=residual)",
+              "        hidden_states, _ = self.norm(hidden_states, residual)",
+              "        kv_lens = None",
+              "    else:  # === decode (B=1) ===",
+              "        for i, layer in enumerate(self.layers):",
+              "            kv_len = past_key_values[i]",
+              "            hidden_states, residual = layer.forward_decode(",
+              "                hidden_states, positions, kv_len, max_seq_len=max_seq_len, residual=residual)",
+              "        # Batch read kv_lens AFTER all layers (outside compiled region)",
+              "        kv_lens = [int(l.self_attn._kv_len_gpu[0].item()) for l in self.layers]",
+              "        hidden_states, _ = self.norm(hidden_states, residual)",
+              "    logits = self.lm_head(hidden_states)  # [B, S, vocab_size]",
+              "    return logits, kv_lens"
+            ]
+          },
+          "class_hierarchy": {
+            "_note": "Qwen3 TP 核心类层级与 __init__ 签名。属性名必须严格匹配 — HF key 映射依赖此命名。",
+            "QwenTPConfig": {
+              "fields": [
+                "model_dir: Path",
+                "hidden_size: int",
+                "intermediate_size: int",
+                "num_hidden_layers: int",
+                "num_attention_heads: int",
+                "num_key_value_heads: int",
+                "head_dim: int",
+                "vocab_size: int",
+                "rms_norm_eps: float",
+                "rope_theta: float",
+                "max_position_embeddings: int",
+                "tie_word_embeddings: bool"
+              ],
+              "factory": "_load_qwen_tp_config(model_dir): AutoConfig.from_pretrained(model_dir, trust_remote_code=True) → QwenTPConfig(...)",
+              "head_dim_fallback": "if not hasattr(cfg, 'head_dim'): cfg.head_dim = cfg.hidden_size // cfg.num_attention_heads"
+            },
+            "QwenAttentionTP": {
+              "constructor": "__init__(self, cfg)",
+              "attrs": [
+                "self.total_num_heads = cfg.num_attention_heads  # 32 (全量)",
+                "self.total_num_kv_heads = cfg.num_key_value_heads  # 8 (全量)",
+                "self.num_heads = cfg.num_attention_heads // tp_size  # 8 (per-rank)",
+                "# KV head replication: if tp > num_kv_heads → replicate heads across ranks",
+                "if cfg.num_key_value_heads >= tp_size:",
+                "    self.num_kv_heads = cfg.num_key_value_heads // tp_size  # 2 (normal case)",
+                "else:",
+                "    self.num_kv_heads = 1  # 1 (replicated, each rank gets 1 head)",
+                "    self.kv_head_replica = tp_size // cfg.num_key_value_heads",
+                "self.head_dim = cfg.head_dim  # 128",
+                "self.q_size = self.num_heads * self.head_dim  # 8*128=1024",
+                "self.kv_size = self.num_kv_heads * self.head_dim  # 2*128=256",
+                "self.scaling = self.head_dim ** -0.5  # 1/sqrt(128)≈0.08839",
+                "self.qkv_proj = QKVColumnParallelLinear(cfg.hidden_size, self.head_dim, self.total_num_heads, self.total_num_kv_heads)",
+                "self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim, cfg.hidden_size, bias=False)",
+                "self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)",
+                "self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)",
+                "self.register_buffer('_cu_q', torch.tensor([0,0], dtype=torch.int32), persistent=False)",
+                "self.register_buffer('_cu_k', torch.tensor([0,0], dtype=torch.int32), persistent=False)",
+                "self._kv_block_size = 256",
+                "self._key_cache = None; self._value_cache = None; self._block_table = None; self._slot_mapping = None",
+                "self.register_buffer('_kv_len_gpu', torch.zeros(1, dtype=torch.int32), persistent=False)",
+                "self.register_buffer('_slot_mapping_decode', torch.zeros(1, dtype=torch.int64), persistent=False)",
+                "self._cos_sin_cache_cpu = _get_cos_sin_cache(cfg.max_position_embeddings, self.head_dim, cfg.rope_theta)",
+                "self._cos_sin_cache_gpu = None  # lazy GPU transfer on first forward"
+              ]
+            },
+            "QwenMLPTP": {
+              "constructor": "__init__(self, cfg)",
+              "attrs": [
+                "self.gate_up_proj = MergedColumnParallelLinear(cfg.hidden_size, cfg.intermediate_size, bias=False, gather_output=False)",
+                "self.down_proj = RowParallelLinear(cfg.intermediate_size, cfg.hidden_size, bias=False)"
+              ]
+            },
+            "QwenDecoderLayerTP": {
+              "constructor": "__init__(self, cfg)",
+              "attrs": [
+                "self.self_attn = QwenAttentionTP(cfg)",
+                "self.mlp = QwenMLPTP(cfg)",
+                "self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)",
+                "self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)"
+              ]
+            },
+            "QwenForCausalLMTP": {
+              "constructor": "__init__(self, cfg, device, dtype)",
+              "attrs": [
+                "self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)",
+                "self.layers = nn.ModuleList([QwenDecoderLayerTP(cfg) for _ in range(cfg.num_hidden_layers)])",
+                "self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)",
+                "self.lm_head = ParallelLMHead(cfg.hidden_size, cfg.vocab_size, gather_output=True)"
+              ]
+            },
+            "construction_chain": [
+              "cfg = _load_qwen_tp_config(model_dir)  # config.json → QwenTPConfig dataclass",
+              "model = QwenForCausalLMTP(cfg, device=device, dtype=torch.bfloat16)",
+              "model.load_weights()  # see qwen_hf_key_mapping",
+              "model.eval()",
+              "init_custom_ar(device=device)  # after model on GPU, before first forward"
+            ]
+          },
+          "model_forward_pseudocode": [
+            "# QwenForCausalLMTP.forward() — 顶层编排器",
+            "def forward(self, input_ids, past_key_values=None, position_offset=0, max_seq_len=528):",
+            "    hidden_states = self.embed_tokens(input_ids)  # [B, S, hidden_size]",
+            "    seq_len = input_ids.shape[1]",
+            "    positions = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)",
+            "    residual = None",
+            "    is_decode = past_key_values is not None",
+            "    if not is_decode:  # === prefill ===",
+            "        for i, layer in enumerate(self.layers):",
+            "            hidden_states, residual = layer.forward(",
+            "                hidden_states, positions, layer_cache=None, max_seq_len=max_seq_len, residual=residual)",
+            "        hidden_states, _ = self.norm(hidden_states, residual)",
+            "        kv_lens = None  # prefill returns None; kv_len set externally",
+            "    else:  # === decode ===",
+            "        for i, layer in enumerate(self.layers):",
+            "            kv_len = past_key_values[i]",
+            "            hidden_states, residual = layer.forward_decode(",
+            "                hidden_states, positions, kv_len, max_seq_len=max_seq_len, residual=residual)",
+            "        # Batch read kv_lens AFTER all layers (MUST be outside compiled region)",
+            "        kv_lens = [int(l.self_attn._kv_len_gpu[0].item()) for l in self.layers]",
+            "        hidden_states, _ = self.norm(hidden_states, residual)",
+            "    logits = self.lm_head(hidden_states)  # [B, S, vocab_size]",
+            "    return logits, kv_lens"
+          ],
+          "_scope_note": "当前蓝图覆盖: nocompile, B=1, TP=4。不使用 torch.compile, 不使用 CUDA Graph, 不考虑 B>1 Continuous Batching。nocompile 场景下 flash_attn_with_kvcache 直接 from flash_attn.flash_attn_interface import，无需 custom_op 注册 (custom_op+register_fake 仅在 torch.compile tracing 时需要)。"
+        },
+        "performance_optimization": {
+          "_note": "Phase 11 — 性能优化。正确性已在 Phase 1-10 验证通过，本阶段仅修改实现方式以提高吞吐。以下模式从真实 meta-infer engine 提取。",
+          "p1_prealloc_buffers": {
+            "rule": "torch.empty_like(x) 预分配，非 torch.empty() 每次新建",
+            "real_engine": "engine/models/qwen.py:112 — out = torch.empty_like(x); rms_norm(out, x.contiguous(), weight, eps)",
+            "apply_to": ["RMSNorm.forward", "attention forward", "MLP forward"],
+            "expected_gain": "消除 per-step cudaMalloc (~200ms → <1ms)"
+          },
+          "p2_lazy_contiguous": {
+            "rule": "仅在内核输入前调用 .contiguous()，不在中间 tensor 上调",
+            "real_engine": "engine/models/qwen.py:113 — rms_norm(out, x.contiguous(), ...); 但中间 view/reshape 后不调 contiguous",
+            "apply_to": ["所有 kernel wrapper 入口", "flash_attn 输入"],
+            "expected_gain": "消除不必要的 GPU mem copy"
+          },
+          "p3_view_not_reshape": {
+            "rule": "view() 替代 reshape() — view 零拷贝且不会隐式触发 contiguous()",
+            "real_engine": "engine/models/qwen.py:225-226 — q.view(bsz, seqlen, num_heads, head_dim)",
+            "apply_to": ["Q/K/V reshape after qkv_proj", "attention output reshape before o_proj"],
+            "expected_gain": "消除 reshape() 触发的隐式 copy"
+          },
+          "p4_eliminate_intermediate_tensors": {
+            "rule": "one-pass 计算，消除中间临时 tensor 分配",
+            "real_engine": "engine/models/qwen.py:300-312 — QwenMLPTP.forward: gate_up → silu_and_mul(in-place) → down_proj; 中间无额外 tensor 分配",
+            "apply_to": ["MLP forward", "attention forward", "decoder layer"],
+            "expected_gain": "减少 Python GC 压力 + per-layer ~50us alloc 开销"
+          },
+          "p5_no_redundant_item": {
+            "rule": ".item() 仅在 QwenForCausalLMTP.forward() 外层 36 层循环后批量读取一次，不在每层 forward_decode 内读取",
+            "real_engine": "engine/models/qwen.py:514 — kv_lens = [int(l.self_attn._kv_len_gpu[0].item()) for l in self.layers]",
+            "expected_gain": "消除 per-token 36×7ms = 252ms GPU sync（当前 226ms 是最大瓶颈）"
+          },
+          "p6_register_buffer_for_persistent_tensors": {
+            "rule": "不变 tensor 用 register_buffer（persistent=False）注册，避免每步重新分配",
+            "real_engine": "engine/models/qwen.py:202-203 — register_buffer('_kv_len_gpu', ...), register_buffer('_slot_mapping_decode', ...)",
+            "apply_to": ["kv_len_gpu", "slot_mapping_decode", "cos_sin_cache (lazy GPU)"]
+          }
+        },
+        "qwen3_kernel_contracts": {
+          "_note": "7 个 vLLM 黑盒 kernel — 全部从 vLLM installed package 源码提取纯净 wrapper (kernel_replacement_plan.md §九)，禁止修改内部逻辑。对应 kernel_replacement_plan.md Stage 1-7。",
+          "source_impl": [
+            "engine/kernels/vllm_wrappers.py",
+            "engine/models/qwen.py",
+            "engine/tp_layers/linear.py"
+          ],
+          "source_refs": [
+            "notebooks-cn/07_improvementPlan/kernel_replacement_plan.md",
+            "notebooks-cn/07_improvementPlan/qwen3_effective_changes.md"
+          ],
+          "rms_norm": {
+            "ref_source": "vllm/_custom_ops.py:420-423",
+            "wrapper": "kernel_replacement_plan.md §九, input, weight, eps)",
+            "constraint": "out 预分配 (empty_like)；input 必须 contiguous；out/input/weight 同 dtype",
+            "usage_in_qwen": "RMSNorm.forward(x) → rms_norm(out, x.contiguous(), weight, eps)",
+            "inline_signature": "def rms_norm(out: Tensor[*,H], input: Tensor[*,H], weight: Tensor[H], epsilon: float) -> None  # out 预分配, input 必须 contiguous, all bf16. vllm._custom_ops.rms_norm"
+          },
+          "fused_add_rms_norm": {
+            "ref_source": "vllm/_custom_ops.py:420-423",
+            "wrapper": "kernel_replacement_plan.md §九, residual!, weight, eps)",
+            "constraint": {
+              "desc": "双 in-place。所有 fused_add_rms_norm 调用均使用本层的 self.input_layernorm.weight 或 self.post_attention_layernorm.weight。不存在跨层 weight 依赖。物理 tracing 确认: forward_decode 中 4 次调用均为 self.input_layernorm.weight (2次) + self.post_attention_layernorm.weight (2次)。",
+              "residual_chain_pseudocode": [
+                "hs, res = hidden_states, residual",
+                "if res is None: res = hs.clone(); rms_norm(hs, res, self.input_layernorm.weight, eps)  # layer 0 only",
+                "else: fused_add_rms_norm(hs, res, self.input_layernorm.weight, eps)  # res+=hs; hs=rms_norm(res)",
+                "# ... attention (prefill or decode) ...",
+                "fused_add_rms_norm(attn_out, res, self.post_attention_layernorm.weight, eps)",
+                "# ... mlp ... ; return mlp_out, res"
+              ]
+            },
+            "usage_in_qwen": "RMSNorm.forward(x, residual) → fused_add_rms_norm(x.contiguous(), residual.contiguous(), weight, eps)",
+            "inline_signature": "def fused_add_rms_norm(input!: Tensor[*,H], residual!: Tensor[*,H], weight: Tensor[H], epsilon: float) -> None  # 双 in-place: residual+=input; input=rms_norm(residual). vllm._custom_ops.fused_add_rms_norm"
+          },
+          "silu_and_mul": {
+            "ref_source": "vllm/model_executor/layers/activation.py::SiluAndMul.forward_cuda",
+            "wrapper": "torch.ops._C.silu_and_mul(out!, input) (需 import vllm._C 触发注册)",
+            "constraint": "out 预分配 [B, S, intermediate/tp]；input 为 MergedColumnParallelLinear 输出 [B, S, 2*intermediate/tp]（前 gate 后 up）",
+            "usage_in_qwen": "QwenMLPTP.forward: gate_up = self.gate_up_proj(x); out = empty(...); silu_and_mul(out, gate_up); return down_proj(out)",
+            "inline_signature": "torch.ops._C.silu_and_mul(out!: Tensor[*,d], input: Tensor[*,2*d]) -> None  # out=SiLU(input[:d])*input[d:]. out 预分配. 需 import vllm._C"
+          },
+          "rotary_embedding": {
+            "ref_source": "vllm/_custom_ops.py:400-410",
+            "wrapper": "kernel_replacement_plan.md §九, q!, k!, head_size, cos_sin_cache, is_neox=True)",
+            "constraint": "q/k in-place 修改；输入为 2D [num_tokens, heads, head_dim] (非4D)；cos_sin_cache 格式 [max_pos, head_size]（前 head_size//2 cos，后 head_size//2 sin）；Qwen3 is_neox=True",
+            "cos_sin_cache_strategy": {
+              "registry": "_cos_sin_cache_registry: dict[tuple, Tensor] = {}  # 模块级",
+              "factory": "_get_cos_sin_cache(max_pos, head_dim, rope_theta): key=(max_pos,head_dim,rope_theta); if key not in registry: registry[key]=make_cos_sin_cache(...); return registry[key]",
+              "lazy_gpu": "self._cos_sin_cache_cpu = _get_cos_sin_cache(max_pos, head_dim, rope_theta)  # CPU 创建在 __init__",
+              "gpu_transfer": "self._cos_sin_cache_gpu = None; 首次 forward: if _cos_sin_cache_gpu is None: _cos_sin_cache_gpu = _cos_sin_cache_cpu.to(device)"
+            },
+            "inline_signature": "def rotary_embedding(positions: Tensor[N] int64, query!: Tensor[N,H,D], key!: Tensor[N,Kv,D]|None, head_size: int, cos_sin_cache: Tensor[M,D], is_neox: bool) -> None  # q/k in-place. vllm._custom_ops.rotary_embedding"
+          },
+          "custom_ar_all_reduce": {
+            "ref_source": "vllm/_custom_ops.py:640-680",
+            "wrapper": "kernel_replacement_plan.md §四 (组装说明)::CustomAllReduceHandle + kernel_replacement_plan.md §四 (组装说明)::all_reduce_sum",
+            "constraint": {
+              "desc": "out-of-place (输出新 tensor，非输入别名)；init_custom_ar 必须在 load_weights 后调用；需要 gloo ProcessGroup 做 IPC handle exchange；world_size=1 时直接 return (no-op)；支持 tp_size ∈ {2,4,6,8}",
+              "ipc_exchange_pseudocode": [
+                "gloo_group = dist.new_group(backend='gloo')",
+                "raw_ptr,ipc_handle = ops.allocate_shared_buffer_and_handle(size)",
+                "dist.all_gather_object(handles,ipc_handle,group=gloo_group)",
+                "pointers = [ops.open_mem_handle(h) if i!=rank else raw_ptr for i,h in enumerate(handles)]"
+              ],
+              "init_state_machine": {
+                "pseudocode": [
+                  "# ⚠️ CRITICAL: 整个 init 必须在 try/except 中。",
+                  "# CustomAR 的 open_mem_handle 依赖 IPC（进程间通信），",
+                  "# 在不同 CUDA 版本/驱动/容器环境下可能失败。",
+                  "# 失败时 _custom_ar_handle 保持 None → all_reduce_sum 自动回退 NCCL。",
+                  "# 严禁 init 崩溃导致 TP 推理直接挂。",
+                  "try:",
+                  "    # Step 1: 所有 rank 完成 load_weights() 后同步",
+                  "    dist.barrier()",
+                  "    if rank == 0: print('weights loaded, initializing CustomAR...')",
+                  "    # Step 2: 创建 gloo ProcessGroup（非 NCCL，用于 IPC handle exchange）",
+                  "    gloo_group = dist.new_group(backend='gloo')",
+                  "    # Step 3: allocate P2P shared buffer (足够容纳最大 all_reduce workspace)",
+                  "    max_size = 16 * 1024 * 1024  # 16 MB",
+                  "    raw_ptr, ipc_handle = ops.allocate_shared_buffer_and_handle(max_size)",
+                  "    # Step 4: 所有 rank 交换 IPC handles",
+                  "    handles = [None] * world_size",
+                  "    dist.all_gather_object(handles, ipc_handle, group=gloo_group)",
+                  "    # Step 5: open remote handles（⚠️ 此处可能抛异常：'Cannot access data pointer'）",
+                  "    pointers = [ops.open_mem_handle(h) if i != rank else raw_ptr for i, h in enumerate(handles)]",
+                  "    # Step 6: init CustomAR state",
+                  "    self._ptr = ops.init_custom_ar(pointers, rank_data, rank, fully_connected)",
+                  "    ops.register_buffer(self._ptr, buf_pointers)",
+                  "    # Step 7: 同步完成",
+                  "    dist.barrier()",
+                  "    if rank == 0: print('CustomAR initialized')",
+                  "except Exception as e:",
+                  "    if rank == 0: print(f'CustomAR init failed: {e}. Falling back to NCCL.')",
+                  "    _custom_ar_handle = None  # ← 确保 None，触发 all_reduce_sum 的 NCCL fallback",
+                  "    # 不 raise——NCCL fallback 完全可用，只是慢一些（204ms vs 24ms）",
+                  "# Special case:",
+                  "if world_size == 1: init_custom_ar 立即 return (no-op)"
+                ],
+                "_failure_fallback_contract": "init_custom_ar 失败时 _custom_ar_handle 必须设为 None。all_reduce_sum（见 tp_distributed_runtime.collectives.all_reduce_sum.pseudocode）已内置 NCCL fallback：if _custom_ar_handle is not None → P2P; else → dist.all_reduce(NCCL)。init_custom_ar 只需保证失败后 handle 为 None，all_reduce_sum 自动走 NCCL。",
+                "workspace_size": "16 MB — RowParallel TP=4 输出 per-rank [B,T,4096] bf16=8KB。36 layers x 2 = 72 all_reduce x 8KB = 576KB total。16MB 足够。",
+                "vllm_imports": {
+                  "_critical": "以下符号从 vllm installed package 导入。在源码销毁假设下，需在 vllm 安装环境中验证这些路径。",
+                  "imports": [
+                    "from vllm import _custom_ops as ops",
+                    "# ops.allocate_shared_buffer_and_handle(size: int) -> tuple[int, bytes]  # (raw_pointer, ipc_handle)",
+                    "# ops.open_mem_handle(ipc_handle: bytes) -> int  # remote raw_pointer",
+                    "# ops.init_custom_ar(meta_ptrs: list[int], rank_data: Tensor, rank: int, fully_connected: bool) -> int  # returns ptr",
+                    "# ops.register_buffer(ptr: int, buf_ptrs: list[int]) -> None",
+                    "# ops.all_reduce(ptr: int, inp: Tensor, out: Tensor, reg_buffer: int, reg_buffer_sz_bytes: int) -> None",
+                    "# ops.dispose(ptr: int) -> None",
+                    "# ops.meta_size() -> int  # metadata buffer size",
+                    "# _check_p2p(rank, world_size) -> bool  # torch.cuda.can_device_access_peer loop"
+                  ]
+                },
+                "register_buffer_detail": {
+                  "purpose": "为 all_reduce 的 staging buffer 注册 IPC 句柄，使 P2P kernel 可直接访问其他 rank 的 buffer",
+                  "_critical_fix": "2026-05-30 物理代码审查确认：buf_ptrs 的 exchange 方式与 meta_ptrs 相同——都用 all_gather_object。broadcast_object_list 仅在 CUDA Graph 路径的 register_graph_buffers() 中使用，与 eager 模式 init 无关。此前蓝图错误地写了 broadcast_object_list，已修正。",
+                  "allocation": [
+                    "# buf_ptrs 的 exchange 与 meta_ptrs 使用同一个 _allocate_and_exchange_handles 函数",
+                    "# 只是传入的 size 参数不同：meta_ptrs=meta_size+max_size, buf_ptrs=max_size",
+                    "def _allocate_and_exchange_handles(size, group, rank, world_size):",
+                    "    raw_ptr, ipc_handle = ops.allocate_shared_buffer_and_handle(size)",
+                    "    handles = [None] * world_size",
+                    "    dist.all_gather_object(handles, ipc_handle, group=group)  # ← 两套都用 all_gather_object！",
+                    "    pointers = [ops.open_mem_handle(h) if i != rank else raw_ptr for i, h in enumerate(handles)]",
+                    "    return pointers",
+                    "",
+                    "# 调用两次：",
+                    "meta_ptrs = _allocate_and_exchange_handles(meta_size + max_size, ...)  # 元数据 + staging",
+                    "buf_ptrs = _allocate_and_exchange_handles(max_size, ...)              # 纯 staging buffer",
+                    "ops.register_buffer(self._ptr, buf_ptrs)  # register staging buffers for all_reduce"
+                  ],
+                  "meta_size_explanation": "ops.meta_size() 返回元数据缓冲区的最小字节数 (通常 ~4KB)。init_custom_ar 时需要 meta_size + max_size 的总缓冲区大小来分配 meta_ptrs (元数据 + staging)。meta_ptrs 用于 rank 间同步 P2P 状态。",
+                  "two_buffer_sets": [
+                    "meta_ptrs: init_custom_ar 时分配 (meta_size + max_size) — 用于 P2P 控制信号 + staging",
+                    "buf_ptrs: register_buffer 时分配 (max_size each) — 用于 all_reduce staging buffer",
+                    "两个 buffer 集合的 exchange 方式完全相同：都通过 _allocate_and_exchange_handles 函数，内部使用 dist.all_gather_object。唯一区别是传入的 size 参数不同。",
+                    "call_sequence: _allocate_and_exchange_handles(meta) → _allocate_and_exchange_handles(buf) → init_custom_ar(meta_ptrs, ...) → register_buffer(ptr, buf_ptrs)"
+                  ],
+                  "broadcast_object_list_usage_note": "⚠️ broadcast_object_list 在真实 engine 中仅用于 register_graph_buffers()——CUDA Graph 捕获后注册 graph buffer IPC meta（handle+offset 对），不是 init 阶段的 raw buffer 分配。eager 模式 nocompile 不需要此函数。蓝图此前混用了两个上下文的 exchange 方式。"
+                }
+              }
+            },
+            "usage_in_qwen": "RowParallelLinear.forward → all_reduce_sum(partial_output) → 透明切换 CustomAR P2P",
+            "inline_signature": "ops.all_reduce(ptr: int, inp: Tensor, out: Tensor, reg_buffer: int, reg_buffer_sz_bytes: int) -> None  # out-of-place. from vllm import _custom_ops as ops"
+          },
+          "sdpa_enable_gqa": {
+            "ref_source": "PyTorch 2.9+ torch.nn.functional.scaled_dot_product_attention(enable_gqa=True)",
+            "constraint": "K/V 保持 [B, num_kv_heads, S, D] 不广播 (去掉 repeat_interleave)；q.shape[1] 必须被 k.shape[1] 整除",
+            "usage_in_qwen": "Decode attention 直接传原始 num_kv_heads 给 SDPA (已迁移到 flash_attn_with_kvcache)"
+          },
+          "qkv_merged_projection": {
+            "ref_source": "vLLM QKVParallelLinear (继承 ColumnParallelLinear)",
+            "wrapper": "kernel_replacement_plan.md §四 (组装说明)::QKVColumnParallelLinear",
+            "constraint": "merged weight [q_size + 2*kv_size, hidden_size] per rank (前 Q 中 K 后 V)；输出 .split([q_size, kv_size, kv_size], dim=-1)；weight loading 按 [0:q_size], [q_size:q_size+kv_size], [q_size+kv_size:] 三段复制；KV head replication 在 tp_size > num_kv_heads 时 num_kv_heads = 1 q_size = num_heads * head_dim // tp_size; kv_size = num_kv_heads * head_dim // tp_size (GQA: num_kv_heads < num_heads) num_heads = config.num_attention_heads (全量值，非 per-rank)。q_size = num_heads * head_dim // tp_size 已包含除法，勿双重除。",
+            "inline_signature": "QKVColumnParallelLinear(hidden_size, head_dim, total_num_heads, total_num_kv_heads, bias=False, gather_output=False).forward(x) → (q,k,v)  # head_dim=cfg.head_dim (128 for Qwen3-8B). Not 'head_size'."
+          }
+        },
+        "deepseek_v2_tp_model_interfaces": {
+          "source_impl": [
+            "engine/models/deepseek_v2.py",
+            "engine/tp_layers/moe.py"
+          ],
+          "decoder_input_hidden": "[B, T, hidden_size]",
+          "mla_attention": {
+            "q_a_proj_out_replicated": "[B, T, q_lora_rank] or skip when q_lora_rank is None",
+            "q_b_local": "[B, T, num_heads/tp, qk_nope_head_dim + qk_rope_head_dim]",
+            "kv_a_latent_replicated": "[B, T, kv_lora_rank]",
+            "k_pe_replicated": "[B, T, qk_rope_head_dim]",
+            "kv_b_local": "[B, T, num_heads/tp, qk_nope_head_dim + v_head_dim]",
+            "attn_out_local": "[B, T, num_heads/tp * v_head_dim]",
+            "attn_out_projected": "[B, T, hidden_size]"
+          },
+          "dense_mlp": {
+            "gate_local": "[B, T, intermediate_size/tp]",
+            "up_local": "[B, T, intermediate_size/tp]",
+            "down_out": "[B, T, hidden_size]"
+          },
+          "moe_mlp": {
+            "router_logits_replicated": "[B*T, n_routed_experts]",
+            "topk_idx": "[B*T, top_k]",
+            "topk_weight": "[B*T, top_k]",
+            "local_expert_out_flat": "[B*T, hidden_size]",
+            "global_expert_out_after_all_reduce": "[B*T, hidden_size]",
+            "shared_experts_out": "[B, T, hidden_size] (if n_shared_experts > 0)",
+            "moe_final_out": "[B, T, hidden_size]"
+          },
+          "model_output": "[B, T, vocab_size]",
+          "_physical_trace_evidence": {
+            "date": "2026-05-26",
+            "gpu_self_cuda_total": "1343.1ms (with profiler overhead)",
+            "communication_percentage": "944.6ms (70.3%) — CustomAR P2P dominates. 64 experts × 6/tok × all_reduce per MoE layer",
+            "compute_percentage": "11.0ms (0.8%) — MLA attention + GEMM. Triton MLA decode kernel active.",
+            "wall_time": "1398.6ms (with profiler)",
+            "throughput": "8.6 tok/s",
+            "output_correctness": "语义正确: '讲究亭台轩榭的布局，讲究假山'",
+            "top_gpu_kernel": "cross_device_reduce_1stage (311.5ms, CustomAR P2P)"
+          }
+        },
+        "cuda_graph_execution_contract": {
+          "_note": "CUDA Graph Stage A-C 完成后状态。单 GPU 可用 (reduce-overhead)，TP=4 阻塞 (阶段三)。",
+          "source_impl": [
+            "engine/models/qwen.py::QwenDecoderLayerTP.forward_decode_graph",
+            "engine/models/qwen.py::QwenTPModelRunner._setup_cuda_graph_piecewise",
+            "engine/tp_layers/cuda_graph_wrapper.py"
+          ],
+          "source_refs": [
+            "notebooks-cn/07_improvementPlan/cuda_graph_plan.md",
+            "notebooks-cn/07_improvementPlan/stage0_2_vs_vllm.md"
+          ],
+          "current_status": {
+            "single_gpu": "可用 — torch.compile(mode='reduce-overhead') + forward_decode_graph (clone 输入)。正确性验证通过 (5/5 字字对齐)。吞吐 35.4 tok/s (eager 55.7 tok/s 对比 vLLM graph 166.8 tok/s)",
+            "tp4": "阻塞 — Dynamo RNG 重编译崩溃。根因: torch.compile 追踪进入 all_reduce_sum 内部 → 预热/捕获 CUDA 流状态不同 → guard 失效 → 重编译 → cuda.get_rng_state() 在 graph 捕获期间被禁止",
+            "planned_fix": "sglang 切图方案: 在 all_reduce_sum 处用 torch.fx.split_module 拆分 FX 图 (split_graph 45行)，通信子图用 backend='eager' 不入 CUDA Graph。核心代码在 ref_projects/sglang/.../compilation/backend.py:214-257",
+            "tp4_implementation_pathway": {
+              "single_gpu": [
+                "CUDA_GRAPH=1 触发 swap_mechanism",
+                "types.MethodType 绑定 compiled forward_decode_graph",
+                "验证: 5/5 greedy decode 字字对齐，graph_launches>0"
+              ],
+              "tp4_upgrade": [
+                "register all_reduce_sum as custom_op",
+                "实现 torch.compile custom backend",
+                "split_graph at all_reduce_sum",
+                "通信 eager, 计算 inductor",
+                "张量传递: clone() 跨图"
+              ],
+              "ref_code": "ref_projects/sglang/.../.../compilation/backend.py:214-257",
+              "note": "TP=4 CUDA Graph 已知未完成。单 GPU 可用 (35.4 tok/s)。TP=4 需自行实现 split_graph。"
+            }
+          },
+          "forward_decode_graph_design": {
+            "clone_mechanism": "forward_decode_graph 开头 hs=hidden_states.clone(); res=residual.clone() — clone 在 compiled + graphed 函数内部，地址被 CUDA Graph 捕获 → replay 时稳定",
+            "why_clone_needed": "fused_add_rms_norm 原地修改输入 → 不 clone 会污染 CUDAGraphEntry 存储的上层输出。无条件 clone 在 eager 模式造成 ~15% 回退 — 通过 swap_mechanism (CUDA_GRAPH=0 走 forward_decode 无 clone) 解决",
+            "static_buffers": "_graph_pos (预分配 position tensor, replay 前 copy 更新), _graph_input_ids (预分配 input_ids tensor)"
+          },
+          "reduce_overhead_constraints": {
+            "triton_cudagraphs": "PyTorch 2.9.1 需手动 torch._inductor.config.triton.cudagraphs = True",
+            "mutated_inputs": "fused_add_rms_norm 原地修改输入 → inductor 检测 mutated inputs → skipping cudagraphs。通过 clone 输入解决",
+            "no_external_wrapper": "reduce-overhead 使用 inductor 内部 cudagraph_trees (BB-9)，不能与外层 CUDAGraphWrapper 同时使用"
+          },
+          "tested_and_excluded_approaches": {
+            "raw_cuda_graph_nccl": "nano-vllm/mini-sglang 方案 — CTRL 捕获成功但 hs 差 3.4 (cuBLAS 图池地址不稳定)",
+            "raw_cuda_graph_custom_ar": "sglang registered=True 路径 — illegal memory access during replay",
+            "torch_compile_guard_disable": "PyTorch 2.9.1 不支持空守卫列表",
+            "pytorch_2_10_upgrade": "实测 2.10.0 仍 crash"
+          },
+          "failure_modes": [
+            "FM-014: Dynamo RNG 重编译崩溃",
+            "FM-015: cuBLAS 图池地址漂移 → replay 数值错误 (差 3.4)",
+            "FM-016: mutated inputs → skipping cudagraphs",
+            "FM-017: clone 在 eager 路径的 ~15% 性能回退"
+          ],
+          "all_reduce_sum_custom_op_template": {
+            "registration": "@torch.library.custom_op('meta_infer::all_reduce_sum',mutates_args=())",
+            "impl": "def all_reduce_sum(x):\n    if not is_tp_enabled(): return x.clone()\n    y=x.clone(); dist.all_reduce(y,SUM); return y",
+            "fake": "@all_reduce_sum.register_fake\ndef _(x): return torch.empty_like(x)",
+            "split_graph_pseudocode": [
+              "node_to_subgraph_id = {}",
+              "for node in fx_graph.graph.nodes:",
+              "    if node.target == 'meta_infer::all_reduce_sum':",
+              "        subgraph_id += 1; node_to_subgraph_id[node] = subgraph_id  # 通信节点独占子图",
+              "        subgraph_id += 1  # 下一计算节点属于新子图",
+              "    else: node_to_subgraph_id[node] = subgraph_id",
+              "split_gm = torch.fx.split_module(graph, None, lambda n: node_to_subgraph_id[n], keep_original_order=True)",
+              "# 通信子图用 backend='eager' (不入 CUDA Graph); 计算子图用 inductor"
+            ],
+            "split_graph_implementation": {
+              "entry_point": "ref_projects/sglang/python/sglang/srt/compilation/backend.py:214-257",
+              "three_steps": [
+                "1. 获取 FX Graph: 通过 torch.compile 的 custom backend hook 或 torch.export.export(model, args) 获取",
+                "2. split_graph(graph, split_at=['meta_infer::all_reduce_sum']): 计算子图 + 通信子图分离",
+                "3. 计算子图: torch.compile(backend='inductor', fullgraph=True) → CUDA Graph 捕获",
+                "   通信子图: torch.compile(backend='eager') — 不入 CUDA Graph，每步 eager 执行"
+              ],
+              "tensor_passing": "计算子图输出 → clone() → 通信子图输入。clone 避免 CUDA Graph 跨图依赖导致的地址绑定冲突。",
+              "pseudocode": [
+                "class SGLangBackend:",
+                "    def compile(self, gm, example_inputs):",
+                "        split_gm, items = split_graph(gm, self.split_ops)",
+                "        for item in items:",
+                "            if item.is_splitting_graph:",
+                "                torch.compile(item.graph, backend='eager')  # 通信图",
+                "            else:",
+                "                torch.compile(item.graph, backend='inductor', fullgraph=True)  # 计算图"
+              ]
+            }
+          }
+        },
+        "deepseek_v2_mla_kv_contract": {
+          "config_dims": {
+            "kv_lora_rank": 512,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "q_head_dim": 192,
+            "v_head_dim": 128,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 27
+          },
+          "hf_materialized_kv_shapes_per_layer": {
+            "key_states": "[batch, num_heads, q_len, q_head_dim] -> [batch, 16, q_len, 192]",
+            "value_states": "[batch, num_heads, q_len, v_head_dim] -> [batch, 16, q_len, 128]"
+          },
+          "logical_kv_bytes": {
+            "formula": "num_layers * num_heads * (q_head_dim + v_head_dim) * dtype_bytes",
+            "dtype_bfloat16_bytes_per_token": 276480,
+            "bytes_per_block_block_size_16": 4423680
+          },
+          "physical_block_indexing": {
+            "token_to_block": "block_index = token_pos // block_size",
+            "token_offset": "offset = token_pos % block_size",
+            "slot_id": "slot_id = block_table[block_index] * block_size + offset",
+            "block_table_dtype": "python list[int] (若转 tensor 用 int32)"
+          },
+          "device_dtype_requirements": {
+            "runner_inputs": "int64 on cuda",
+            "model_weights": "bfloat16 on cuda",
+            "kv_placeholder": "bfloat16 on cuda",
+            "sampler_logits_compute": "logits.float() before temperature/top_p"
+          }
+        }
+      },
+      "scheduler_tp_runner_bridge": {
+        "_note": "Scheduler 与 TP Runner 之间的集成接口层。解决双轨 block_size、num_free_blocks 来源、BlockManager 降级三个关键架构断层。",
+        "llm_engine_block_size_injection": {
+          "rule": "LLMEngine.__init__ 中根据 self.inference_backend 向 Scheduler 注入 block_size",
+          "pseudocode": [
+            "if self.inference_backend in (None, 'hf'): scheduler._block_size = 16",
+            "elif self.inference_backend in ('qwen_tp', 'deepseek_tp'): scheduler._block_size = 256"
+          ]
+        },
+        "num_free_blocks_source": {
+          "RealModelRunner": "BlockManager.get_num_free_blocks() -> int",
+          "TP_Runner": {
+            "impl": [
+              "kv_len = self.model.layers[0].self_attn._kv_len_gpu[0].item()",
+              "max_blocks = config.max_position_embeddings // 256",
+              "allocated = (kv_len + 255) // 256",
+              "return max_blocks - allocated"
+            ],
+            "ceil_note": "(kv_len+255)//256 而非 kv_len//256。部分使用的 block 也算已分配。",
+            "kv_len_source": "任意层。所有层 decode 步开始时 _kv_len_gpu 值相同。"
+          },
+          "interface": "LLMEngine.step() 中根据 inference_backend 选择调用 BlockManager 或 runner 获取 num_free_blocks"
+        },
+        "block_manager_role_in_tp_path": {
+          "rule": "TP Runner 路径下 BlockManager 降级为纯容量计数器。allocate()/free() 为 no-op。block_table 的实际分配由 QwenAttentionTP torch.arange 完成。",
+          "pseudocode": [
+            "if inference_backend in ('qwen_tp', 'deepseek_tp'):",
+            "    # Scheduler 仍调用 can_allocate/can_append_one_more",
+            "    # 但 BlockManager.allocate() 内部: return block_count (仅计数，不分配 block_id)",
+            "    # 实际 block_table 由 QwenAttentionTP.forward_prefill() 内部 torch.arange 分配"
+          ]
+        },
+        "prefix_caching_in_tp_path": {
+          "rule": "TP Runner 路径不支持 prefix caching（block_table 为顺序分配，非 hash-based）。后续 stage 可升级为基于 token sequence 的 prefix 匹配。",
+          "impact": "低 — 当前单请求 B=1 推理场景下 prefix caching 收益为零"
+        },
+        "interface_boundary": "调度器 always 通过 LLMEngine.step() 的 num_free_blocks 参数感知容量。block_table 的具体分配逻辑由 ModelRunner 内部决定（框架层 BlockManager 或模型层 torch.arange），调度器不关心。",
+        "prefill_timing_gap": {
+          "problem": "prefill 调度在 forward 前，_kv_len_gpu 为旧值",
+          "fix": "Scheduler 维护 _reserved_blocks 计数器",
+          "pseudocode": [
+            "def schedule(num_free):",
+            "  reserved = 0; batch = []",
+            "  for seq in waiting:",
+            "    req = ceil(len(seq.input_ids) / self._block_size)",
+            "    if reserved + req <= num_free and _check_max_tokens(batch, seq):",
+            "      batch.append(seq); reserved += req",
+            "  return (batch, True) if batch else _select_decode(num_free - reserved)"
+          ],
+          "_b1_note": "_reserved_blocks 当前实现仅适用于 B=1 单序列 (postprocess 中直接重置为 0)。B>1 扩展时需改为 per-sequence 计数器或从 runner 实时查询。"
+        }
+      }
+    },
+    "todo_generation_playbook": {
+      "_note": "纯 Eager 模式 nocompile B=1 TP=4。Phase 顺序由物理依赖拓扑决定，不可重排。Phase 8 可与 Phase 1-7 并行开发。",
+      "_dependency_topology": "Layer0(环境)→L1(数值基元)→L2(TP通信)→L3(TP线性)→L4(Embedding)→L5(Attention)→L6(Decoder+MLP)→L7(权重加载)→L8(框架外壳,并行)→L9(引擎集成)→L10(验收)→L11(性能优化)",
+      "phase_order": [
+        "phase_1_numeric_primitives",
+        "phase_2_tp_communication",
+        "phase_3_tp_linear",
+        "phase_4_tp_embedding",
+        "phase_5_attention_kv_cache",
+        "phase_6_mlp_decoder_layer",
+        "phase_7_weight_loading",
+        "phase_8_framework_shell",
+        "phase_9_engine_integration",
+        "phase_10_e2e_acceptance",
+        "phase_11_performance"
+      ],
+      "phase_1_numeric_primitives": {
+        "_depends_on": "无（仅需 GPU + meta conda 环境）",
+        "_provides": "所有上层组件的数值计算基础",
+        "implementation_todos": [
+          "实现 rms_norm wrapper（vLLM _custom_ops.rms_norm）：out 预分配，input contiguous",
+          "实现 fused_add_rms_norm wrapper（vLLM _custom_ops.fused_add_rms_norm）：双 in-place",
+          "实现 rotary_embedding wrapper（vLLM _custom_ops.rotary_embedding）：2D 输入 [tokens,heads,dim]，is_neox 参数",
+          "实现 silu_and_mul wrapper（torch.ops._C.silu_and_mul）：out 预分配，import vllm._C 触发注册",
+          "实现 _get_cos_sin_cache(max_pos, head_dim, rope_theta)：模块级 registry + lazy GPU transfer",
+          "flash_attn_varlen_func 直接 from flash_attn.flash_attn_interface import（nocompile 无需 custom_op）",
+          "flash_attn_with_kvcache 直接 from flash_attn.flash_attn_interface import（nocompile 无需 custom_op）"
+        ],
+        "minimal_test_commands": [
+          "python -m pytest tests/test_kernel_wrappers.py -v -s"
+        ],
+        "eager_gate": {
+          "cpu_dispatch": "每个 kernel wrapper 不含 .to() / 不必要 Python 循环",
+          "numeric_accuracy": "每个 kernel vs PyTorch 参考实现 max diff < 1e-5 (bf16)",
+          "rope_style": "Neox (前后分半) 和 GPT-J (奇偶交错) 均正确",
+          "cos_sin_shape": "cache shape [max_pos, head_size] 非 [2*head_size]"
+        },
+        "failure_fallback_strategy": [
+          "silu_and_mul 报错 → import vllm._C 是否在调用前执行",
+          "rotary_embedding 数值不对 → 检查 is_neox 值（Qwen3=True, DeepSeek=False）",
+          "rms_norm contiguous 报错 → 输入是否 .contiguous()"
+        ],
+        "done_criteria": [
+          "7 个 kernel wrapper 单测全部通过（随机 Tensor 输入，shape/dtype 验证）。",
+          "与 PyTorch 参考实现数值对齐（bf16 tolerance）。"
+        ],
+        "test_interface_contracts": {
+          "scripts": [
+            {
+              "file": "scripts/test_phase1_kernel_wrappers.py",
+              "format": "pytest / python direct",
+              "guards_against": "7 个 vLLM kernel wrapper 签名/dtype/import 路径错误",
+              "past_error_triggered_by": "kernel_replacement_plan.md §九 (Stage 1-7 kernel replacement)，V17 FG-2 Dense KV 预算"
+            },
+            {
+              "file": "scripts/test_phase1_kernel_wrappers.sh",
+              "format": "bash",
+              "guards_against": "conda环境缺少vllm/flash_attn依赖→kernel import失败",
+              "past_error_triggered_by": "physical_trace_tp4_rank0.json [env] flash_attn+vllm availability"
+            }
+          ],
+          "review_gate": "脚本通过 code-review 子代理 10 条门禁审查 + 对抗压力测试（故意写错签名确认脚本捕获）"
+        }
+      },
+      "phase_2_tp_communication": {
+        "_depends_on": "phase_1 + torchrun 环境（RANK/WORLD_SIZE/LOCAL_RANK）",
+        "_provides": "所有 TP 层的通信结构",
+        "implementation_todos": [
+          "实现 init_tp_distributed()：torch.cuda.set_device(LOCAL_RANK) + dist.init_process_group('nccl','env://') + dist.barrier()。⚠️ 必须内置 WORLD_SIZE <= 1 guard——单进程场景（WORLD_SIZE=1 或未设置）直接 return，严禁调用 dist.init_process_group（会永久 hang 等待不存在的 NCCL master）。LLMEngine 调用侧也必须加 _world_size > 1 条件才进入 init_tp_distributed()",
+          "实现 init_custom_ar(device)：gloo ProcessGroup + IPC exchange (allocate_shared_buffer_and_handle + all_gather_object) + ops.init_custom_ar + ops.register_buffer。world_size==1 直接 return",
+          "实现 all_reduce_sum(x)：@torch.library.custom_op 注册 + CustomAR P2P → NCCL fallback + register_fake。⚠️ CustomAR P2P 路径的 reg_buf 必须使用 buf_ptrs[dist.get_rank()]（当前 rank 的 staging buffer 地址），严禁 buf_ptrs[0]——rank 0 恰好正确仅因巧合，rank 1/2/3 用 buf_ptrs[0] 会触发 'buffer address not registered' RuntimeError",
+          "实现 all_gather_last_dim(x)：dist.all_gather(outs, x) + torch.cat(outs, dim=-1)"
+        ],
+        "minimal_test_commands": [
+          "torchrun --nproc_per_node=2 -m pytest tests/test_tp_communication.py -v -s",
+          "torchrun --nproc_per_node=4 -m pytest tests/test_tp_communication.py -v -s"
+        ],
+        "eager_gate": {
+          "all_reduce_correctness": "tp_size=2/4 下 all_reduce_sum 输出 = 各 rank 输入之和",
+          "all_gather_correctness": "all_gather_last_dim 输出 last dim = 输入 * tp_size",
+          "custom_ar_init": "CustomAR 初始化不报错，dist.barrier() 不超时",
+          "no_redundant_copy": "all_reduce_sum TP=1 路径 x.clone() 接受（custom_op 禁止输出别名输入），TP>1 路径不含多余 aten::copy_"
+        },
+        "failure_fallback_strategy": [
+          "all_gather_object 报错 → 必须使用 gloo backend（gloo_group = dist.new_group(backend='gloo')）",
+          "CustomAR init 失败 → 检查 torch.cuda.can_device_access_peer（所有 rank 对可见）",
+          "dist.all_reduce 超时 → 检查 NCCL 初始化顺序：set_device → init_process_group → barrier",
+          "单 GPU 非 torchrun 启动 hang（Phase 9 发现）→ init_tp_distributed 缺少 WORLD_SIZE <= 1 guard。LLMEngine.__init__ 侧也要加 _world_size > 1 条件才进入。前序 Phase 2 测试全部通过 torchrun 启动，单进程路径未被覆盖",
+          "'buffer address not registered' (rank≠0, Phase 9 发现) → all_reduce_sum 中 reg_buf 错误地用了 buf_ptrs[0] 而非 buf_ptrs[dist.get_rank()]。rank 0 正常仅因 buf_ptrs[0]==buf_ptrs[rank] 的巧合。注册了哪个 buffer 就必须传哪个 buffer 的地址"
+        ],
+        "done_criteria": [
+          "2 卡和 4 卡通信单测全部通过。",
+          "CustomAR P2P 初始化成功（tp_size>1）。",
+          "NCCL fallback 正常（无 CustomAR 时自动切换）。"
+        ],
+        "test_interface_contracts": {
+          "scripts": [
+            {
+              "file": "scripts/test_phase2_custom_ar_init.sh",
+              "format": "bash (torchrun --nproc_per_node=4)",
+              "guards_against": "CustomAR 初始化失败（gloo group 缺失、IPC handle exchange 顺序错误），导致 all_reduce 回退到慢速 NCCL",
+              "past_error_triggered_by": "2026-05-13 Stage 5 TP 通信优化，V17 OW-5 IPC exchange 方法混淆"
+            },
+            {
+              "file": "scripts/test_phase2_tp_communication.py",
+              "format": "pytest",
+              "guards_against": "all_reduce_sum TP=1 clone+custom_op注册+all_gather dim",
+              "past_error_triggered_by": "V17 OW-5 CustomAR IPC exchange+physical_trace_tp4_rank0.json"
+            }
+          ],
+          "review_gate": "脚本通过 code-review 子代理 10 条门禁审查，含 CUSTOMAR-INIT-001/002 错误码"
+        },
+        "_phase9_regression_notes": [
+          {
+            "bug": "Bug 2: init_tp_distributed 无 WORLD_SIZE guard",
+            "discovered": "Phase 9 单 GPU generate() 测试时进程永久 hang",
+            "root_cause": "dist.init_process_group('nccl','env://') 在 WORLD_SIZE=1 时等待不存在的 NCCL master。前序 Phase 2 测试全部通过 torchrun --nproc_per_node=4 启动，单进程路径从未被测试",
+            "fix": "init_tp_distributed() 内置 WORLD_SIZE <= 1 → return。LLMEngine.__init__ 加 _world_size > 1 guard",
+            "symptom": "python -c 'from llm_engine import LLMEngine; LLMEngine(...)' → 永久 hang",
+            "verified_by": "scripts/test_phase9_generate_single_gpu.sh"
+          },
+          {
+            "bug": "Bug 7: CustomAR buf_ptrs[0] 而非 buf_ptrs[rank]",
+            "discovered": "Phase 9 TP=4 generate() 时 rank 1/2/3 全部崩溃",
+            "root_cause": "all_reduce_sum 中 reg_buf = buf_ptrs[0]（始终用 rank 0 的 buffer 地址）。registered=False 时 P2P kernel 先将输入拷贝到本 rank 的 staging buffer，rank 3 传了 rank 0 的地址与 register_buffer 时注册的 buf_ptrs[3] 不匹配。Phase 2 测试只验证了 CustomAR init + NCCL fallback，未测 CustomAR P2P 实际调用路径",
+            "fix": "reg_buf = buf_ptrs[dist.get_rank()]（与真实引擎 meta-infer/engine/tp_layers/custom_ar.py:76 一致）",
+            "symptom": "RuntimeError: buffer address 140245722988544 is not registered! (rank 1/2/3 同时崩溃，rank 0 巧合正常)",
+            "verified_by": "scripts/test_phase9_generate_single_gpu.sh (TP=4 torchrun)"
+          }
+        ]
+      },
+      "phase_3_tp_linear": {
+        "_depends_on": "phase_2（all_reduce_sum, all_gather_last_dim ready）",
+        "_provides": "模型组件的基础砖块",
+        "implementation_todos": [
+          "实现 ColumnParallelLinear：[out/tp, in] weight，forward=F.linear，可选 all_gather_last_dim",
+          "实现 RowParallelLinear：[out, in/tp] weight，forward=F.linear + all_reduce_sum",
+          "实现 MergedColumnParallelLinear：gate+up 合并 [2*inter/tp, in]，无 gather",
+          "实现 QKVColumnParallelLinear：QKV 合并 [q_size+2*kv_size, in]，输出 .split([q_sz,kv_sz,kv_sz])",
+          "实现 load_weight_shard：double shard guard（传入 shape==self.weight.shape → 直接 copy_；否则按 tp_rank 切片）"
+        ],
+        "minimal_test_commands": [
+          "python -m pytest tests/test_tp_linear.py -v -s",
+          "torchrun --nproc_per_node=4 -m pytest tests/test_tp_linear_tp4.py -v -s"
+        ],
+        "eager_gate": {
+          "single_gemm_qkv": "QKVColumnParallelLinear 只用一次 F.linear（非 q_proj+k_proj+v_proj 三次）",
+          "single_gemm_gate_up": "MergedColumnParallelLinear 只用一次 F.linear（非 gate_proj+up_proj 两次）",
+          "single_all_reduce": "RowParallelLinear.forward 中 all_reduce_sum 调用 = 1 次",
+          "cpu_dispatch": "单次 linear forward < 0.5ms (不含通信)"
+        },
+        "failure_fallback_strategy": [
+          "TP=1 vs TP=4 输出不一致 → 检查 ColumnParallel split_dim / RowParallel all_reduce",
+          "权重加载 shape mismatch → 检查 double shard guard 是否生效",
+          "QKV split 后维度不对 → 确认 q_size/kv_size 公式（q_size=num_heads*head_dim, kv_size=num_kv_heads*head_dim）"
+        ],
+        "done_criteria": [
+          "4 种 Linear 单测通过（单卡数学正确性 + 4 卡 TP 一致性）。",
+          "double shard guard：传入预切片权重和全量权重均正确加载。"
+        ],
+        "test_interface_contracts": {
+          "scripts": [
+            {
+              "file": "scripts/test_phase3_tp_linear.py",
+              "format": "pytest / python direct",
+              "guards_against": "4 种 TP Linear shape 计算错误（Column/Row/Merged/QKV）和 double_shard_guard 二次切片风险。gate_up_total=6144 非 6400，inter_per_rank=3072 非 3200",
+              "past_error_triggered_by": "V17 FG-1 intermediate_size 12800→12288 纠正（2026-05-27 物理 config.json 验证）"
+            },
+            {
+              "file": "scripts/test_phase3_tp_linear_tp4.py",
+              "format": "pytest",
+              "guards_against": "ColumnParallel all_gather维度+RowParallel all_reduce+QKV/GateUp切分",
+              "past_error_triggered_by": "V17 FG-1 intermediate_size=12288+physical_trace_tp4_rank0.json"
+            }
+          ],
+          "review_gate": "脚本通过 code-review 子代理 10 条门禁审查，含 LINEAR-001~006 错误码"
+        }
+      },
+      "phase_4_tp_embedding": {
+        "_depends_on": "phase_2（all_reduce_sum, all_gather_last_dim）",
+        "_provides": "词表并行 Embedding 和 LM Head",
+        "implementation_todos": [
+          "实现 VocabParallelEmbedding：vocab_start/tp 范围 mask → masked_fill(~mask,0) → all_reduce_sum",
+          "实现 ParallelLMHead：F.linear(hidden, weight) → local logits → all_gather_last_dim → full vocab"
+        ],
+        "minimal_test_commands": [
+          "python -m pytest tests/test_tp_embedding.py -v -s",
+          "torchrun --nproc_per_node=4 -m pytest tests/test_tp_embedding_tp4.py -v -s"
+        ],
+        "eager_gate": {
+          "mask_correctness": "VocabParallelEmbedding mask 外位置必须为零（masked_fill 正确）",
+          "tp_consistency": "tp=4 embedding 输出 = tp=1 全量 embedding 输出（bf16 tolerance）",
+          "cpu_dispatch": "单次 embedding lookup + all_reduce < 2ms（含通信）"
+        },
+        "failure_fallback_strategy": [
+          "embedding 输出全零 → 检查 vocab_start/vocab_end 范围计算",
+          "size mismatch (0) → double shard guard：embedding weight 是否被二次切片"
+        ],
+        "done_criteria": [
+          "VocabParallelEmbedding 和 ParallelLMHead 单测通过。",
+          "TP=4 输出与 TP=1 参考一致。"
+        ],
+        "test_interface_contracts": {
+          "scripts": [
+            {
+              "file": "scripts/test_phase4_tp_embedding.py",
+              "format": "pytest",
+              "guards_against": "VocabParallelEmbedding mask范围+ParallelLMHead gather维度",
+              "past_error_triggered_by": "V17 OW-6 Sequence block_table dual-track"
+            },
+            {
+              "file": "scripts/test_phase4_tp_embedding_tp4.py",
+              "format": "pytest",
+              "guards_against": "TP=4 embedding各rank mask不重叠+all_reduce一致性",
+              "past_error_triggered_by": "physical_trace_tp4_rank0.json [config] vocab_size=151936"
+            }
+          ],
+          "review_gate": "所有脚本通过 code-review 子代理 11 条门禁审查"
+        }
+      },
+      "phase_5_attention_kv_cache": {
+        "_depends_on": "phase_1（kernel wrappers）+ phase_3（QKVColumnParallelLinear, RowParallelLinear）",
+        "_provides": "Attention 模块 + paged KV cache 管理",
+        "implementation_todos": [
+          "实现 QwenAttentionTP.__init__：KV head replication（tp>num_kv_heads→num_kv_heads=1,kv_head_replica=tp//num_kv_heads）、_kv_block_size=256、_key_cache=None (lazy init)、register_buffer(_kv_len_gpu、_slot_mapping_decode)、_cos_sin_cache lazy GPU transfer",
+          "实现 QwenAttentionTP.forward(prefill)：qkv_proj→Q/K norm→rotary→flash_attn_varlen_func(causal=True)→KV cache lazy alloc (torch.zeros(num_blocks_needed,256,kv_heads,dim) 其中 num_blocks_needed=(num_tokens+255)//256，**严禁 torch.zeros(max_blocks,...) 全量预分配**，否则 160 blocks × 36 layers = 额外 ~700MB 显存浪费)→block_table torch.arange→slot_mapping→index_copy_ 写入 cache",
+          "实现 QwenAttentionTP.forward_decode(decode)：qkv_proj→Q/K norm→rotary→slot_mapping=_kv_len_gpu[0]→index_copy_→_kv_len_gpu+=1→flash_attn_with_kvcache(causal=False)→o_proj。⚠️ flash_attn_with_kvcache 调用必须使用 keyword args（cache_seqlens=, block_table=, softmax_scale=, causal=），严禁 positional args——不同 flash_attn 版本（如 2.8.3）参数顺序可能不同，positional 会导致参数错位（与真实引擎 custom_ops.py 对齐）",
+          "KV reshape 链：K/V reshape [num_tokens,kv_heads,head_dim] contiguous；KV cache view flat [-1,heads,dim]；index_copy_ dim=0",
+          "QKV reshape 约束：Q 用 num_heads=8 (per-rank), K/V 用 num_kv_heads_local=2 (per-rank)。勿用 num_heads reshape K/V",
+          "⚠️ RMSNorm.forward(x, residual=None) 必须统一返回 2-tuple：(out, residual)。residual is None 时返回 (out, None)；residual is not None 时返回 (x, residual)。严禁两个分支返回类型不一致——调用方（QwenForCausalLMTP.forward 的 hidden_states,_ = self.norm(...)、QwenAttentionTP 的 q_flat,_ = self.q_norm(...)）全部使用 2-tuple unpacking。Phase 6 QwenDecoderLayerTP 使用裸 kernel 函数绕过此问题，但 QwenForCausalLMTP 直接调用 RMSNorm.forward"
+        ],
+        "minimal_test_commands": [
+          "python -m pytest tests/test_attention_tp.py -v -s"
+        ],
+        "eager_gate": {
+          "prefill_kv_source": "flash_attn_varlen_func K/V 来自投影产出（非 cache 读取）",
+          "kv_cache_view": "index_copy_ 前 cache view 为 [-1, heads, dim] flat",
+          "no_item_in_attention": "forward/prefill/decode 内部不含 .item() 调用",
+          "slot_mapping_algo": "block_table[0, i//256] * 256 + (i%256)",
+          "cpu_dispatch": "单层 prefill attention < 5ms（含 flash_attn + KV write）",
+          "rmsnorm_return_type": "RMSNorm.forward 两个分支均返回 2-tuple。QwenForCausalLMTP 和 QwenAttentionTP 中所有 7 处 self.norm/q_norm/k_norm 调用均使用 tuple unpacking"
+        },
+        "failure_fallback_strategy": [
+          "flash_attn_with_kvcache 报错 → 检查 block_size >= 256，block_table dtype=int32。若报参数类型错误或 kernel 内部 crash → 检查是否使用了 positional args（必须全部 keyword，与 flash_attn 2.8.3+ 兼容）",
+          "index_copy_ shape mismatch → 检查 k_flat reshape 和 kc_flat view 的 heads dim 一致",
+          "KV cache 全零 → prefill 后是否执行了 index_copy_ 写入",
+          "ValueError: not enough values to unpack (Phase 9 发现) → RMSNorm.forward 某分支返回了单 Tensor 非 2-tuple。QwenDecoderLayerTP 用裸 kernel 绕过此问题，但 QwenForCausalLMTP.forward 直接调 self.norm()。检查 residual is None 分支是否返回 (out, None)"
+        ],
+        "done_criteria": [
+          "单卡随机权重 prefill/decode 通过（shape 校验 + NaN/Inf 检查）。",
+          "KV cache 写入后读取一致。"
+        ],
+        "test_interface_contracts": {
+          "scripts": [
+            {
+              "file": "scripts/test_phase5_attention_init.py",
+              "format": "pytest",
+              "guards_against": "KV head replication+per-rank维度+kv_block_size=256",
+              "past_error_triggered_by": "V17 FG-1 max_position_embeddings=40960"
+            },
+            {
+              "file": "scripts/test_phase5_kv_cache_paged.py",
+              "format": "pytest",
+              "guards_against": "block_size≠256+slot_mapping contiguous range+block_table非int32",
+              "past_error_triggered_by": "V5 audit KV cache paged format"
+            },
+            {
+              "file": "scripts/test_phase5_flash_attn_prefill_decode.py",
+              "format": "pytest",
+              "guards_against": "causal方向错+KV source顺序错+scale公式错",
+              "past_error_triggered_by": "P3-FA Flash Attention 集成阶段"
+            }
+          ],
+          "review_gate": "所有脚本通过 code-review 子代理 11 条门禁审查"
+        },
+        "_phase9_regression_notes": [
+          {
+            "bug": "Bug 4: RMSNorm 条件返回类型不统一",
+            "discovered": "Phase 9 QwenForCausalLMTP.forward 首次调用 self.norm() → tuple unpack ValueError",
+            "root_cause": "RMSNorm.forward 的 residual is None 分支返回单 Tensor (out)，residual is not None 分支也返回单 Tensor (x)。蓝图契约要求统一返回 2-tuple。QwenDecoderLayerTP 使用裸 kernel 函数 rms_norm()/fused_add_rms_norm() 不经过 RMSNorm.forward，所以 Phase 5/6 测试全都 PASS。只有 QwenForCausalLMTP 和 QwenAttentionTP 直接调 self.norm/q_norm/k_norm，这些调用链 Phase 9 才首次激活",
+            "fix": "residual is None → return out, None；residual is not None → return x, residual。QwenAttentionTP 中 4 处 q_norm/k_norm 调用改用 tuple unpacking",
+            "symptom": "ValueError: not enough values to unpack (expected 2, got 1) at hidden_states, _ = self.norm(...)",
+            "affected_callsites": 7,
+            "verified_by": "scripts/test_phase9_generate_single_gpu.sh"
+          },
+          {
+            "bug": "Bug 5: flash_attn 2.8.3 API 签名 positional arg 错位",
+            "discovered": "Phase 9 环境 flash_attn >= 2.8.3，flash_attn_with_kvcache 参数顺序与 Phase 5 实现时不同",
+            "root_cause": "修复前使用 positional args：flash_attn_with_kvcache(q, kc, vc, kv_len, block_table, scale, causal=False)。flash_attn 2.8.3 签名在中间增加了 softmax_scale 等参数，positional 导致参数错位",
+            "fix": "全部改用 keyword args：cache_seqlens=..., block_table=..., softmax_scale=..., causal=...。与 meta-infer/engine/kernels/custom_ops.py 一致",
+            "symptom": "CUDA kernel 参数 mismatch 或静默数值错误",
+            "verified_by": "scripts/test_phase9_generate_single_gpu.sh"
+          }
+        ]
+      },
+      "phase_6_mlp_decoder_layer": {
+        "_depends_on": "phase_5（attention ready）+ phase_1（silu_and_mul, fused_add_rms_norm）",
+        "_provides": "完整的 Decoder Layer（Attention + MLP + residual chain）",
+        "implementation_todos": [
+          "实现 QwenMLPTP：gate_up_proj(MergedColumnParallelLinear)→silu_and_mul→down_proj(RowParallelLinear)",
+          "实现 QwenDecoderLayerTP.forward(prefill)：rms_norm(input)→attention.forward→fused_add_rms_norm(post_attn,self.post_attention_layernorm.weight)→mlp→return(hs,residual)",
+          "实现 QwenDecoderLayerTP.forward_decode(decode)：fused_add_rms_norm(input,self.input_layernorm.weight)→attention.forward_decode→fused_add_rms_norm(post_attn,self.post_attention_layernorm.weight)→mlp→return(hs,residual)",
+          "Residual chain：首层 res=None→clone+rms_norm；后续层 fused_add_rms_norm（res+=hs; hs=rms_norm(res)）",
+          "关键约束：所有4处 fused_add_rms_norm 的 weight 均为本层 self.xxx.weight（非跨层）"
+        ],
+        "minimal_test_commands": [
+          "python -m pytest tests/test_decoder_layer.py -v -s"
+        ],
+        "eager_gate": {
+          "residual_correctness": "输入 hs+prev_res 经过 decode layer 后 residual 含正确累积",
+          "fused_norm_weight_check": "静态 grep 确认 weight 参数均为 self.input_layernorm.weight 或 self.post_attention_layernorm.weight（无跨层引用）",
+          "cpu_dispatch": "单层 decode < 3ms（含 attention + mlp + 2×fused_add_rms_norm）",
+          "no_clone_in_eager": "forward_decode 不含 clone()"
+        },
+        "failure_fallback_strategy": [
+          "residual NaN → 首层 res=None 分支是否 clone+rms_norm（非 fused_add_rms_norm）",
+          "fused_add_rms_norm weight 参数错误 → 对照 AGENT_SKILL.md §G.6",
+          "mlp 输出 shape 不对 → gate_up_proj 输出 = [B,T,2*inter/tp], silu_and_mul 后 = [B,T,inter/tp]"
+        ],
+        "done_criteria": [
+          "单卡随机权重 QwenDecoderLayerTP prefill/decode 通过。",
+          "Residual chain 数值正确（累加不丢）。",
+          "4 处 fused_add_rms_norm weight 均为本层 weight。"
+        ],
+        "test_interface_contracts": {
+          "scripts": [
+            {
+              "file": "scripts/test_phase6_residual_chain.py",
+              "format": "pytest / python direct",
+              "guards_against": "fused_add_rms_norm weight 参数被错误引用为跨层 weight（如 post_mlp 用下一层 input_layernorm.weight）。用 id() identity check 精确捕获跨层引用",
+              "past_error_triggered_by": "V5/V15/V17 三轮审计 FM-003（kernel_replacement_plan.md §9.2 跨层 weight 文档错误），2026-05-27 物理 tracing 确认全部 4 处为本层 weight"
+            },
+            {
+              "file": "scripts/test_phase6_mlp_forward.py",
+              "format": "pytest",
+              "guards_against": "gate_up_proj→silu_and_mul→down_proj shape链(6144非6400!)",
+              "past_error_triggered_by": "V17 FG-1 intermediate_size=12288+physical_trace model_weights"
+            },
+            {
+              "file": "scripts/test_phase6_decode_forward_no_clone.py",
+              "format": "pytest",
+              "guards_against": "Eager路径forward_decode残留clone()→~15%吞吐回退",
+              "past_error_triggered_by": "Stage C clone regression fix"
+            },
+            {
+              "file": "scripts/test_phase6_layer_e2e_random_weights.py",
+              "format": "pytest",
+              "guards_against": "prefill/decode双路径shape传播+residual链断裂+NaN/Inf",
+              "past_error_triggered_by": "V17 FG-1+physical_trace_tp4_rank0.json layer0 dimensions"
+            }
+          ],
+          "review_gate": "脚本通过 code-review 子代理 3 轮审查（S4/G8 逐项修复）+ 对抗压力测试（故意跨层引用 → RED，恢复 → GREEN）"
+        }
+      },
+      "phase_7_weight_loading": {
+        "_depends_on": "phase_6（所有模型组件 ready）",
+        "_provides": "完整 Qwen3-8B 模型（含权重）",
+        "implementation_todos": [
+          "实现 QwenTPConfig dataclass：从 config.json 提取所有维度字段（动态读取，严禁硬编码）。head_dim fallback: hidden_size // num_attention_heads",
+          "实现 _load_qwen_tp_config(model_dir)：AutoConfig.from_pretrained → QwenTPConfig(...)",
+          "实现 QwenForCausalLMTP.__init__：embed_tokens(VocabParallelEmbedding)→layers[QwenDecoderLayerTP]*36→norm(RMSNorm)→lm_head(ParallelLMHead)。正确 attr 名：.self_attn, .mlp, .input_layernorm, .post_attention_layernorm。⚠️ 必须始终执行 self.to(device=device, dtype=bf16)——即使 device=None 也要 to(dtype=bf16)。默认 PyTorch float32 下 8B 参数 = ~32GB 显存（单卡 OOM）。调用方 LLMEngine 必须显式传 device 和 dtype=torch.bfloat16",
+          "实现 HF key mapping：QKV merge torch.cat([q_slice,k_slice,v_slice],dim=0) Q-K-V 顺序。Gate-Up merge torch.cat([gate_slice,up_slice],dim=0)。⚠️ Qwen3 特有的 self_attn.q_norm.weight 和 self_attn.k_norm.weight 两条映射必须包含在 _dispatch_weight 中——缺失不会报错（权重保持 torch.ones 初始值），但 generate() 输出全错（垃圾 token），是最隐蔽的 bug",
+          "实现 load_weights()：读 model.safetensors.index.json→safe_open→_load_one_weight(hf_key,full)→double shard guard。load_weights 后 dist.barrier()+init_custom_ar(device)"
+        ],
+        "minimal_test_commands": [
+          "python -m pytest tests/test_weight_loading.py -v -s",
+          "torchrun --nproc_per_node=4 -m pytest tests/test_weight_loading_tp4.py -v -s"
+        ],
+        "eager_gate": {
+          "per_rank_memory": "每 rank 显存 < 全量模型 / N（不能每卡加载全量权重）",
+          "weight_map_parsed": "model.safetensors.index.json weight_map 正确解析",
+          "qkv_order": "torch.cat Q-K-V 顺序（非 K-Q-V 或 V-K-Q）",
+          "no_shape_mismatch": "safetensors 加载无 shape mismatch 错误",
+          "custom_ar_after_load": "load_weights 后 dist.barrier() + init_custom_ar() 正常执行"
+        },
+        "failure_fallback_strategy": [
+          "QKV shape mismatch → 检查 cat 顺序 Q-K-V 和 tp_rank slice 范围",
+          "gate_up shape mismatch → 检查 cat 顺序 gate-up",
+          "Embedding size mismatch (0) → double shard guard: _load_tensor 是否二次切片",
+          "CustomAR block → dist.barrier() 是否在 load_weights 后、init_custom_ar 前",
+          "rank0 显存 > 30GB（Phase 9 发现）→ QwenForCausalLMTP 未应用 bf16。检查 __init__ 中 device=None 分支是否跳过了 self.to(dtype=bf16)。调用方 LLMEngine 是否显式传了 dtype 参数",
+          "generate() 输出乱码/垃圾 token 但 forward 不报错（Phase 9 发现）→ 检查 _dispatch_weight 是否遗漏了 self_attn.q_norm.weight 和 self_attn.k_norm.weight。这两条缺失导致 Q/K norm 保持 torch.ones 初始值，logits 全错但不 crash"
+        ],
+        "done_criteria": [
+          "Qwen3-8B 权重成功加载到 4 卡，每卡显存约 4.7 GB（bf16 权重 15.7GB/tp=4 ≈ 3.9GB + runtime buffers ~0.8GB）。KV cache 必须 lazy alloc——prefill 时按需分配 num_blocks_needed（非 max_blocks 全量），否则显存膨胀至 7+ GB。",
+          "无 safetensors 加载错误。",
+          "CustomAR 初始化成功。"
+        ],
+        "test_interface_contracts": {
+          "scripts": [
+            {
+              "file": "scripts/test_phase7_hf_key_mapping.py",
+              "format": "pytest",
+              "guards_against": "QKV cat顺序(Q-K-V非K-Q-V)+Gate-Up顺序+double_shard_guard+q_norm/k_norm dispatch缺失（Qwen3特有，缺失不报错但E2E generate输出全错）",
+              "past_error_triggered_by": "V5/V15 HF key mapping错误模式 + Phase 9 Bug 6 (generate垃圾输出)"
+            },
+            {
+              "file": "scripts/test_phase7_qwen_tp_config.py",
+              "format": "pytest",
+              "guards_against": "config.json硬编码维度+head_dim fallback缺失+per-rank全量值",
+              "past_error_triggered_by": "V17 FG-1 max_position_embeddings=40960 intermediate=12288"
+            },
+            {
+              "file": "scripts/test_phase7_weight_loading.sh",
+              "format": "bash",
+              "guards_against": "per-rank加载全量模型(应~4.7GB非~15.7GB)",
+              "past_error_triggered_by": "physical_trace_tp4_rank0.json [cuda_memory] allocated_gb=4.69"
+            }
+          ],
+          "review_gate": "所有脚本通过 code-review 子代理 11 条门禁审查"
+        },
+        "_phase9_regression_notes": [
+          {
+            "bug": "Bug 1: float32 全量模型显存爆炸 (31661 MB)",
+            "discovered": "Phase 9 首次完整加载 Qwen3-8B 真实模型权重并执行 generate()",
+            "root_cause": "QwenForCausalLMTP.__init__ 有 dtype=torch.bfloat16 默认参数，但 if device is not None: self.to(device, dtype) 分支在 device=None 时不执行 to(dtype=bf16)，模型保持 PyTorch 默认 float32。8B×4 bytes=32GB。Phase 7 测试用随机权重/小尺寸，不分配 8B 参数",
+            "fix": "始终执行 self.to(dtype=bf16)。LLMEngine 调用侧显式传 device=device, dtype=torch.bfloat16",
+            "symptom": "rank0 显存分配 31661 MB，远超单卡 80GB 容量（bf16 下仅需 ~8GB）",
+            "verified_by": "scripts/test_phase9_generate_single_gpu.sh"
+          },
+          {
+            "bug": "Bug 6: q_norm/k_norm 权重未加载 → generate() 输出垃圾",
+            "discovered": "Phase 9 首次 E2E generate() 时发现输出乱码但 forward 不报错",
+            "root_cause": "_dispatch_weight 处理了 12 个标准 HF key 映射，但遗漏了 Qwen3 特有的 self_attn.q_norm.weight 和 self_attn.k_norm.weight。q_norm/k_norm 保持 torch.ones 初始值，Q/K 被错误 norm 权重污染 → logits 全错。Phase 7 spec-review 的 key mapping 表格只有 12 条不包含这 2 条，Phase 7 测试只验证了显存未做 E2E generate()",
+            "fix": "_dispatch_weight 新增 2 行：elif component == 'self_attn.q_norm.weight': ... elif component == 'self_attn.k_norm.weight': ...",
+            "symptom": "engine.generate('苏州园林的特点是', temperature=0.0) 输出乱码而非正确中文。模型正常加载、显存正常、forward 不报错——最隐蔽的 bug",
+            "verified_by": "scripts/test_phase9_generate_single_gpu.sh (greedy align)"
+          }
+        ]
+      },
+      "phase_8_framework_shell": {
+        "_depends_on": "无（与 phase_1-7 完全独立，可并行开发）",
+        "_provides": "调度、采样、序列管理 —— 引擎运行所需的框架外壳",
+        "implementation_todos": [
+          "实现 Sequence：input_ids/output_ids/block_table(list+Tensor 双轨)/status(WAITING→RUNNING_PREFILL→RUNNING_DECODE→FINISHED/REJECTED)。⚠️ input_ids_tensor(device) 必须接受 device 参数并在 torch.tensor(..., device=device) 中使用——device=None 时 tensor 在 CPU，与 GPU forward 串联时会触发 RuntimeError: tensors on different devices。调用方 QwenTPModelRunner.run() 必须显式传 device=self.device，Sequence 构造时也需接受 device 参数",
+          "实现 Sampler：temperature=0.0 greedy / top_p sampling。TP 协议：rank 0 采样 + dist.broadcast",
+          "实现 BlockManager（TP 路径降级）：allocate/free 为 no-op，get_num_free_blocks()=len(free_pool)",
+          "实现 Scheduler：schedule(num_free) 先prefill后decode + overlength rejection(REJECTED) + token budget + _reserved_blocks 计数器。postprocess(batch,is_prefill,tokens)：output_ids追加+EOS/max_tokens+FINISHED+资源释放"
+        ],
+        "minimal_test_commands": [
+          "python -m pytest tests/test_sequence.py -v -s",
+          "python -m pytest tests/test_scheduler.py -v -s",
+          "python -m pytest tests/test_sampler.py -v -s"
+        ],
+        "eager_gate": {
+          "no_preempt": "Scheduler.schedule() 不含 preempt() 逻辑",
+          "block_size_injectable": "Scheduler._block_size 可由 LLMEngine 注入 (TP→256, HF→16)",
+          "tp_sampling": "tp_size>1 时仅 rank 0 调用 sample()，其余 rank 等待 broadcast",
+          "explicit_transitions": "所有状态转移为显式 seq.status = Status.XXX"
+        },
+        "failure_fallback_strategy": [
+          "Scheduler 死循环 → 检查空批次返回 ([], False) 和 all_finished 退出条件",
+          "Sampler TP 不一致 → 检查 broadcast src=0 和 device",
+          "REJECTED 不生效 → 检查 _max_blocks 是否被 LLMEngine 正确注入",
+          "RuntimeError: tensors on different devices (cpu vs cuda, Phase 9 发现) → input_ids_tensor 返回了 CPU tensor。Sequence 构造和 input_ids_tensor() 必须接受 device 参数，QwenTPModelRunner.run() 必须传 device=self.device"
+        ],
+        "done_criteria": [
+          "Sequence/Scheduler/Sampler 单测全部通过。",
+          "Scheduler 不出现死循环或空批次异常。"
+        ],
+        "test_interface_contracts": {
+          "scripts": [
+            {
+              "file": "scripts/test_phase8_sequence_scheduler.py",
+              "format": "pytest",
+              "guards_against": "preempt()未删+block_size硬编码16+REJECTED缺失",
+              "past_error_triggered_by": "V4/V17 Scheduler-LLMEngine bridge审计"
+            },
+            {
+              "file": "scripts/test_phase8_sampler_tp.py",
+              "format": "pytest",
+              "guards_against": "TP各rank独立采样→KV不同步→NCCL崩溃",
+              "past_error_triggered_by": "V4 audit §G.8 TP采样协议"
+            }
+          ],
+          "review_gate": "所有脚本通过 code-review 子代理 11 条门禁审查"
+        },
+        "_phase9_regression_notes": [
+          {
+            "bug": "Bug 3: input_ids_tensor 无 device 参数 → CPU/CUDA RuntimeError",
+            "discovered": "Phase 9 首次将 Sequence 与 QwenTPModelRunner 串联，torch.cat([s.input_ids_tensor() ...]) 返回 CPU tensor",
+            "root_cause": "input_ids_tensor(device=None) 在 device=None 时 torch.tensor(..., device=None) 创建的 tensor 在 CPU 上。Phase 8 测试不需要 GPU forward，所有 tensor 在 CPU 上运行，未暴露此问题",
+            "fix": "调用方 QwenTPModelRunner.run() 显式传 device=self.device。Sequence 构造时也需接受 device 参数",
+            "symptom": "RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!",
+            "verified_by": "scripts/test_phase9_generate_single_gpu.sh"
+          }
+        ]
+      },
+      "phase_9_engine_integration": {
+        "_depends_on": "phase_7（model ready）+ phase_8（scheduler ready）",
+        "_provides": "端到端可用的推理引擎 + OpenAI 兼容 HTTP API",
+        "implementation_todos": [
+          "实现 QwenTPModelRunner：__init__(model_dir,device,dtype) → run(seqs,is_prefill,temperature,top_p) prefill/decode 分发 → get_num_free_blocks() 从 layers[0].self_attn._kv_len_gpu 推算 → _sample(logits) rank0+broadcast",
+          "实现 LLMEngine.__init__ 完整流程：(1) torch.cuda.set_device(local_rank) (2) _select_tp_backend(model_dir) 自动检测架构 (3) 创建 QwenTPModelRunner/DeepseekTPModelRunner/RealModelRunner (4) self.eos_token_id=tokenizer.eos_token_id (5) _estimate_kv_blocks() 基于剩余显存 (6) KVMemoryPool(...) (7) Scheduler(memory_pool,...)",
+          "实现 _select_tp_backend(model_dir)：读 config.json architectures[0] → Qwen2/3→'qwen_tp', DeepseekV2/3→'deepseek_tp'",
+          "实现 _estimate_kv_blocks()：torch.cuda.mem_get_info → Dense公式或MLA公式 → max(1, budget//bytes_per_block)",
+          "实现 _enqueue(prompts,...)：tokenizer.encode → Sequence → scheduler.add_request",
+          "实现 generate()：_enqueue → while-loop(scheduler.schedule → runner.run → scheduler.postprocess → _finish_check_and_cleanup) → tokenizer.decode → return text",
+          "实现 step()：scheduler.schedule → runner.run → scheduler.postprocess → _finish_check_and_cleanup → return finished",
+          "实现 begin_generation()/has_unfinished_requests()/get_generation_outputs()：API server 三步接口",
+          "实现 _finish_check_and_cleanup(seq)：EOS/max_tokens 检测 → FINISHED → scheduler.running.remove → memory_pool.free_sequence",
+          "实现 RealModelRunner（HF 兜底路径）：AutoModelForCausalLM + use_cache=False + left-padding decode",
+          "集成桥接接口（CRITICAL-01）：TP 路径 BlockManager 降级 no-op，KV 由 QwenAttentionTP 自管；HF 路径 BlockManager 完整功能"
+        ],
+        "minimal_test_commands": [
+          "CUDA_VISIBLE_DEVICES=0 python -c \"from llm_engine import LLMEngine; from pathlib import Path; engine=LLMEngine(model_dir=Path('.../models/qwen/Qwen3-8B'),inference_backend='qwen_tp'); out=engine.generate('苏州园林的特点是',max_new_tokens=24,temperature=0.0); assert len(out)>0 and '园林' in out; print(f'OK: {out!r}')\"",
+          "torchrun --nproc_per_node=4 -m pytest tests/test_qwen_tp_real.py -v -s"
+        ],
+        "eager_gate": {
+          "no_item_in_forward_decode": "forward_decode 不含 .item()（batch 读取在 QwenForCausalLMTP.forward() 外层）",
+          "no_clone_in_forward_decode": "eager 路径 forward_decode 不含 clone()",
+          "no_dead_loop": "generate() while-loop 空批次时正确检测 all_finished 或 raise",
+          "overlength_rejection": "超长 prompt 被 Scheduler REJECTED 而非永久 WAITING",
+          "eos_detection": "_finish_check_and_cleanup 正确检测 EOS token 和 max_tokens"
+        },
+        "failure_fallback_strategy": [
+          "generate() 死循环 → 检查 scheduler.schedule() 空批次处理和 all_finished 检测顺序",
+          "_estimate_kv_blocks 返回 0 → free_bytes 是否足够，reserve_bytes 是否过大",
+          "TP Runner 找不到 → _select_tp_backend 是否匹配 config.json 的 architectures",
+          "Scheduler-TP Runner num_free 不一致 → 检查 step() 中路由逻辑"
+        ],
+        "done_criteria": [
+          "LLMEngine.generate() 单 prompt Qwen3-8B 输出可读文本。",
+          "LLMEngine.step() 循环可被 OpenAI server 正常驱动。",
+          "temperature=0.0 输出字字对齐基线。",
+          "generate() 对超长 prompt 不永久挂起（REJECTED 或报错）。"
+        ],
+        "test_interface_contracts": {
+          "scripts": [
+            {
+              "file": "scripts/test_phase9_llm_engine_init.py",
+              "format": "pytest",
+              "guards_against": "_select_tp_backend路由+block_size注入(TP→256)+_max_blocks注入",
+              "past_error_triggered_by": "V17 FG-4 step()完整方法体缺失"
+            },
+            {
+              "file": "scripts/test_phase9_generate_single_gpu.sh",
+              "format": "bash",
+              "guards_against": "generate()报错/输出空/非中文",
+              "past_error_triggered_by": "physical_trace_tp4_rank0.json [runtime] greedy_match=True"
+            }
+          ],
+          "review_gate": "所有脚本通过 code-review 子代理 11 条门禁审查"
+        }
+      },
+      "phase_10_e2e_acceptance": {
+        "_depends_on": "phase_9（全链路 LLMEngine ready）",
+        "_provides": "最终验收证据链 + OpenAI 兼容 HTTP benchmark 接口",
+        "implementation_todos": [
+          "构建 OpenAI TP Server（openai_tp_server.py）：ThreadingHTTPServer + /v1/completions + /health",
+          "实现 TP 同步机制：non-rank0 while-loop(broadcast_obj) + rank0 HTTP handler。threading.Lock 序列化请求。",
+          "实现 streaming (SSE) 和非 streaming (JSON) 两种响应模式",
+          "实现 run_tp_generation_loop：rank0 启动 HTTP server + non-rank0 等待 broadcast 命令",
+          "贪婪解码（temperature=0.0）字字对齐验证：预期输出 '（ ） A：建筑与园林结合 B：建筑与自然结合 C：建筑与山水结合 D：建筑'",
+          "中文 prompt 回归（与标准答案比对）",
+          "4 卡 TP HCU/VRAM 监控证据（4 卡 VRAM 绝对值同量级一致，HCU%>0）。注意：~7% 是 64GB GPU 的相对值，绝对值约 4.7 GB/rank。若 GPU 显存不同，以绝对值 4.7 GB 为准。",
+          "单层 CPU dispatch profiling（目标 < 15ms/layer）",
+          "性能基线：nocompile ≥ 54 tok/s；GPU Self CUDA ≤ 66ms；CustomAR ≤ 25ms",
+          "Profiler 确认无 torch.compile/CUDA Graph 痕迹"
+        ],
+        "minimal_test_commands": [
+          "torchrun --nproc_per_node=4 -m pytest tests/test_qwen_tp_real.py -v -s",
+          "SKIP_VLLM=1 CUDA_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 ROUNDS=10 STEPS=8 MODEL_DIR=.../models/qwen/Qwen3-8B bash agent-infer/run_compare_metainfer_vllm.sh qwen",
+          "TP_SIZE=4 PORT=9000 bash start_tp_infer_service.sh qwen  # 启动 OpenAI server",
+          "PORT=9000 NUM_PROMPTS=50 REQUEST_RATE=1 MAX_CONCURRENCY=1 bash run_myengine_benchmark.sh qwen  # HTTP 压测",
+          "python -c \"import os; os.environ['META_INFER_CUDA_GRAPH']='0'; print('Eager mode only: no torch.compile, no CUDA Graph')\""
+        ],
+        "e2e_acceptance_bottom_line": {
+          "_hard_metrics": "以下指标不达标不能声称完成",
+          "greedy_align": "temperature=0.0 输出字字对齐基线",
+          "throughput": "Output throughput ≥ 54 tok/s（HTTP benchmark 或直接 generate 均可）",
+          "gpu_latency": "GPU Self CUDA ≤ 66ms / step",
+          "custom_ar_latency": "CustomAR 通信 ≤ 25ms / step",
+          "cpu_dispatch": "CPU dispatch ≤ 15ms / layer (36 layer total ≤ 540ms)",
+          "vram": "4 卡 VRAM 绝对值同量级一致（约 4.7 GB/rank，百分比取决于 GPU 总显存。Qwen3-8B bf16: 15.7GB/tp=4 ≈ 3.9GB 权重 + ~0.8GB runtime/kernel buffers）",
+          "no_compile": "Profiler 确认无 CompiledFunction、Inductor kernel、cudaGraphLaunch=0",
+          "openai_api": "/v1/completions 返回合法 JSON，/health 返回 200"
+        },
+        "failure_fallback_strategy": [
+          "OpenAI server TP 不同步 → 检查 request_lock 是否序列化请求，broadcast 是否所有 rank 参与",
+          "non-rank0 卡死 → broadcast_obj 超时，检查 rank0 是否正确发送 action",
+          "streaming 无输出 → generate_stream() generator 是否正常迭代",
+          "benchmark 吞吐不达标 → 回退到 phase_9 做性能诊断（clone 冗余、.item() sync、slot_mapping 循环）",
+          "若正确性失败，回退到 phase_6（单层）或 phase_7（权重加载）做数值对齐。"
+        ],
+        "done_criteria": [
+          "Qwen3-8B TP=4 贪婪解码字字对齐。",
+          "OpenAI /v1/completions 返回正确 JSON 响应。",
+          "所有 e2e_acceptance_bottom_line 硬性指标通过。",
+          "HCU/VRAM 监控证据完整。",
+          "Profiler trace 无 torch.compile/CUDA Graph 痕迹。"
+        ],
+        "test_interface_contracts": {
+          "scripts": [
+            {
+              "file": "scripts/test_phase10_greedy_align.sh",
+              "format": "bash",
+              "guards_against": "temperature=0输出≠基线(字字对齐验收底线)",
+              "past_error_triggered_by": "physical_trace_tp4_rank0.json [runtime] output+greedy_match=True"
+            },
+            {
+              "file": "scripts/test_phase10_benchmark.sh",
+              "format": "bash",
+              "guards_against": "TP=4 nocompile吞吐<54 tok/s(基线55.7)",
+              "past_error_triggered_by": "CLAUDE.md §4 55.7 tok/s nocompile TP=4 baseline"
+            },
+            {
+              "file": "scripts/test_phase10_no_compile_check.sh",
+              "format": "bash",
+              "guards_against": "cudaGraphLaunch≠0+torch.compile痕迹",
+              "past_error_triggered_by": "physical_trace_tp4_rank0.json compile_enabled=False"
+            },
+            {
+              "file": "scripts/test_phase10_vs_vllm_compare.sh",
+              "format": "bash",
+              "guards_against": "新框架 vs vLLM(no-graph+graph)三方对比基准缺失",
+              "past_error_triggered_by": "CLAUDE.md §4 vLLM CUDA Graph 166.8 tok/s"
+            }
+          ],
+          "review_gate": "所有脚本通过 code-review 子代理 11 条门禁审查。Phase 10 硬性指标不达标不得声称完成。"
+        }
+      },
+      "phase_11_performance": {
+        "_depends_on": "phase_10（全链路正确性已验证）",
+        "_provides": "吞吐从 ~10 tok/s 提升至 ≥ 54 tok/s",
+        "_note": "仅修改实现方式（pre-alloc, view, contiguous消除），不改变功能行为",
+        "implementation_todos": [
+          "P1: 所有 kernel wrapper 入口改为 torch.empty_like 预分配",
+          "P2: 审查 .contiguous() — 仅保留 kernel 输入前，删除中间 view/reshape 后的",
+          "P3: .reshape() → .view() — view 零拷贝不触发隐式 contiguous",
+          "P4: MLP/attention/decoder forward 消除中间临时 tensor",
+          "P5: .item() 仅在 forward() 外层 36 层后批量读取，不在每层 forward_decode 内",
+          "P6: 不变 tensor 用 register_buffer(persistent=False)"
+        ],
+        "minimal_test_commands": [
+          "python scripts/test_phase11_throughput.py",
+          "bash scripts/test_phase11_profiler.sh"
+        ],
+        "performance_gate": {
+          "throughput_target": "TP=4 nocompile ≥ 54 tok/s，对齐 meta-infer 55.7 tok/s",
+          "cuda_malloc_target": "cudaMalloc = 0 in steady-state decode",
+          "aten_item_target": "aten::item < 10ms total per step",
+          "correctness_regression": "Phase 1-10 全部 scripts/ 必须仍然 PASS"
+        },
+        "done_criteria": [
+          "单 GPU throughput ≥ 54 tok/s",
+          "Phase 1-10 全部 scripts/ 仍然 PASS",
+          "Profiler 确认稳态 decode 无 cudaMalloc",
+          "Profiler 确认 aten::item 累计 < 10ms"
+        ]
+      }
+    }
+  },
+  "model_layer": {
+    "architecture_knowledge_base": {
+      "global_primitives_constraints": {
+        "rmsnorm_precision_law": {
+          "directive": "RMSNorm 使用 vLLM 标品 CUDA kernel: kernel_replacement_plan.md §九, input, weight, eps)。kernel 内部 fp32 计算，调用方只需确保 out 预分配、input contiguous。",
+          "reference_pattern": "from engine.kernels.vllm_wrappers import rms_norm; out = torch.empty_like(x); rms_norm(out, x.contiguous(), self.weight, self.eps)",
+          "deprecated_manual_pattern": "x_fp32 = x.float(); var = ...; out = ... ← 禁止使用。性能低且无 fused kernel 优化，已被 vLLM kernel 替换。",
+          "why": "vLLM CUDA kernel 内部 fp32 计算 + fused elementwise，比手动 PyTorch 逐元素链快 ~6x (18ms→3.1ms RMSNorm/step)。",
+          "source_refs": [
+            "kernel_replacement_plan.md Stage 1",
+            "trinity_audit_report.md CRITICAL-03"
+          ],
+          "_physical_trace_evidence": "2026-05-26: vllm._custom_ops.rms_norm and fused_add_rms_norm confirmed available. Actual implementation uses vLLM CUDA kernel wrapper (kernel_replacement_plan.md §九), not manual PyTorch RMSNorm.",
+          "_nano_vllm_override": "nano-vllm 原始 RMSNorm 实现需整体替换为 vLLM kernel wrapper (kernel_replacement_plan.md §九)。不能保留 nano-vllm 的 PyTorch RMSNorm 框架 + 局部 vLLM kernel 调用的混合体。RMSNorm 类需直接调用 vLLM kernel: forward(x) → rms_norm(out, x.contiguous(), weight, eps); forward(x,residual) → fused_add_rms_norm(x.contiguous(), residual.contiguous(), weight, eps)。 参考文件: ref_projects/nano-vllm/nanovllm/layers/layernorm.py (L1-51, 手写 PyTorch RMSNorm)。整体 DELETE 并替换为 vLLM kernel wrapper (kernel_replacement_plan.md §九)。"
+        },
+        "tp_linear_load_no_double_shard": {
+          "directive": "ColumnParallelLinear/RowParallelLinear 的 load_weight_shard 必须先做形状拦截。",
+          "hard_rule": [
+            "若传入权重 shape == self.weight.shape，则直接 copy_。",
+            "仅当传入权重是全量张量时，才可按 tp_rank 执行切片。"
+          ],
+          "why": "磁盘惰性加载（safe_open.get_slice）常已预切分；再次切分会导致双重切片和权重错乱。",
+          "source_refs": [
+            "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+            "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+          ]
+        },
+        "hf_baseline_test_oom_guard": {
+          "directive": "torchrun 多进程对齐测试时，HF 基准模型严禁 .to(device) 常驻 GPU。",
+          "hard_rule": [
+            "HF 模型保持 CPU 驻留。",
+            "仅在 forward 时将 input_ids/attention_mask 放到目标设备。",
+            "必要时调用 torch.cuda.empty_cache() 清理碎片。"
+          ],
+          "why": "避免 N 进程重复占用全量显存导致 OOM。",
+          "source_refs": [
+            "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+            "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+          ],
+          "_physical_trace_evidence": {
+            "date": "2026-05-26",
+            "finding": "llm_engine.py:118-125: self.model.to(self.device) confirmed present. Each torchrun rank loads full HF model to GPU.",
+            "risk_assessment": "TP Runner bypasses RealModelRunner entirely (inference_backend='deepseek_tp' or 'qwen_tp'). This OOM risk only affects inference_backend='hf' path which is not used in production.",
+            "conclusion": "Low priority fix. Only affects HF fallback path (not used in TP production). Mark as known limitation."
+          }
+        },
+        "debug_evidence_before_guessing": {
+          "directive": "先做证据链，再推断根因。",
+          "mandatory_checks": [
+            "多 rank logits diff（max/mean/top1）",
+            "shape/device 打点",
+            "NaN/Inf 健康检查"
+          ],
+          "source_refs": [
+            "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+          ]
+        },
+        "paging_dual_track_contract": {
+          "_physical_trace_evidence": "2026-05-26: Confirmed via code grep. QwenAttentionTP._block_table uses torch.arange(num_blocks) — self-managed, independent of BlockManager (block_size=16). Framework paging and model paging are dual-track.",
+          "runtime_enforcement": "assert inference_backend not in ('qwen_tp','deepseek_tp') or block_table_source == 'model_internal'"
+        },
+        "engine_routing_contract": {
+          "hard_rule": "TP Runner 初始化时必须动态读取 config.json 提取全部维度参数。严禁硬编码。",
+          "config_keys": [
+            "hidden_size",
+            "intermediate_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "num_hidden_layers",
+            "head_dim",
+            "vocab_size",
+            "max_position_embeddings",
+            "rope_theta",
+            "rms_norm_eps"
+          ]
+        }
+      },
+      "qwen_series_dense": {
+        "source_refs": [
+          "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md",
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md"
+        ],
+        "architectures": [
+          "Qwen2ForCausalLM",
+          "Qwen3ForCausalLM",
+          "Qwen2VLForCausalLM",
+          "Qwen2_5_VLForCausalLM"
+        ],
+        "classification": {
+          "family": "Dense",
+          "attention_type": "Standard MHA/GQA",
+          "ffn_type": "Dense MLP"
+        },
+        "attention_routing": {
+          "qkv": {
+            "parallel": "QKVColumnParallelLinear",
+            "note": "合并 q_proj+k_proj+v_proj 为单次 GEMM → split([q_size, kv_size, kv_size])，非 3 个独立 ColumnParallelLinear",
+            "split_dim": 0
+          },
+          "o_proj": {
+            "parallel": "RowParallelLinear",
+            "split_dim": 1
+          }
+        },
+        "mlp_routing": {
+          "gate_up_proj": {
+            "parallel": "MergedColumnParallelLinear",
+            "note": "合并 gate_proj+up_proj 为单次 GEMM，output=[2*intermediate/tp]，非 2 个独立 ColumnParallelLinear",
+            "split_dim": 0
+          },
+          "down_proj": {
+            "parallel": "RowParallelLinear",
+            "split_dim": 1
+          }
+        },
+        "rope_routing": {
+          "style": "Neox half-half rotate",
+          "hard_rule": "严禁使用 GPT-J 奇偶交错 rotate，Qwen 系列必须使用前后分半 rotate_half。",
+          "risk_if_violated": "常见表现为短句重复、局部复读、退化输出。",
+          "source_refs": [
+            "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+            "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md"
+          ]
+        },
+        "qwen3_8b_model_dims": {
+          "hidden_size": 4096,
+          "intermediate_size": 12288,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 8,
+          "num_hidden_layers": 36,
+          "head_dim": 128,
+          "vocab_size": 151936,
+          "max_position_embeddings": 40960,
+          "rope_theta": 1000000.0,
+          "rms_norm_eps": 1e-06,
+          "tp4_per_rank": {
+            "hidden": 1024,
+            "intermediate": 3072,
+            "attn_heads": 8,
+            "kv_heads": 2,
+            "qkv_weight": "[1536,4096]",
+            "gate_up_weight": "[6144,4096]"
+          },
+          "_note": "以下值来自 2026-05-27 物理 config.json 验证。严禁硬编码。必须动态读取 config.json。",
+          "_verified_config": {
+            "max_position_embeddings": 40960,
+            "intermediate_size": 12288,
+            "verified_at": "2026-05-27",
+            "verification": "python3 -c \"import json; cfg=json.load(open('.../models/qwen/Qwen3-8B/config.json')); print(cfg['max_position_embeddings'], cfg['intermediate_size'])\""
+          }
+        }
+      },
+      "deepseek_v2_v3_mla_moe": {
+        "source_refs": [
+          "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+          "notebooks-cn/04_parallel_strategies/04_vllm_tp4_deepseekv2_index.md",
+          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ],
+        "architectures": [
+          "DeepseekV2ForCausalLM",
+          "DeepseekV3ForCausalLM"
+        ],
+        "classification": {
+          "family": "MLA + MoE",
+          "attention_type": "Decoupled RoPE MLA",
+          "ffn_type": "Hybrid Dense + MoE"
+        },
+        "attention_routing_mla": {
+          "replicated_must_not_shard": [
+            "q_a_proj",
+            "kv_a_proj_with_mqa"
+          ],
+          "tp_sharded": {
+            "q_b_proj": {
+              "parallel": "ColumnParallelLinear",
+              "split_dim": 0,
+              "note": "按 num_heads * head_dim 列切"
+            },
+            "kv_b_proj_with_mqa": {
+              "parallel": "ColumnParallelLinear",
+              "split_dim": 0,
+              "note": "按头维输出列切"
+            },
+            "o_proj": {
+              "parallel": "RowParallelLinear",
+              "split_dim": 1
+            }
+          },
+          "source_refs": [
+            "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+            "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+            "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+          ]
+        },
+        "yarn_rope_scaling_patch": {
+          "required": true,
+          "hard_rule": [
+            "Attention scaling 不仅是 dim ** -0.5。",
+            "当 rope_scaling.type == yarn 时，必须乘上 YaRN mscale 的平方修正。"
+          ],
+          "risk_if_violated": "注意力失焦，输出乱码或异常退化。",
+          "source_refs": [
+            "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+            "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
+          ]
+        },
+        "moe_routing_hybrid_parallel": {
+          "shared_experts": {
+            "strategy": "TP",
+            "rule": "作为 Dense MLP 处理：gate/up 列切，down 行切。"
+          },
+          "routed_experts": {
+            "strategy": "Simplified EP via AllReduce",
+            "router_gate": "全卡复制（Replicated）",
+            "expert_instantiation": "各 rank 仅实例化 local_expert_ids",
+            "aggregation": "本地专家输出加权求和后做 dist.all_reduce_sum"
+          },
+          "source_refs": [
+            "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+            "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+            "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+          ]
+        },
+        "routed_probability_patch": {
+          "config_key": "norm_topk_prob",
+          "hard_rule": "若开启 norm_topk_prob，top-k 路由权重必须除以权重和做重归一化。",
+          "risk_if_violated": "FFN 信号衰减，语义能力显著下降。",
+          "source_refs": [
+            "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md"
+          ],
+          "_physical_trace_evidence": {
+            "date": "2026-05-26",
+            "method": "torchrun --nproc_per_node=4 + profiling on DeepSeek-V2-Lite-Chat TP=4",
+            "config_values": {
+              "norm_topk_prob": false,
+              "routed_scaling_factor": 1.0,
+              "n_routed_experts": 64,
+              "num_experts_per_tok": 6
+            },
+            "finding": "norm_topk_prob=False in model config — the routed_probability_patch condition is NOT triggered. routed_scaling_factor=1.0. No norm_topk_prob normalization needed for this model variant.",
+            "moe_routing_verified": "engine/tp_layers/moe.py uses topk routing with routed_scaling_factor. Code confirms: if norm_topk_prob were True, normalization would be needed. Current config disables it → safe.",
+            "conclusion": "W1 is a CONFIG-DEPENDENT warning. For DeepSeek-V2-Lite (norm_topk_prob=False), no action needed. Full-scale DeepSeek-V2/V3 models may have norm_topk_prob=True and require the patch."
+          }
+        }
+      },
+      "lazy_loader_synthesis_rules": {
+        "backend": "safetensors.safe_open",
+        "source_refs": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+        ],
+        "generic_strategy": [
+          "优先读取 model.safetensors.index.json 的 weight_map 定位分片文件。",
+          "仅在需要分片时调用 get_slice，避免整张量读入。",
+          "严格区分 replicated 权重与 tp/ep 分片权重。"
+        ],
+        "qwen_dense_loader": {
+          "split_dim_0": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "gate_proj",
+            "up_proj"
+          ],
+          "split_dim_1": [
+            "o_proj",
+            "down_proj"
+          ]
+        },
+        "deepseek_mla_moe_loader": {
+          "must_full_read": [
+            "q_a_proj",
+            "kv_a_proj_with_mqa"
+          ],
+          "tp_slice_read": [
+            "q_b_proj",
+            "kv_b_proj_with_mqa",
+            "o_proj",
+            "shared_experts.gate_proj",
+            "shared_experts.up_proj",
+            "shared_experts.down_proj"
+          ],
+          "ep_sparse_read": "遍历本 rank 的 local experts，仅加载对应 expert_id 的 gate/up/down，不得读取全量 routed experts。"
+        },
+        "qwen_hf_key_mapping": {
+          "model.layers.N.self_attn.q_proj.weight": "layers[N].self_attn.qkv_proj — [0:q_size] (Q), concat order: Q-K-V",
+          "model.layers.N.self_attn.k_proj.weight": "layers[N].self_attn.qkv_proj — [q_size:q_size+kv_size] (K)",
+          "model.layers.N.self_attn.v_proj.weight": "layers[N].self_attn.qkv_proj — [q_size+kv_size:] (V)",
+          "model.layers.N.self_attn.o_proj.weight": "layers[N].self_attn.o_proj.weight",
+          "model.layers.N.mlp.gate_proj.weight": "layers[N].mlp.gate_up_proj — 前半 [0:inter/tp] (gate)",
+          "model.layers.N.mlp.up_proj.weight": "layers[N].mlp.gate_up_proj — 后半 [inter/tp:] (up)",
+          "model.layers.N.mlp.down_proj.weight": "layers[N].mlp.down_proj.weight",
+          "model.layers.N.input_layernorm.weight": "layers[N].input_layernorm.weight",
+          "model.layers.N.post_attention_layernorm.weight": "layers[N].post_attention_layernorm.weight",
+          "model.embed_tokens.weight": "embed_tokens.weight (VocabParallelEmbedding, vocab/tp shard)",
+          "lm_head.weight": "lm_head.weight (ParallelLMHead)",
+          "model.norm.weight": "norm.weight",
+          "merge_order": "q_proj → k_proj → v_proj concatenated (Q-K-V order)",
+          "load_procedure": [
+            "1. 读 model.safetensors.index.json → weight_map",
+            "2. QKV: 3个HF权重 ColumnParallel 切片 → torch.cat([q,k,v],dim=0) → self.qkv_proj.weight.copy_()",
+            "3. MLP: gate/up ColumnParallel 切片 → torch.cat([gate,up],dim=0) → self.gate_up_proj.weight.copy_()",
+            "4. o_proj/down_proj: RowParallel 切片 → copy_()",
+            "5. double_shard_guard: if weight.shape==self.weight.shape → copy_() (已切片); else → 按 tp_rank 切片"
+          ]
+        },
+        "load_weights_pseudocode": [
+          "def load_weights(self):",
+          "  # 1. Read weight_map",
+          "  index = json.load(open(f'{model_dir}/model.safetensors.index.json'))",
+          "  weight_map = index['weight_map']  # {hf_key: safetensors_filename}",
+          "  # 2. Group by safetensors file",
+          "  files = {}  # {filename: [hf_keys]}",
+          "  for key, fname in weight_map.items(): files.setdefault(fname, []).append(key)",
+          "  # 3. Load each shard",
+          "  for fname, keys in files.items():",
+          "    with safe_open(f'{model_dir}/{fname}', framework='pt') as f:",
+          "      for hf_key in keys:",
+          "        full = f.get_tensor(hf_key)",
+          "        self._load_one_weight(hf_key, full)",
+          "  # 4. After all weights loaded:",
+          "  dist.barrier(); init_custom_ar(device=device)",
+          "",
+          "def _load_one_weight(self, hf_key, full_weight):",
+          "  # Map HF key → module attribute (see qwen_hf_key_mapping)",
+          "  # QKV merge: 3 HF keys (q_proj, k_proj, v_proj) → single self_attn.qkv_proj",
+          "  #   q_slice = self._load_tensor(full_q, split_dim=0)  # ColumnParallel",
+          "  #   k_slice = self._load_tensor(full_k, split_dim=0, allow_kv_replication=True)",
+          "  #   v_slice = self._load_tensor(full_v, split_dim=0, allow_kv_replication=True)",
+          "  #   merged = torch.cat([q_slice, k_slice, v_slice], dim=0)  # Q-K-V order!",
+          "  #   target.weight.copy_(merged)",
+          "  # Gate+Up merge: same pattern, cat([gate_slice, up_slice], dim=0)",
+          "  # RowParallel (o_proj, down_proj): self._load_tensor(full, split_dim=1) → weight.copy_()",
+          "  # Double shard guard: if full.shape == self.weight.shape → just copy_()",
+          "",
+          "def _load_tensor(self, full, split_dim, allow_kv_replication=False):",
+          "  # ColumnParallel (split_dim=0): full[:, :] → slice[local_out_start:local_out_end, :]",
+          "  # RowParallel (split_dim=1): full[:, :] → slice[:, local_in_start:local_in_end]",
+          "  # KV replication: if tp_size > num_kv_heads: return full (replicated on all ranks)",
+          "  local = full.chunk(tp_size, dim=split_dim)[self.tp_rank]",
+          "  return local"
+        ]
+      },
+      "engine_routing_contract": {
+        "entrypoint": "LLMEngine/RealModelRunner",
+        "source_refs": [
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ],
+        "hard_rule": [
+          "必须读取 model_dir/config.json。",
+          "必须解析 architectures[0] 并路由到对应 TP Runner。",
+          "禁止将 RealModelRunner 固定绑定到单一模型 Runner。"
+        ],
+        "routing_table": {
+          "Qwen2ForCausalLM": "QwenTPModelRunner",
+          "Qwen3ForCausalLM": "QwenTPModelRunner",
+          "Qwen2VLForCausalLM": "QwenTPModelRunner",
+          "Qwen2_5_VLForCausalLM": "QwenTPModelRunner",
+          "DeepseekV2ForCausalLM": "DeepseekTPModelRunner",
+          "DeepseekV3ForCausalLM": "DeepseekTPModelRunner"
+        }
+      },
+      "alignment_and_validation_contracts": {
+        "source_refs": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+        ],
+        "realtime_tp_test_style": {
+          "required_pattern": [
+            "LLMEngine(model_dir, inference_backend='tp')",
+            "批量 add prompt 到调度器",
+            "while eng.has_unfinished_requests(): eng.step()",
+            "输出 eng.get_generation_outputs()"
+          ],
+          "forbidden_pattern": [
+            "在真实 TP 回归测试中依赖 AutoModelForCausalLM.from_pretrained 喂权重",
+            "把端到端验证完全退化成 HF-debug 广播路径"
+          ]
+        },
+        "numeric_alignment": {
+          "greedy_required": "temperature=0.0",
+          "recommended_checks": [
+            "首 token logits diff",
+            "多 prompt 文本稳定性复跑",
+            "分层 hidden diff 定位首个发散层"
+          ]
+        }
+      },
+      "failure_mode_library": {
+        "_note": "从 10 个有效改动点的踩坑经验标准化提取。每条包含 symptom/check/fix/source_refs。",
+        "source_refs": [
+          "notebooks-cn/07_improvementPlan/qwen3_effective_changes.md",
+          "notebooks-cn/06_experience/*"
+        ],
+        "entries": [
+          {
+            "id": "FM-001",
+            "category": "TP Embedding 双重切片",
+            "symptom": "VocabParallelEmbedding 加载报错: size mismatch (0)",
+            "check": "_load_tensor(split_dim=0) 已按 tp_rank 取本地分片，load_weight_shard 是否二次切片",
+            "fix": "load_weight_shard 增加分支: 若传入张量首维已等于 local_vocab_size → 直接 copy；否则按全量词表范围切片",
+            "source_refs": [
+              "06_experience/01_task10_tp_qwen_debug_experience.md §1"
+            ]
+          },
+          {
+            "id": "FM-002",
+            "category": "RMSNorm contiguous 约束",
+            "symptom": "rms_norm 输出数值异常或 CUDA error",
+            "check": "传入 rms_norm 的 4D QK norm tensor (view 结果) 是否 .is_contiguous()",
+            "fix": "调用前加 .contiguous(): rms_norm(out, x.contiguous(), weight, eps)",
+            "source_refs": [
+              "kernel_replacement_plan.md Stage 0 §0.4, Stage 1 踩坑"
+            ]
+          },
+          {
+            "id": "FM-003",
+            "category": "fused_add_rms_norm 跨层 weight",
+            "symptom": "post_mlp 的 fused_add_rms_norm 使用了错误的 weight → 输出异常",
+            "check": "确认所有 4 处 fused_add_rms_norm 调用的 weight 均为 self.xxx.weight (本层内)，非下一层的 weight。",
+            "fix": "所有 fused_add_rms_norm 调用均使用本层 self.input_layernorm.weight 或 self.post_attention_layernorm.weight。不存在跨层 weight 依赖。按 residual_chain_pseudocode 实现。",
+            "source_refs": [
+              "kernel_replacement_plan.md Stage 1 踩坑"
+            ]
+          },
+          {
+            "id": "FM-004",
+            "category": "CosSinCache 格式 + 显存",
+            "symptom": "rotary_embedding 输出与 PyTorch RoPE 不一致；或 36×8MB=288MB 显存浪费",
+            "check": "cache shape 应为 [max_pos, head_size]=[40960,128] 而非 [2*head_size]；是否模块级共享",
+            "fix": "make_cos_sin_cache(max_pos, head_size)；_cos_sin_cache_registry dict 共享，lazy 移到 GPU",
+            "source_refs": [
+              "kernel_replacement_plan.md Stage 0 §0.2, Stage 3 踩坑"
+            ]
+          },
+          {
+            "id": "FM-005",
+            "category": "CustomAR gloo ProcessGroup",
+            "symptom": "dist.all_gather_object 报错 (NCCL 不支持 object collectives)",
+            "fix": "gloo_group = dist.new_group(backend='gloo')",
+            "source_refs": [
+              "kernel_replacement_plan.md Stage 4 踩坑"
+            ]
+          },
+          {
+            "id": "FM-006",
+            "category": "QKV weight 拼接索引",
+            "symptom": "QKV 切片后 Q/K/V 维度与 num_heads 不匹配",
+            "fix": "load_weight_shard 按 [0:q_size], [q_size:q_size+kv_size], [q_size+kv_size:] 三段复制",
+            "source_refs": [
+              "kernel_replacement_plan.md Stage 7 踩坑"
+            ]
+          },
+          {
+            "id": "FM-007",
+            "category": "RoPE Neox vs GPT-J 错配",
+            "symptom": "短句重复、局部复读、退化输出 (非乱码)",
+            "check": "Qwen3 必须 is_neox=True (前后分半 rotate_half)；DeepSeek 用 is_neox=False (GPT-J 奇偶交错)",
+            "fix": "根据模型系列选择正确的 is_neox 值",
+            "source_refs": [
+              "06_experience/01_task10_tp_qwen_debug_experience.md §3.2"
+            ]
+          },
+          {
+            "id": "FM-008",
+            "category": "paged KV block_size",
+            "symptom": "flash_attn_with_kvcache 报错",
+            "check": "_kv_block_size >= 256",
+            "fix": "使用 block_size=256 (flash_attn_with_kvcache 硬性最低要求)",
+            "source_refs": [
+              "kernel_replacement_plan.md Stage 8"
+            ]
+          },
+          {
+            "id": "FM-009",
+            "category": "compiled region 内 .item()",
+            "symptom": "SIGABRT (torch.compile fullgraph=True 内 CPU sync)",
+            "fix": "kv_len .item() 移到 forward() 外部 — batch 读取所有层后统一 sync",
+            "source_refs": [
+              "cuda_graph_plan.md 踩坑 #8"
+            ],
+            "_runtime_verification": "2026-05-26 物理 tracing 验证: .item() 在 QwenForCausalLMTP.forward()@line516（非编译函数），不在 forward_decode（编译函数）内。SAFE。",
+            "check": "物理验证: grep '.item()' engine/models/qwen.py — 确认所有 .item() 调用均在非编译函数 (forward()) 中",
+            "_physical_trace_evidence": {
+              "date": "2026-05-26",
+              "method": "torchrun --nproc_per_node=4 + torch.profiler.profile() on Qwen3-8B TP=4",
+              "finding": "Line 516: new_past_key_values = [int(l.self_attn._kv_len_gpu[0].item()) for l in self.layers] — this .item() is in QwenForCausalLMTP.forward() which is NOT compiled (only layer.forward_decode is compiled). None of the 3 .item() calls in qwen.py are inside forward_decode.",
+              "conclusion": "SAFE. All .item() calls correctly placed outside compiled region.",
+              "trace_file": "/tmp/audit_trace_rank0.json"
+            }
+          },
+          {
+            "id": "FM-010",
+            "category": "reduce-overhead vs KV cache 冲突",
+            "symptom": "RuntimeError: accessing tensor output of CUDAGraphs",
+            "fix": "使用 mode='default' 或 paged KV cache (固定 buffer 地址)",
+            "source_refs": [
+              "improvement_plan.md §P2"
+            ]
+          },
+          {
+            "id": "FM-011",
+            "category": "flash_attn 无法 compile trace",
+            "symptom": "Cannot access data pointer of FakeTensor",
+            "fix": "@torch.library.custom_op 注册 + register_fake 返回同 shape FakeTensor",
+            "source_refs": [
+              "cuda_graph_plan.md 踩坑 #1",
+              "kernel_replacement_plan.md (custom_op 注册)"
+            ]
+          },
+          {
+            "id": "FM-012",
+            "category": "无条件 clone 性能回退",
+            "symptom": "nocompile 吞吐 ~15% 回退 (53.9→45 tok/s)",
+            "fix": "拆分 forward_decode (eager, 无 clone) 和 forward_decode_graph (graph, 含 clone)",
+            "source_refs": [
+              "cuda_graph_plan.md §3.3-A",
+              "kernel_replacement_plan.md (forward_decode_graph 设计)"
+            ]
+          },
+          {
+            "id": "FM-013",
+            "category": "Dynamo RNG 重编译 (TP=4)",
+            "symptom": "CUDAGeneratorImpl::current_seed 在 graph 捕获期间报错",
+            "fix": "sglang 切图: torch.fx.split_module 在 all_reduce_sum 处拆分 FX 图，通信子图 backend='eager' 不入 CUDA Graph",
+            "source_refs": [
+              "cuda_graph_plan.md §四 阶段三"
+            ]
+          },
+          {
+            "id": "FM-014",
+            "category": "cuBLAS 图池地址漂移",
+            "symptom": "raw CUDA Graph replay 后 hs 差 3.4 (应为 0)",
+            "fix": "通信 op 从 CUDA Graph 分离 (eager 执行)。raw CUDA Graph 无 inductor 内存规划保证。",
+            "source_refs": [
+              "cuda_graph_plan.md §四 已尝试并排除的方案"
+            ],
+            "_architecture_note": "此为 PyTorch 编译器架构限制（cuBLAS workspace 地址在图回放间不保证稳定），非代码缺陷。修复需 sglang 切图方案或 PyTorch 版本升级。",
+            "check": "graph capture 前后打印 F.linear 输出的 data_ptr()；replay 时再次打印，断言一致。若不一致 → 地址漂移发生。",
+            "_physical_trace_evidence": {
+              "date": "2026-05-26",
+              "method": "GPU kernel trace via torch.profiler on Qwen3-8B TP=4. CustomAR cross_device_reduce_1stage dominates GPU time (23.5ms, 876 calls). cuBLAS address drift was observed in earlier raw CUDA Graph attempts (hs diff 3.4).",
+              "conclusion": "Architecture limitation of raw CUDA Graph + cuBLAS workspace. Fix requires sglang split_graph approach or PyTorch compiler-level fix. Not a code defect.",
+              "trace_file": "/tmp/audit_trace_rank0.json"
+            }
+          },
+          {
+            "id": "FM-015",
+            "category": "mutated inputs → cudagraphs 跳过",
+            "symptom": "warning: 'skipping cudagraphs due to mutated inputs'; cudaGraphLaunch=0",
+            "fix": "forward_decode_graph 开头 clone 输入 → fused_add_rms_norm 修改 clone 而非函数输入",
+            "source_refs": [
+              "cuda_graph_plan.md 踩坑 #7"
+            ]
+          }
+        ]
+      },
+      "knowledge_source_index": {
+        "global_primitives_constraints": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ],
+        "qwen_series_dense": [
+          "notebooks-cn/04_parallel_strategies/02_qwen_dense_tp_implementation_guide.md",
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md"
+        ],
+        "deepseek_v2_v3_mla_moe": [
+          "notebooks-cn/04_parallel_strategies/03_tp4_moe_implementation_guide_deepseekv2.md",
+          "notebooks-cn/04_parallel_strategies/04_vllm_tp4_deepseekv2_index.md",
+          "notebooks-cn/04_parallel_strategies/05_deepseekv2_vllm_adaptation_knowledge.md",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ],
+        "lazy_loader_synthesis_rules": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ],
+        "engine_routing_contract": [
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt",
+          "notebooks-cn/07_agentPlan/task10_deepseekv2_tp_stage1_stage2_plan.md"
+        ],
+        "alignment_and_validation_contracts": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md"
+        ],
+        "failure_mode_library": [
+          "notebooks-cn/06_experience/01_task10_tp_qwen_debug_experience.md",
+          "notebooks-cn/06_experience/02_task11_deepseek_tp_real_debug_experience.md",
+          "notebooks-cn/08_history_prompt/task10从QwenTP到dsTP验证.txt"
+        ]
+      }
+    }
+  },
+  "runtime_acceptance_layer": {
+    "logic_constraints": [
+      "严格按自下而上物理依赖拓扑构建：数值基元(Phase1)→TP通信(Phase2)→TP线性层(Phase3)→Embedding(Phase4)→Attention+KV Cache(Phase5)→Decoder+MLP(Phase6)→权重加载(Phase7)→框架外壳(Phase8,可并行)→引擎集成(Phase9)→E2E验收(Phase10)。不可重排。",
+      "Phase 8（框架外壳：Sequence/Scheduler/Sampler/BlockManager）可与 Phase 1-7（模型层）并行开发，二者物理独立。Phase 9 必须等双方完成才能开始。",
+      "纯 Eager 模式铁律：绝对禁止 torch.compile 和 CUDA Graph。forward_decode 不含 clone()(Eager路径)和 .item()(禁止 GPU sync)。",
+      "Scheduler 采用 prefill 优先策略；decode 仅选择 can_append_one_more 的运行序列，资源不足时不抢占。",
+      "Prefix caching 仅对完整 block token 切片生效；末尾不满 block 的 token 不入 hash_to_block_id。",
+      "KVMemoryPool 的 block 数按模型配置与 dtype 估算，且预留 reserve_bytes 与 mem_utilization 安全因子。",
+      "任务完成标准：Qwen3-8B TP=4 nocompile 贪婪解码(temperature=0.0)字字对齐基线 + 性能指标达标(≥54 tok/s,≤66ms GPU,≤25ms CustomAR)。DeepSeek-V2 为独立扩展阶段，不在本次纯 Eager 基线范围。",
+      "运行时监控要求：真实 TP 推理时持续采集 HCU 0,1,2,3 的 HCU% 与 VRAM%（若可见设备不足 5 个需先打印设备清单并说明）。",
+      "4 卡 TP 真实推理期间，参与 TP 的 4 张卡 VRAM 绝对值需同量级近似一致；Qwen3-8B TP=4 每卡约 4.7 GB（bf16 15.7GB/tp=4 ≈ 3.9GB + runtime ~0.8GB），DeepSeek-V2-16B TP=4 每卡约 9 GB。百分比取决于 GPU 总显存容量。KV cache 必须 lazy alloc——prefill 时按需分配 num_blocks_needed=（num_tokens+255）//256，严禁 torch.zeros(max_blocks) 全量预分配。",
+      "推理测试窗口中 HCU% 必须出现大于 0 的时刻，作为并行加载与真实计算证据；无监控证据仅有文本输出视为未通过。",
+      "开发约束：严格 TDD，新增或修改组件必须先写测试后实现；未通过单测禁止继续跨组件集成。",
+      "严禁 fake inference：验收必须附带 profiler trace 文件 + HCU 监控证据。硬编码文本输出冒充真实推理视为验收失败。"
+    ],
+    "acceptance_test_targets": {
+      "_scope": "纯 Eager 模式 nocompile B=1 TP=4。本次基线仅覆盖 Qwen3-8B。DeepSeek-V2 为独立扩展阶段。",
+      "qwen3_tp": {
+        "model_dir": ".../models/qwen/Qwen3-8B",
+        "suggested_test": "tests/test_qwen_tp_real.py",
+        "performance_baseline": {
+          "output_throughput": "≥ 54 tok/s",
+          "gpu_self_cuda": "≤ 66ms / step",
+          "custom_ar_communication": "≤ 25ms / step",
+          "cpu_dispatch_per_layer": "< 15ms (36 layer total ≤ 540ms)",
+          "vram_per_rank": "约 4.7 GB/rank（绝对值，同量级一致）。bf16 15.7GB/tp=4 ≈ 3.9GB 权重 + ~0.8GB runtime。KV cache 必须 lazy alloc 按需分配。严禁 max_blocks 全量预分配。",
+          "greedy_align": "temperature=0.0 字字对齐基线"
+        }
+      },
+      "deepseek_v2_tp": {
+        "_note": "不在本次纯 Eager 基线范围。Phase 10 完成后作为独立扩展阶段处理。",
+        "model_dir": ".../models/deepseek-ai/DeepSeek-V2-Lite-Chat",
+        "suggested_test": "tests/test_deepseek_tp_real.py"
+      }
+    }
+  },
+  "knowledge_source_policy": {
+    "rule": "每条核心知识必须能回溯到 notebooks-cn的原始文档。",
+    "primary_dirs": [
+      "notebooks-cn/01_framework_design",
+      "notebooks-cn/02_model_specifics",
+      "notebooks-cn/03_operators",
+      "notebooks-cn/04_parallel_strategies",
+      "notebooks-cn/05_memory_pool",
+      "notebooks-cn/06_request_lifecycle",
+      "notebooks-cn/07_agentPlan",
+      "notebooks-cn/08_history_prompt"
+    ]
+  }
+}
