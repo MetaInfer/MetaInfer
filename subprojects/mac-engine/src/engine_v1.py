@@ -10,7 +10,6 @@ import mlx.core as mx
 
 from .kv_cache import KVCache, make_kv_cache
 from .model import Qwen3Config
-from .sampler import temperature_sample
 from .tokenizer import Tokenizer
 from .weights import load_qwen3_model
 
@@ -57,11 +56,24 @@ class InferenceEngine:
         input_ids = mx.array([token_ids])
         logits = self.model(input_ids, cache=self._cache)
 
-        # Decode loop
-        for _ in range(max_tokens):
-            next_id = temperature_sample(logits[0, -1, :], temperature)
-            yield self.tokenizer.decode([next_id])
+        # Pre-allocate next_input tensor (1x1, reused)
+        _next_input = mx.zeros((1, 1), mx.int32)
 
-            # Decode: single token forward with cache
-            next_input = mx.array([[next_id]])
-            logits = self.model(next_input, cache=self._cache)
+        # Decode loop
+        generated = 0
+        while generated < max_tokens:
+            # Compiled argmax: stays in MX graph, no .item() sync
+            next_logits = logits[0, -1, :]
+            next_id_arr = _compiled_sample(next_logits, temperature)
+            next_id = int(next_id_arr.item())  # only sync point
+
+            token_text = self.tokenizer.decode([next_id])
+            generated += 1
+            yield token_text
+
+            if generated >= max_tokens:
+                break
+
+            # Reuse pre-allocated buffer, avoid new allocation
+            _next_input[0, 0] = next_id
+            logits = self.model(_next_input, cache=self._cache)
