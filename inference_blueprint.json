@@ -2143,7 +2143,7 @@
           "集成桥接接口（CRITICAL-01）：TP 路径 BlockManager 降级 no-op，KV 由 QwenAttentionTP 自管；HF 路径 BlockManager 完整功能"
         ],
         "minimal_test_commands": [
-          "CUDA_VISIBLE_DEVICES=0 python -c \"from llm_engine import LLMEngine; from pathlib import Path; engine=LLMEngine(model_dir=Path('.../models/qwen/Qwen3-8B'),inference_backend='qwen_tp'); out=engine.generate('苏州园林的特点是',max_new_tokens=24,temperature=0.0); assert len(out)>0 and '园林' in out; print(f'OK: {out!r}')\"",
+          "CUDA_VISIBLE_DEVICES=0 python -c \"from llm_engine import LLMEngine; from pathlib import Path; engine=LLMEngine(model_dir=Path('${MODEL_DIR}'),inference_backend='qwen_tp'); out=engine.generate('苏州园林的特点是',max_new_tokens=24,temperature=0.0); assert len(out)>0 and '园林' in out; print(f'OK: {out!r}')\"",
           "torchrun --nproc_per_node=4 -m pytest tests/test_qwen_tp_real.py -v -s"
         ],
         "eager_gate": {
@@ -2200,7 +2200,7 @@
         ],
         "minimal_test_commands": [
           "torchrun --nproc_per_node=4 -m pytest tests/test_qwen_tp_real.py -v -s",
-          "SKIP_VLLM=1 CUDA_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 ROUNDS=10 STEPS=8 MODEL_DIR=.../models/qwen/Qwen3-8B bash agent-infer/run_compare_metainfer_vllm.sh qwen",
+          "SKIP_VLLM=1 CUDA_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 ROUNDS=10 STEPS=8 MODEL_DIR=${MODEL_DIR} bash run_compare_metainfer_vllm.sh qwen",
           "TP_SIZE=4 PORT=9000 bash start_tp_infer_service.sh qwen  # 启动 OpenAI server",
           "PORT=9000 NUM_PROMPTS=50 REQUEST_RATE=1 MAX_CONCURRENCY=1 bash run_myengine_benchmark.sh qwen  # HTTP 压测",
           "python -c \"import os; os.environ['META_INFER_CUDA_GRAPH']='0'; print('Eager mode only: no torch.compile, no CUDA Graph')\""
@@ -2439,7 +2439,7 @@
             "max_position_embeddings": 40960,
             "intermediate_size": 12288,
             "verified_at": "2026-05-27",
-            "verification": "python3 -c \"import json; cfg=json.load(open('.../models/qwen/Qwen3-8B/config.json')); print(cfg['max_position_embeddings'], cfg['intermediate_size'])\""
+            "verification": "python3 -c \"import json; cfg=json.load(open('${MODEL_DIR}/config.json')); print(cfg['max_position_embeddings'], cfg['intermediate_size'])\""
           }
         }
       },
@@ -2905,7 +2905,7 @@
     "acceptance_test_targets": {
       "_scope": "纯 Eager 模式 nocompile B=1 TP=4。本次基线仅覆盖 Qwen3-8B。DeepSeek-V2 为独立扩展阶段。",
       "qwen3_tp": {
-        "model_dir": ".../models/qwen/Qwen3-8B",
+        "model_dir": "${MODEL_DIR}",
         "suggested_test": "tests/test_qwen_tp_real.py",
         "performance_baseline": {
           "output_throughput": "≥ 54 tok/s",
@@ -2918,7 +2918,7 @@
       },
       "deepseek_v2_tp": {
         "_note": "不在本次纯 Eager 基线范围。Phase 10 完成后作为独立扩展阶段处理。",
-        "model_dir": ".../models/deepseek-ai/DeepSeek-V2-Lite-Chat",
+        "model_dir": "${MODEL_DIR}",
         "suggested_test": "tests/test_deepseek_tp_real.py"
       }
     }

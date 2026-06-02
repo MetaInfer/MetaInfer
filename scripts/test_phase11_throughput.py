@@ -10,7 +10,7 @@ print("=== Phase 11: Throughput Baseline ===")
 print("THROUGHPUT-001: Measuring single GPU throughput...")
 
 from llm_engine import LLMEngine; from pathlib import Path
-engine = LLMEngine(model_dir=Path('../models/qwen/Qwen3-8B'), inference_backend='qwen_tp', max_num_seqs=4)
+engine = LLMEngine(model_dir=Path('${MODEL_DIR}'), inference_backend='qwen_tp', max_num_seqs=4)
 
 NUM_TOKENS = 32
 t0 = time.time()

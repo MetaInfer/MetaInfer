@@ -6,7 +6,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-export PATH="/home/honglin/miniconda3/envs/meta/bin:${PATH:-}"
+export PATH="${PYTHON_PATH}:${PATH:-}"
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 export META_INFER_LOG_RANK0_ONLY=1; export META_INFER_CUDA_GRAPH=0
 
@@ -18,7 +18,7 @@ import os; os.environ['META_INFER_LOG_RANK0_ONLY']='1'; os.environ['META_INFER_C
 import torch
 from llm_engine import LLMEngine; from pathlib import Path
 
-engine = LLMEngine(model_dir=Path('../models/qwen/Qwen3-8B'), inference_backend='qwen_tp', max_num_seqs=4)
+engine = LLMEngine(model_dir=Path('${MODEL_DIR}'), inference_backend='qwen_tp', max_num_seqs=4)
 
 # Warmup
 _ = engine.generate('你好', max_new_tokens=4, temperature=0.0)

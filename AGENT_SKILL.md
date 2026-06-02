@@ -1,7 +1,7 @@
 # AGENT SKILL: TP/EP Inference Generation SOP
 
 你是 `agent-infer` 的推理框架生成 Agent。你的唯一目标是：  
-**基于 `curosr/skills/inference_blueprint.json` 的架构知识图谱，生成单路径、可观测、可验证、可自愈的 TP/EP 推理实现。**
+**基于 `inference_blueprint.json` 的架构知识图谱，生成单路径、可观测、可验证、可自愈的 TP/EP 推理实现。**
 
 ### 0.-2 路径兼容规则（开源分发保护）
 
@@ -50,7 +50,7 @@
 
 ## 0. 启动前强制动作
 
-1. 进入项目根目录：`./agent-infer`。
+1. 进入项目根目录：本仓库根目录（即 CLAUDE.md 所在目录）。
 2. **物理块双轨制感知边界（CRITICAL-01 强制）**：
    - TP Runner 路径（`inference_backend="qwen_tp"/"deepseek_tp"`）：KV cache 由模型自管（`_kv_block_size=256`，`torch.arange` 顺序分配）。**严禁** BlockManager API 接入 TP Runner。
    - HF 兜底路径（`inference_backend="hf"`）：框架层 paging（BlockManager, block_size=16）正常生效。
@@ -117,8 +117,8 @@
 2. **4 卡 TP 一致性**  
    - `torchrun --nproc_per_node=4` 期间，参与 TP 的 4 张卡 VRAM% 需出现同量级且近似一致的区间。  
 3. **目标区间（经验阈值）**  
-   - `.../models/qwen/Qwen3-8B` 在 TP=4 推理时，每卡 VRAM% 约 `7%`。  
-   - `.../models/deepseek-ai/DeepSeek-V2-Lite-Chat` 在 TP=4 推理时，每卡 VRAM% 约 `14%`。  
+   - Qwen3-8B 在 TP=4 推理时，每卡 VRAM% 约 `7%`（MODEL_DIR 指向 Qwen3-8B 目录）。  
+   - DeepSeek-V2-Lite-Chat 在 TP=4 推理时，每卡 VRAM% 约 `14%`（MODEL_DIR 指向 DeepSeek-V2-Lite-Chat 目录）。  
 4. **真实并行计算证据**  
    - 测试窗口内需出现 HCU% `> 0` 的时刻，且至少覆盖 4 张 TP 卡。  
 5. **反作弊约束**  
@@ -213,12 +213,12 @@ Phase N 实现代码写完
 
 **ref_code 读取规则**：
 1. `ref_projects/nano-vllm/...` 路径在项目根目录下，**必须实际 `Read` 打开该文件**。蓝图 component 的 `_nano_vllm_override` 字段说明了哪些行需要修改/删除。
-2. `vllm/_custom_ops.py:420-423` 等路径指向 **vLLM installed package**（在 meta conda 环境的 site-packages 中）。Agent 需 `import vllm._custom_ops; print(inspect.getsource(...))` 或直接读已安装包的源码文件。
+2. `vllm/_custom_ops.py:420-423` 等路径指向 **vLLM installed package**（在用户 Python 环境的 site-packages 中）。Agent 需 `import vllm._custom_ops; print(inspect.getsource(...))` 或直接读已安装包的源码文件。
 3. ref_code 中有精确到方法名和行号的引用（如 `vllm/model_executor/layers/activation.py::SiluAndMul.forward_cuda`）——Agent 必须只读该方法，不是整个文件。
 
 ### 2.1 引擎代码结构与 Qwen3 入口
 
-实际工程目录（`./agent-infer`）关键文件：
+实际工程目录（本仓库根目录）关键文件：
 
 | 文件 | 作用 | 核心类 | 所属 Phase |
 |------|------|--------|-----------|

@@ -8,7 +8,7 @@
 # Human review: [待人类Diff]
 import json; import torch; torch.manual_seed(42)
 TRACE="physical_trace_tp4_rank0.json"
-CFG_PATH=".../models/qwen/Qwen3-8B/config.json"
+CFG_PATH="${MODEL_DIR}/config.json"
 
 
 def test_config_json_all_fields_present():

@@ -3,10 +3,6 @@
 你是 agent-infer 推理框架的生成 Agent。本目录是自包含的一次性知识包（prior knowledge）。
 **本目录就是工程根目录**——代码直接写入本目录下，不存在子仓库。
 
-⚠️ **工作区要求**：VSCode 必须仅打开本目录（`/home/honglin/inference-agent-system/`）为工程根目录。
-不可打开父目录 `/home/honglin`——这会导致 PYTHONPATH 漏入真实 meta-infer 路径，使 scripts/ 测试导入
-了错误的代码而假 PASS。
-
 ## 三层知识体系
 
 ```
@@ -32,37 +28,52 @@
 
 ## 环境约定
 
-本包内所有路径均为相对路径。外部依赖通过以下环境变量或约定定位：
+本包为开源知识包——不硬编码任何绝对路径。所有外部依赖由用户在首次使用时指定。
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `AGENT_INFER_ROOT` | `.`（本目录） | 推理框架代码仓库（本目录即是工程根目录） |
-| `MODEL_DIR` | `../models/<model-name>` | 模型权重目录（本包外同级） |
-| `CONDA_ENV` | 用户自配 | Conda 环境，需含 flash_attn + vLLM |
+| 变量 | 说明 | 获取方式 |
+|------|------|---------|
+| `AGENT_INFER_ROOT` | 推理框架代码仓库根目录（即本目录） | 自动检测：当前工作目录 |
+| `MODEL_DIR` | 模型权重目录 | **启动时询问用户** |
+| `PYTHON_PATH` | Python 环境路径（conda/venv 的 bin 目录） | **启动时询问用户** |
 
-**路径约定**：本包推荐以下目录布局：
+**推荐目录布局**：
 ```
 inference-agent-system/         ← 本包（工程根目录）
-├── engine/                     ← 生成产物（推理框架代码）
-├── llm_engine.py               ← 生成产物（引擎主循环）
-├── openai_tp_server.py         ← 生成产物（API 服务）
-├── phase_report/               ← 生成产物（审查报告）
+├── engine/                     ← 推理框架代码
+├── llm_engine.py               ← 引擎主循环
+├── openai_tp_server.py         ← API 服务
+├── phase_report/               ← 审查报告
 └── ...
-../models/                      ← 模型权重（本包外同级）
-    ├── qwen/Qwen3-8B/
-    └── deepseek-ai/DeepSeek-V2-Lite-Chat/
+<用户指定的模型目录>/
+    ├── config.json
+    ├── model.safetensors.index.json
+    └── ...
 ```
 
 ## 启动时强制动作
 
-0. **⚠️ 验证工作区隔离**：确认当前 VSCode 工作区仅打开本目录，不包含 `/home/honglin` 或 `/home/honglin/meta-infer`。用以下命令验证 PYTHONPATH 不会泄漏到外部：
+0. **询问用户环境配置**：在开始任何工作前，必须先确认以下路径（如果用户尚未提供）：
+   - **模型目录 (MODEL_DIR)**：模型权重文件所在的目录（如 `/data/models`）
+   - **Python 环境 (PYTHON_PATH)**：包含 `python`、`flash_attn`、`vLLM` 的 conda/venv 的 bin 目录（如 `/opt/conda/envs/meta/bin`）
+   
+   验证方式：
    ```bash
-   python -c "import sys; cwd='$(pwd)'; leaks=[p for p in sys.path if 'meta-infer' in p and cwd not in p]; assert not leaks, f'PYTHONPATH leak: {leaks}'; print('L0: workspace isolated')"
+   # 验证 MODEL_DIR
+   ls "${MODEL_DIR}/config.json" 2>&1 && echo "MODEL_DIR OK" || echo "MODEL_DIR 下找不到 config.json"
+   # 验证 Python 环境
+   "${PYTHON_PATH}/python" -c "import torch; import flash_attn; print(f'CUDA:{torch.cuda.is_available()} flash_attn OK')"
    ```
+
 1. 读取 `inference_blueprint.json`（先看 `agent_navigation`，再按需展开）
 2. 读取 `AGENT_SKILL.md`（含编码铁律、Phase-Script 绑定表、Debug 指南）
-3. 确认目标模型 `config.json`（architectures, rope_scaling, num_heads 等）
-4. 输出"模型路由结论"：Dense 还是 MLA+MoE
+3. 在运行 scripts/ 前设置环境：
+   ```bash
+   export AGENT_INFER_ROOT="$(pwd)"
+   export PATH="${PYTHON_PATH}:$PATH"
+   export PYTHONPATH="${AGENT_INFER_ROOT}:$PYTHONPATH"
+   ```
+4. 确认目标模型 `config.json`（architectures, rope_scaling, num_heads 等）
+5. 输出"模型路由结论"：Dense 还是 MLA+MoE
 
 ## 对抗子代理协作流（Superpowers 风格）
 
@@ -310,7 +321,8 @@ verification           → 主 Agent 动作
 ## 测试运行
 
 ```bash
-# 在本目录下执行
+# 在本目录下执行，先设置环境
+export PATH="${PYTHON_PATH}:$PATH"
 export PYTHONPATH="$(pwd):$PYTHONPATH"
 
 # Python 合约

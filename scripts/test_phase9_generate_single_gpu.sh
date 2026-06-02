@@ -16,7 +16,7 @@ echo "=== Phase 9: Single GPU Generate E2E ==="
 OUTPUT=$(python -c "
 import os,sys; os.environ['META_INFER_LOG_RANK0_ONLY']='1'; os.environ['META_INFER_CUDA_GRAPH']='0'
 from llm_engine import LLMEngine; from pathlib import Path
-engine=LLMEngine(model_dir=Path('.../models/qwen/Qwen3-8B'),inference_backend='qwen_tp',max_num_seqs=4)
+engine=LLMEngine(model_dir=Path('${MODEL_DIR}'),inference_backend='qwen_tp',max_num_seqs=4)
 out=engine.generate('苏州园林的特点是',max_new_tokens=24,temperature=0.0)
 sys.stdout.write('RESULT:'+out+'\n')
 " 2>&1 | grep '^RESULT:' | sed 's/^RESULT://')

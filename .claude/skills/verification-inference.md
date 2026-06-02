@@ -75,11 +75,11 @@ print(f'L0 PASS: rms_norm imported from {src_file} (inside {cwd})')
 
 ### 1. 确认环境
 ```bash
-# 锁定工作目录为知识包根目录（claude -p 进程的 CWD 不固定）
-cd /home/honglin/inference-agent-system
-# 使用 meta conda 环境（PATH 方式，避免 conda init 开销）
-export PATH=/home/honglin/miniconda3/envs/meta/bin:$PATH
-export PYTHONPATH="/home/honglin/inference-agent-system:$PYTHONPATH"
+# 锁定工作目录为知识包根目录
+cd "${AGENT_INFER_ROOT:-.}"
+# 使用用户指定的 Python 环境（PATH 方式，避免 conda init 开销）
+export PATH="${PYTHON_PATH}:$PATH"
+export PYTHONPATH="${AGENT_INFER_ROOT:-.}:${PYTHONPATH:-}"
 export META_INFER_LOG_RANK0_ONLY=1
 export META_INFER_CUDA_GRAPH=0
 ```
@@ -145,9 +145,9 @@ print('CompiledFunction traces: should be 0 for pure eager')
 
 #### 贪婪解码正确性（Phase 9+）
 ```bash
-PYTHONPATH="$(pwd):$PYTHONPATH" CUDA_VISIBLE_DEVICES=0 python -c "
+PYTHONPATH="${AGENT_INFER_ROOT:-.}:$PYTHONPATH" CUDA_VISIBLE_DEVICES=0 python -c "
 from llm_engine import LLMEngine; from pathlib import Path
-engine = LLMEngine(model_dir=Path('../models/qwen/Qwen3-8B'), inference_backend='qwen_tp', max_num_seqs=4)
+engine = LLMEngine(model_dir=Path('${MODEL_DIR}'), inference_backend='qwen_tp', max_num_seqs=4)
 out = engine.generate('苏州园林的特点是', max_new_tokens=24, temperature=0.0)
 expected = '（ ） A：建筑与园林结合 B：建筑与自然结合 C：建筑与山水结合 D：建筑'
 assert out == expected, f'GREEDY-ALIGN: output differs. Got={out!r} Expected={expected!r}'

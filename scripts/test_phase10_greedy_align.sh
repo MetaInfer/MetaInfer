@@ -29,7 +29,7 @@ echo "[GREEDY-ALIGN-001] Single GPU test..."
 OUTPUT=$(python -c "
 import os; os.environ['META_INFER_LOG_RANK0_ONLY']='1'; os.environ['META_INFER_CUDA_GRAPH']='0'
 from llm_engine import LLMEngine; from pathlib import Path
-engine = LLMEngine(model_dir=Path('.../models/qwen/Qwen3-8B'), inference_backend='qwen_tp', max_num_seqs=4)
+engine = LLMEngine(model_dir=Path('${MODEL_DIR}'), inference_backend='qwen_tp', max_num_seqs=4)
 out = engine.generate('${PROMPT}', max_new_tokens=${MAX_TOKENS}, temperature=0.0)
 import sys; sys.stdout.write('RESULT:' + out + '\n')
 " 2>&1 | grep '^RESULT:' | sed 's/^RESULT://')
@@ -54,7 +54,7 @@ if [ "${TP_SIZE}" -gt 1 ] && command -v torchrun &>/dev/null; then
 import os, sys; os.environ['META_INFER_LOG_RANK0_ONLY']='1'; os.environ['META_INFER_CUDA_GRAPH']='0'
 import torch.distributed as dist
 from llm_engine import LLMEngine; from pathlib import Path
-engine = LLMEngine(model_dir=Path('.../models/qwen/Qwen3-8B'), inference_backend='qwen_tp', max_num_seqs=4)
+engine = LLMEngine(model_dir=Path('${MODEL_DIR}'), inference_backend='qwen_tp', max_num_seqs=4)
 out = engine.generate('${PROMPT}', max_new_tokens=${MAX_TOKENS}, temperature=0.0)
 if int(os.environ.get('RANK','0')) == 0:
     assert out == '${EXPECTED}', f\"GREEDY-ALIGN-002: TP=4 output differs. Got={out!r}\"

@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 export META_INFER_LOG_RANK0_ONLY=1; export META_INFER_CUDA_GRAPH=0
-MODEL_DIR="${MODEL_DIR:-/home/honglin/models/qwen/Qwen3-8B}"
+MODEL_DIR="${MODEL_DIR:-${MODEL_DIR}}"
 TP_SIZE="${TP_SIZE:-4}"
 TRACE_SRC="Source: physical_trace_tp4_rank0.json [cuda_memory_per_rank] allocated_gb=4.69"
 

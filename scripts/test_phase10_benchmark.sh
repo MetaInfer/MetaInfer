@@ -14,7 +14,7 @@ TRACE_SRC="Source: CLAUDE.md §4 nocompile baseline 55.7 tok/s"
 
 TP_SIZE="${TP_SIZE:-4}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-MODEL_DIR="${MODEL_DIR:-.../models/qwen/Qwen3-8B}"
+MODEL_DIR="${MODEL_DIR:-${MODEL_DIR}}"
 
 echo "=== Phase 10: Performance Benchmark (TP=${TP_SIZE} nocompile) ==="
 
