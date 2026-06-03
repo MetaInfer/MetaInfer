@@ -588,6 +588,18 @@ SKIP_VLLM=1 CUDA_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 ROUNDS=10 output_len=8 REQUES
 |28 个门禁脚本|inference\-agent\-system/scripts/|
 
 
+## Citation
+
+If you find this project useful, please consider citing:
+
+```bibtex
+@software{metainfer_2026,
+  author  = {Honglin Wang and Xiaoning Huang and Mingheng Mi},
+  title   = {MetaInfer: LLM-as-Compiler — A Generative Inference Framework Built End-to-End by an Autonomous Multi-Agent Loop},
+  year    = {2026},
+  url     = {https://github.com/MetaInfer/MetaInfer}
+}
+```
 
 
 
