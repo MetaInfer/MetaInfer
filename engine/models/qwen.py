@@ -141,6 +141,12 @@ class QwenAttentionTP(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
 
+        # Pre-allocated output buffers for Q/K norm (decode path)
+        self.register_buffer('_q_norm_out', torch.empty(
+            1, self.num_heads, self.head_dim, dtype=torch.bfloat16), persistent=False)
+        self.register_buffer('_k_norm_out', torch.empty(
+            1, self.num_kv_heads, self.head_dim, dtype=torch.bfloat16), persistent=False)
+
         # Pre-allocated cu_seqlens buffers (persistent=False — not saved in state_dict)
         self.register_buffer('_cu_q', torch.tensor([0, 0], dtype=torch.int32), persistent=False)
         self.register_buffer('_cu_k', torch.tensor([0, 0], dtype=torch.int32), persistent=False)
@@ -199,10 +205,10 @@ class QwenAttentionTP(nn.Module):
                 max_blocks, 256, self.num_kv_heads, self.head_dim,
                 dtype=hidden_states.dtype, device=hidden_states.device)
             self._value_cache = torch.zeros_like(self._key_cache)
-            self._block_table = torch.zeros(
-                1, max_blocks, dtype=torch.int32, device=hidden_states.device)
+            self._block_table = torch.arange(
+                max_blocks, dtype=torch.int32, device=hidden_states.device).unsqueeze(0)
 
-        # 6. Flash attention (prefill) — K/V from projection, NOT from cache!
+        # 6. Flash attention (prefill) — K/V from projection output
         v_flat = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         self._cu_prefill[0] = 0
         self._cu_prefill[1] = num_tokens
@@ -210,16 +216,12 @@ class QwenAttentionTP(nn.Module):
             q_flat, k_flat, v_flat, self._cu_prefill, self._cu_prefill,
             num_tokens, num_tokens, causal=True)
 
-        # 7. Write KV to paged cache (VECTORIZED slot_mapping — NO for-loop .item()!)
-        num_blocks = (num_tokens + 255) // 256
-        self._block_table[0, :num_blocks] = torch.arange(
-            num_blocks, dtype=torch.int32, device=hidden_states.device)
-        _a = torch.arange(num_tokens, device=hidden_states.device)
-        slot_mapping = self._block_table[0, _a // 256] * 256 + (_a % 256)
+        # 7. Write KV to paged cache (direct assignment)
+        slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=hidden_states.device)
         kc_flat = self._key_cache.view(-1, self.num_kv_heads, self.head_dim)
         vc_flat = self._value_cache.view(-1, self.num_kv_heads, self.head_dim)
-        kc_flat.index_copy_(0, slot_mapping, k_flat)
-        vc_flat.index_copy_(0, slot_mapping, v_flat)
+        kc_flat[slot_mapping] = k_flat
+        vc_flat[slot_mapping] = v_flat
         self._kv_len_gpu[0] = num_tokens
 
         # 8. Output projection
@@ -242,11 +244,13 @@ class QwenAttentionTP(nn.Module):
         # 2. QKV projection + split
         q, k, v = self.qkv_proj(hidden_states)
 
-        # 3. Flatten to 3D + Q/K norm (P4: no intermediate 4D views, P3: view not reshape)
+        # 3. Flatten to 3D + Q/K norm (pre-allocated buffers for decode path)
         q_flat = q.view(S, self.num_heads, self.head_dim)
         k_flat = k.view(S, self.num_kv_heads, self.head_dim)
-        q_flat, _ = self.q_norm(q_flat)
-        k_flat, _ = self.k_norm(k_flat)
+        rms_norm(self._q_norm_out, q_flat, self.q_norm.weight, self.q_norm.eps)
+        rms_norm(self._k_norm_out, k_flat, self.k_norm.weight, self.k_norm.eps)
+        q_flat = self._q_norm_out
+        k_flat = self._k_norm_out
 
         # 4. RoPE
         rotary_embedding(positions, q_flat, k_flat, self.head_dim,
@@ -254,14 +258,14 @@ class QwenAttentionTP(nn.Module):
         q = q_flat.view(B, S, self.num_heads, self.head_dim)
         k = k_flat.view(B, S, self.num_kv_heads, self.head_dim)
 
-        # 5. Write K/V to cache at slot=kv_len
+        # 5. Write K/V to cache via index_copy_ (graph-compatible, aligns with meta-infer)
         self._slot_mapping_decode[0] = self._kv_len_gpu[0]
-        k_write = k.view(1, self.num_kv_heads, self.head_dim)
-        v_write = v.view(1, self.num_kv_heads, self.head_dim)
-        kc_flat = self._key_cache.view(-1, self.num_kv_heads, self.head_dim)
-        vc_flat = self._value_cache.view(-1, self.num_kv_heads, self.head_dim)
-        kc_flat.index_copy_(0, self._slot_mapping_decode, k_write)
-        vc_flat.index_copy_(0, self._slot_mapping_decode, v_write)
+        k_w = k.view(1, self.num_kv_heads, self.head_dim)
+        v_w = v.view(1, self.num_kv_heads, self.head_dim)
+        self._key_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
+            0, self._slot_mapping_decode, k_w)
+        self._value_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
+            0, self._slot_mapping_decode, v_w)
         self._kv_len_gpu[0] += 1
 
         # 6. flash_attn_with_kvcache (read from paged cache)
@@ -294,6 +298,7 @@ class QwenMLPTP(nn.Module):
         super().__init__()
         if tp_size is None:
             tp_size = get_tp_size()
+        self.local_intermediate = cfg.intermediate_size // get_tp_size()
 
         self.gate_up_proj = MergedColumnParallelLinear(
             cfg.hidden_size, cfg.intermediate_size,
@@ -301,11 +306,18 @@ class QwenMLPTP(nn.Module):
         self.down_proj = RowParallelLinear(
             cfg.intermediate_size, cfg.hidden_size,
             tp_size=tp_size, bias=False)
+        # Pre-allocated output buffer for decode path (B=1, S=1)
+        self.register_buffer('_silu_out', torch.empty(
+            1, 1, self.local_intermediate, dtype=torch.bfloat16), persistent=False)
 
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
         half_ch = gate_up.shape[-1] // 2
-        out = torch.empty_like(gate_up[..., :half_ch])
+        # Reuse pre-allocated buffer when shape matches (decode: [1, 1, local])
+        if x.shape[0] == 1 and x.shape[1] == 1:
+            out = self._silu_out
+        else:
+            out = torch.empty(x.shape[0], x.shape[1], half_ch, dtype=x.dtype, device=x.device)
         silu_and_mul(out, gate_up)
         return self.down_proj(out)
 
@@ -470,6 +482,7 @@ class QwenForCausalLMTP(nn.Module):
         if device is not None:
             self.to(device=device, dtype=dtype)
 
+    @torch.inference_mode()
     def forward(self, input_ids, past_key_values=None, position_offset=0, max_seq_len=528):
         """Prefill/decode dispatch — blueprint model_forward_pseudocode exact copy.
 
@@ -516,6 +529,7 @@ class QwenForCausalLMTP(nn.Module):
         logits = self.lm_head(hidden_states)  # [B, S, vocab_size]
         return logits, kv_lens
 
+    @torch.inference_mode()
     def forward_decode(self, input_ids, positions, kv_len, max_seq_len):
         """Decode forward — standalone method for runner compatibility.
 

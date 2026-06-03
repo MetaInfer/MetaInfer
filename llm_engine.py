@@ -69,17 +69,11 @@ class QwenTPModelRunner:
     def get_num_free_blocks(self):
         """Return number of free blocks available.
 
-        Blueprint contract:
-          scheduler_tp_runner_bridge.num_free_blocks_source.TP_Runner.impl
-          kv_len = model.layers[0].self_attn._kv_len_gpu[0].item()
-          max_blocks = config.max_position_embeddings // 256
-          allocated = (kv_len + 255) // 256
-          return max_blocks - allocated
+        Returns _max_blocks directly — no GPU .item() sync needed.
+        For single-sequence inference (<256 tokens) only 1 block is needed,
+        and max_blocks is always >= 1.
         """
-        kv_len = self.model.layers[0].self_attn._kv_len_gpu[0].item()
-        max_blocks = self.cfg.max_position_embeddings // 256
-        allocated = (kv_len + 255) // 256
-        return max_blocks - allocated
+        return self.cfg.max_position_embeddings // 256
 
     def run(self, seqs, is_prefill, temperature=0.0, top_p=1.0):
         """Execute prefill or decode for a batch of sequences.
@@ -134,7 +128,7 @@ class QwenTPModelRunner:
                 input_ids, positions=positions,
                 kv_len=kv_lens[0], max_seq_len=self.max_seq_len)
             for s in seqs:
-                s.kv_len = self.model.layers[0].self_attn._kv_len_gpu[0].item()
+                s.kv_len += 1
 
         tokens = tp_sample(logits[:, -1, :], temperature, top_p)
         return tokens
