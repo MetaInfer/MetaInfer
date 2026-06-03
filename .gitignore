@@ -49,6 +49,9 @@ Thumbs.db
 .claude/sessions/
 .claude/worktrees/
 
+# Profiler trace intermediate files (large)
+perf_iteration/trace_*/
+
 # Misc Python
 .mypy_cache/
 .pytest_cache/
