@@ -446,11 +446,11 @@ def main():
     print(f"\n  {passed}/{total} 通过")
 
     if failures:
-        print(f"\n  失败项:")
+        print("\n  失败项:")
         for f in failures:
             print(f"    ❌ {f}")
     else:
-        print(f"\n  🎉 全部通过!")
+        print("\n  🎉 全部通过!")
 
     # Save JSON results
     out_path = PROJECT_ROOT / "scripts" / "adversarial_results.json"

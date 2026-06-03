@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from .kv_cache import make_kv_cache
 from .model import Qwen3Config
 from .sampler import temperature_sample
 from .tokenizer import Tokenizer

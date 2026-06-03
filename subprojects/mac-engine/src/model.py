@@ -7,9 +7,7 @@ Built entirely with mlx.core and mlx.nn.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn

@@ -23,11 +23,9 @@ import mlx.nn as nn
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.kv_cache import KVCache, make_kv_cache
-from src.model import Qwen3Config, Qwen3ForCausalLM, Qwen3Model
+from src.kv_cache import make_kv_cache
 from src.weights import load_qwen3_model
 from src.tokenizer import Tokenizer
-from src.sampler import greedy_sample
 
 MODEL_PATH = str(Path.home() / ".cache/modelscope/hub/models/Qwen/Qwen3-8B/")
 
@@ -149,7 +147,7 @@ def main():
     print(f"  embed_tokens: {t_emb:.4f} ms")
 
     # ── 5. Per-layer timing ────────────────────────────────────────
-    print(f"\n[5/9] 逐层计时 (×30 each)...")
+    print("\n[5/9] 逐层计时 (×30 each)...")
 
     cache_layer = make_kv_cache(N_LAYERS)
     h = model.model.embed_tokens(input_ids)
@@ -165,8 +163,8 @@ def main():
 
     layer_times = []
     for i, layer in enumerate(model.model.layers):
-        def _fn(l=layer, hd=h_dec, c=cache_layer[i]):
-            r = l(hd, mask=None, cache=c)
+        def _fn(lyr=layer, hd=h_dec, c=cache_layer[i]):
+            r = lyr(hd, mask=None, cache=c)
             mx.eval(r)
         t = time_single(_fn, warmup=3, repeats=30)
         layer_times.append(t)
@@ -181,7 +179,7 @@ def main():
     mx.clear_cache()
 
     # ── 6. Layer 0 breakdown ───────────────────────────────────────
-    print(f"\n[6/9] Layer 0 内部拆解...")
+    print("\n[6/9] Layer 0 内部拆解...")
 
     # Setup layer 0 cache with prefill
     cache0 = make_kv_cache(1)
@@ -382,7 +380,7 @@ def main():
     print(f"  MLP 完整调用:          {t_mlp:.4f} ms")
 
     # ── 7. Final Norm + LM Head + Sampling ────────────────────────
-    print(f"\n[7/9] Final Norm + LM Head + Sampling...")
+    print("\n[7/9] Final Norm + LM Head + Sampling...")
 
     cache_final = make_kv_cache(N_LAYERS)
     _h = model.model.embed_tokens(input_ids)
@@ -435,7 +433,7 @@ def main():
     mx.clear_cache()
 
     # ── 8. Python overhead ────────────────────────────────────────
-    print(f"\n[8/9] Python 开销...")
+    print("\n[8/9] Python 开销...")
     t_tok_decode = 0.0
     for _ in range(50):
         t0 = time.perf_counter_ns()
@@ -445,7 +443,7 @@ def main():
     print(f"  tokenizer.decode(5): {t_tok_decode:.4f} ms")
 
     # ── 9. Memory bandwidth ───────────────────────────────────────
-    print(f"\n[9/9] 内存带宽...")
+    print("\n[9/9] 内存带宽...")
     dev_info = mx.device_info()
     print(f"  Device: {dev_info.get('name', 'unknown')}")
     print(f"  Memory: {dev_info.get('memory_size', 0) / 1e9:.1f} GB")
@@ -526,7 +524,7 @@ def main():
     post_norm_gpu_est = max(post_norm_gpu_est, 0)
     res_gpu_est = max(res_gpu_est, 0)
 
-    single_layer_gpu = attn_gpu_est + mlp_gpu_est + norm_gpu_est + post_norm_gpu_est + res_gpu_est * 2
+    _ = attn_gpu_est + mlp_gpu_est + norm_gpu_est + post_norm_gpu_est + res_gpu_est * 2
 
     print("\n")
     print("╔" + "═" * 70 + "╗")

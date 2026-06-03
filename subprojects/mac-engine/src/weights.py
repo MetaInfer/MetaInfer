@@ -8,14 +8,11 @@ weight files and maps them into the MLX model via model.update().
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
-import mlx.nn as nn
 
-from .kv_cache import make_kv_cache
 from .model import Qwen3Config, Qwen3ForCausalLM
 
 
