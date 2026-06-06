@@ -11,3 +11,6 @@ t0 = time.time()
 out = engine.generate('苏州园林的特点是', max_new_tokens=32, temperature=0.0)
 elapsed = time.time() - t0
 print(f'Elapsed: {elapsed:.3f}s, Throughput: {32/elapsed:.1f} tok/s, Correct: {out}')
+
+
+# CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 checkagetn.py
