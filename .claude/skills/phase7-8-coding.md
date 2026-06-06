@@ -6,7 +6,7 @@
 
 ## 概述
 
-依次完成 Phase 7（权重加载）→ Phase 8（框架外壳），每 Phase 独立走完 implementer→spec→verif→汇总。
+依次完成 Phase 7（权重加载）→ Phase 8（框架外壳）。每个 Phase 通过 spawn phase-runner 子代理完成内部对抗审查，主 Agent 只做调度和防假 PASS 抽查。
 
 ---
 
@@ -19,7 +19,7 @@
 
 ## 你的角色
 
-读取本目录的 CLAUDE.md。本次依次完成 Phase 7 → Phase 8，每 Phase 独立走完 implementer→spec→verif→汇总。
+你是**主 Agent**——只做高层调度和抽查，不亲自 orchestrate 三角色。每个 Phase 通过 spawn phase-runner 子代理执行，你只看到结构化摘要，保持上下文轻量。
 
 ## Phase 7: 权重加载
 
@@ -77,8 +77,48 @@ Phase 8 的组件（Scheduler/Sequence/Sampler/BlockManager）与模型层物理
 2. **block_size 硬编码 16**: TP 路径未注入 256
 3. **TP 各 rank 独立采样**: 未做 rank0+broadcast → KV 不同步 → NCCL 崩溃
 
+## 执行方式
+
+对 Phase 7 和 Phase 8，分别执行以下循环：
+
+### 步骤 1：spawn phase-runner
+
+```
+Agent(
+  subagent_type: "general-purpose",
+  description: "Phase N runner",
+  prompt: """
+Phase N: [Phase名称]。
+读取 .claude/skills/phase-runner.md 了解你的角色边界。
+读取 .claude/skills/phase7-8-coding.md 了解本 Phase 的任务细节。
+执行完整 implementer→spec→verif 对抗审查链（模式 A：首次执行）。
+"""
+)
+```
+
+phase-runner 返回结构化摘要后，进入步骤 2。
+
+### 步骤 2：主 Agent 防假 PASS 抽查
+
+```bash
+RANDOM_SCRIPT=$(ls scripts/test_phase${N}_*.py scripts/test_phase${N}_*.sh 2>/dev/null | shuf -n1)
+ACTUAL_OUTPUT=$(python "${RANDOM_SCRIPT}" 2>&1 || bash "${RANDOM_SCRIPT}" 2>&1)
+```
+
+读取 `./phase_report/PHASE${N}_VERIFICATION_REPORT.md` 中该脚本的原始 stdout 比对：
+- **一致** ✅ → 该 Phase 交付，进入步骤 3
+- **不一致** ❌ → 写 `./phase_report/PHASE${N}_SPOT_CHECK_FAIL.md` → 回到步骤 1（重试模式，模式 B）。连续 5 次驳回 → 停止，向人类报告。
+
+### 步骤 3：写 Phase 汇总
+
+抽查通过后，写 `./phase_report/PHASE${N}_SUMMARY.md`，含 PID 交叉验证和抽查结果。然后进入下一 Phase。
+
 ## 关键约束（每 Phase 均适用）
 
-- implementer→spec(L1)→verif(L1+L2 回归)→汇总。串行不可跳过
-- 主 Agent 禁止降级子代理结论
+- 主 Agent 只做调度 + 抽查，不亲自 orchestrate 三角色
+- phase-runner 内部 implementer/spec-reviewer/verification 三角色物理隔离（Shell claude -p）
+- 审查串行：spec ✅ 才到 verif。spec ❌ 时 verif 不启动
+- 主 Agent 抽查是最终裁定——不一致就驳回，连续 5 次才停止
+- 主 Agent 禁止降级/修改子代理结论
 - PID 互不相同
+- scripts/ 不可修改。测试不过 → 改实现代码，不改脚本

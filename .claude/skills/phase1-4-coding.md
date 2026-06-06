@@ -6,7 +6,7 @@
 
 ## 概述
 
-依次完成 Phase 1 → Phase 2 → Phase 3 → Phase 4 的编码任务，严格按照 implementer → spec-reviewer → verification 对抗子代理协作流执行。
+依次完成 Phase 1 → Phase 2 → Phase 3 → Phase 4 的编码任务。每个 Phase 通过 spawn phase-runner 子代理完成内部对抗审查，主 Agent 只做调度和防假 PASS 抽查。
 
 ---
 
@@ -18,7 +18,7 @@
 
 ## 你的角色
 
-读取本目录的 CLAUDE.md，理解你的角色、三层知识体系和对抗子代理协作流。
+你是**主 Agent**——只做高层调度和抽查，不亲自 orchestrate 三角色。每个 Phase 通过 spawn phase-runner 子代理执行，你只看到结构化摘要，保持上下文轻量。
 
 ## 本次任务
 
@@ -29,33 +29,68 @@
   Phase 3: TP 线性层（Column/Row/Merged/QKV Parallel Linear）
   Phase 4: TP Embedding（VocabParallelEmbedding + ParallelLMHead）
 
-## 每 Phase 的执行步骤
+## 执行方式
 
-### 步骤 1：implementer 子代理
+本 Phase 使用 **phase-runner 子代理** 完成编码和对抗审查。你（主 Agent）只做高层调度和防假 PASS 抽查——不再亲自 orchestrate implementer/spec/verif，避免上下文膨胀导致 compact 后约束丢失。
 
-使用 Agent 工具 spawn implementer（subagent_type: general-purpose），读取 .claude/skills/implementer-inference.md。
-implementer 只写代码，不跑测试。完成后写出 ./phase_report/PHASE<N>_IMPLEMENTER_REPORT.md（含 PID、Role、Timestamp、Phase=N，status=SUBMITTED）。
+对每个 Phase（1, 2, 3, 4），依次执行以下循环：
 
-### 步骤 2：spec-reviewer（Shell claude -p 独立审查）
+### 步骤 1：spawn phase-runner（首次）
 
-```bash
-claude -p --allowedTools "Read(*),Write(*),Bash(*)" "读取 ${AGENT_INFER_ROOT}/.claude/skills/spec-reviewer-inference.md。审查 ./engine/ 下的代码。对照 inference_blueprint.json 中 Phase N 的契约逐条核验。将 SPEC_REVIEW_REPORT.md 写入 ./phase_report/（文件名前缀 PHASE<N>_）。文件头含 PID（os.getpid()）、Role=spec-reviewer、Timestamp。"
+```
+Agent(
+  subagent_type: "general-purpose",
+  description: "Phase N runner",
+  prompt: """
+Phase N: [Phase名称]。
+读取 .claude/skills/phase-runner.md 了解你的角色边界。
+读取 .claude/skills/phase1-4-coding.md 了解本 Phase 的任务细节。
+执行完整 implementer→spec→verif 对抗审查链（模式 A：首次执行）。
+"""
+)
 ```
 
-如果 spec ❌ → 打回 implementer 重写，verification 不启动。如果 ✅ → 进入步骤 3。
+phase-runner 返回结构化摘要后，进入步骤 2。
 
-### 步骤 3：verification（Shell claude -p 独立验收，仅 spec ✅ 后执行）
+### 步骤 2：主 Agent 防假 PASS 抽查
+
+从当前 Phase 的 scripts/ 中随机抽取 1 个脚本，亲自重跑：
 
 ```bash
-claude -p --allowedTools "Read(*),Write(*),Bash(*)" "读取 ${AGENT_INFER_ROOT}/.claude/skills/verification-inference.md。验收 Phase N：运行 scripts/ 下 Phase N 对应的全部测试脚本。Phase 3+ 必须额外做跨 Phase 回归（重跑前序所有 Phase 的 scripts/）。将 VERIFICATION_REPORT.md 写入 ./phase_report/（文件名前缀 PHASE<N>_）。文件头含 PID（os.getpid()）、Role=verification、Timestamp。"
+# 随机选 1 个脚本
+RANDOM_SCRIPT=$(ls scripts/test_phase${N}_*.py scripts/test_phase${N}_*.sh 2>/dev/null | shuf -n1)
+# 运行
+ACTUAL_OUTPUT=$(python "${RANDOM_SCRIPT}" 2>&1 || bash "${RANDOM_SCRIPT}" 2>&1)
 ```
 
-### 步骤 4：汇总
+读取 `./phase_report/PHASE${N}_VERIFICATION_REPORT.md`，找到该脚本的原始 stdout，与 ACTUAL_OUTPUT 比对：
+- **一致** ✅ → 该 Phase 交付，进入步骤 3
+- **不一致** ❌ → 写 `./phase_report/PHASE${N}_SPOT_CHECK_FAIL.md`（失败脚本、期望 vs 实际），回到步骤 1 但用重试模式：
 
-步骤 3.5: 主 Agent 抽查（verification 返回后）：从 Phase N 的 scripts/ 中随机抽 1 个重跑，比对 verification 报告的原始 stdout。一致 → 进入步骤 4。不一致 → 整个验收作废，重新 spawn verification。
-步骤 4: 主 Agent 汇总——读取三个报告和抽查结果，验证 PID 互不相同，原样汇总入 ./phase_report/PHASE{N}_SUMMARY.md。禁止降级/修改子代理结论。
+```
+Agent(
+  subagent_type: "general-purpose",
+  description: "Phase N runner (RETRY)",
+  prompt: """
+Phase N RETRY。
+读取 ./phase_report/PHASE${N}_SPOT_CHECK_FAIL.md 了解失败原因。
+读取 .claude/skills/phase-runner.md 了解你的角色边界。
+读取 .claude/skills/phase1-4-coding.md 了解任务细节。
+执行完整 implementer→spec→verif 修复链（模式 B：重试修复，不得跳过任何环节）。
+"""
+)
+```
 
-代码直接写入本目录下（`./engine/`、`./llm_engine.py`、`./openai_tp_server.py`）。
+重试后再次抽查（换一个脚本）。连续 5 次驳回 → 停止，向人类报告全部 5 次驳回记录。
+
+### 步骤 3：写 Phase 汇总
+
+抽查通过后，写 `./phase_report/PHASE${N}_SUMMARY.md`，含：
+- PID 交叉验证（implementer/spec-reviewer/verification 的 PID 互不相同）
+- 抽查脚本和结果
+- 原样转述子代理结论（禁止降级/修改）
+
+然后 `[PROGRESS] Phase N 完成`，进入下一 Phase。
 
 ## Phase-Script 绑定
 
@@ -77,15 +112,11 @@ claude -p --allowedTools "Read(*),Write(*),Bash(*)" "读取 ${AGENT_INFER_ROOT}/
 
 ## 关键约束
 
-- implementer 不跑测试、不判 PASS（状态为 SUBMITTED）
-- spec-reviewer 和 verification 通过独立的 Shell claude -p 进程执行（新的 PID）
-- 审查串行：先 spec-reviewer，通过后才到 verification。spec ❌ 时 verification 不启动
-- 主 Agent 是信使非裁判——禁止降级/修改子代理结论。禁止"有条件交付"
-- 三个子代理的 PID 必须互不相同
+- 主 Agent 只做调度 + 抽查，不亲自 orchestrate 三角色
+- phase-runner 内部 implementer/spec-reviewer/verification 三角色物理隔离（Shell claude -p）
+- 审查串行：spec ✅ 才到 verif。spec ❌ 时 verif 不启动
+- 主 Agent 抽查是最终裁定——不一致就驳回，连续 5 次才停止
+- 主 Agent 禁止降级/修改子代理结论。禁止"有条件交付"
 - scripts/ 不可修改。测试不过 → 改实现代码，不改脚本
 - Phase 3 开始，verification 必须做跨 Phase 回归（重跑前序 Phase 的全部 scripts/）
-
-## 防长上下文遗忘机制
-
-每完成一个 Phase 后，重新打开 AGENT_SKILL.md §2.0.1 确认下一 Phase 的知识链路。
-每完成一个 Phase 后，输出一行进度：`[PROGRESS] Phase N 完成，spec=✅/❌，verif=✅/❌`。
+- 代码直接写入本目录下（`./engine/`、`./llm_engine.py`、`./openai_tp_server.py`）

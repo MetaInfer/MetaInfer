@@ -6,7 +6,7 @@
 
 ## 概述
 
-Phase 11 性能优化——不改变功能行为，只改实现方式。采用**审计-修复-再审计**循环，替代传统的 implementer→spec→verif 流程。
+Phase 11 性能优化——不改变功能行为，只改实现方式。通过 spawn phase-runner 子代理执行审计闭环，主 Agent 只做调度和 benchmark 抽查。
 
 ---
 
@@ -14,7 +14,7 @@ Phase 1-10 已完成，TP=4 推理正确性字字对齐。当前吞吐仅 ~10 to
 
 ## 你的角色
 
-读取本目录的 CLAUDE.md。本次是性能优化 Phase——不改变功能行为，只改实现方式。
+你是**主 Agent**——只做高层调度和 benchmark 抽查。通过 spawn phase-runner 子代理（审计模式）执行 Phase 11 的 audit → fix → reaudit → benchmark 闭环，你只看到结构化摘要，保持上下文轻量。
 
 ## 强制审计闭环（不可跳过）
 
@@ -105,9 +105,61 @@ O1-O6 全部 PASS + throughput > 50 tok/s → Phase 11 完成。写 ./phase_repo
 - L1: 运行 Phase 11 scripts（throughput + profiler）
 - L2: 跨 Phase 回归——**重跑 Phase 1-10 全部 26 个 scripts/**！性能优化不能引入正确性回归
 
+## 执行方式
+
+### 步骤 1：spawn phase-runner（审计模式）
+
+```
+Agent(
+  subagent_type: "general-purpose",
+  description: "Phase 11 runner (audit)",
+  prompt: """
+Phase 11: 性能优化（审计模式）。
+读取 .claude/skills/phase-runner.md 了解你的角色边界（使用模式 C：审计闭环）。
+读取 .claude/skills/phase11-coding.md 了解审计规则和 O1-O9 优化清单。
+执行 STEP-AUDIT → STEP-FIX → STEP-REAUDIT → STEP-BENCHMARK 完整闭环。
+"""
+)
+```
+
+phase-runner 返回结构化摘要后，进入步骤 2。
+
+### 步骤 2：主 Agent 防假 PASS 抽查
+
+从 Phase 11 scripts 中随机抽 1 个（或两个都跑），亲自验证：
+
+```bash
+# 抽查 benchmark（phase-runner 的吞吐数据）
+python scripts/test_phase11_throughput.py 2>&1
+# 或抽查 profiler
+bash scripts/test_phase11_profiler.sh 2>&1
+```
+
+读取 `./phase_report/PHASE11_IMPLEMENTER_REPORT.md` 中 phase-runner 记录的 benchmark 数据，与亲自跑的结果比对：
+- **一致**（吞吐差距 ≤ 2%）✅ → Phase 11 交付，写 `./phase_report/PHASE11_SUMMARY.md`
+- **不一致** ❌ → 写 `./phase_report/PHASE11_SPOT_CHECK_FAIL.md` → 回到步骤 1（重试模式）：
+
+```
+Agent(
+  subagent_type: "general-purpose",
+  description: "Phase 11 runner (RETRY audit)",
+  prompt: """
+Phase 11 RETRY。
+读取 ./phase_report/PHASE11_SPOT_CHECK_FAIL.md 了解失败原因。
+读取 .claude/skills/phase-runner.md 了解你的角色边界（使用模式 D：审计重试）。
+读取 .claude/skills/phase11-coding.md 了解审计规则。
+从 STEP-AUDIT 重新开始完整审计闭环（不得跳过任何步骤）。
+"""
+)
+```
+
+重试后再次抽查。连续 5 次驳回 → 停止，向人类报告。
+
 ## 关键约束
 
+- 主 Agent 只做调度 + 抽查，不亲自 execute 审计闭环
 - STEP-AUDIT → STEP-FIX → STEP-REAUDIT → STEP-BENCHMARK → STEP-DONE 不可跳过
 - O7 的 .contiguous() 不能删除——vLLM kernel 要求输入连续（ROUND_1 Error #2 已验证）
 - 不改变功能行为，只改实现方式
 - 如果某个 O 引入正确性回归 → 回滚 → 标记为 BLOCKED → 继续其他 O
+- 连续 5 次驳回 → 停止，向人类报告全部 5 次驳回记录

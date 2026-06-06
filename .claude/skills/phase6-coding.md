@@ -6,7 +6,7 @@
 
 ## 概述
 
-构建 Phase 6: MLP + Decoder Layer —— 整个流水线中**错误密度与 Phase 5 并列最高的阶段**。
+构建 Phase 6: MLP + Decoder Layer —— 整个流水线中**错误密度与 Phase 5 并列最高的阶段**。通过 spawn phase-runner 子代理完成内部对抗审查，主 Agent 只做调度和抽查。
 
 ---
 
@@ -23,7 +23,7 @@
 
 ## 你的角色
 
-读取本目录的 CLAUDE.md。Phase 6 是整个流水线中**错误密度与 Phase 5 并列最高的阶段**。
+你是**主 Agent**——只做高层调度和抽查，不亲自 orchestrate 三角色。通过 spawn phase-runner 子代理执行 Phase 6，你只看到结构化摘要，保持上下文轻量。
 
 ## 本次任务
 
@@ -43,12 +43,51 @@
 过去 V5/V15/V17 三轮审计 Agent 反复犯的错误：将 post_mlp 的 weight 错误引用为下一层的 input_layernorm.weight。
 用 id() 做 identity check（非 value check），确保每层只用自己的 weight。
 
-## 执行步骤
+## 执行方式
 
-步骤 1: implementer → ./phase_report/PHASE6_IMPLEMENTER_REPORT.md（SUBMITTED）
-步骤 2: spec-reviewer → ./phase_report/PHASE6_SPEC_REVIEW_REPORT.md（Shell claude -p，独立 PID）
-步骤 3: verification → ./phase_report/PHASE6_VERIFICATION_REPORT.md（L1+L2，独立 PID）
-步骤 4: 主 Agent 汇总（含步骤 3.5 防假 PASS 抽查）→ ./phase_report/PHASE6_SUMMARY.md（PID 交叉验证）
+### 步骤 1：spawn phase-runner
+
+```
+Agent(
+  subagent_type: "general-purpose",
+  description: "Phase 6 runner",
+  prompt: """
+Phase 6: MLP + Decoder Layer。
+读取 .claude/skills/phase-runner.md 了解你的角色边界。
+读取 .claude/skills/phase6-coding.md 了解本 Phase 的任务细节。
+执行完整 implementer→spec→verif 对抗审查链（模式 A：首次执行）。
+"""
+)
+```
+
+phase-runner 返回结构化摘要后，进入步骤 2。
+
+### 步骤 2：主 Agent 防假 PASS 抽查
+
+```bash
+RANDOM_SCRIPT=$(ls scripts/test_phase6_*.py scripts/test_phase6_*.sh 2>/dev/null | shuf -n1)
+ACTUAL_OUTPUT=$(python "${RANDOM_SCRIPT}" 2>&1 || bash "${RANDOM_SCRIPT}" 2>&1)
+```
+
+读取 `./phase_report/PHASE6_VERIFICATION_REPORT.md` 中该脚本的原始 stdout 比对：
+- **一致** ✅ → Phase 6 交付，写 `./phase_report/PHASE6_SUMMARY.md`
+- **不一致** ❌ → 写 `./phase_report/PHASE6_SPOT_CHECK_FAIL.md` → 回到步骤 1（重试模式）：
+
+```
+Agent(
+  subagent_type: "general-purpose",
+  description: "Phase 6 runner (RETRY)",
+  prompt: """
+Phase 6 RETRY。
+读取 ./phase_report/PHASE6_SPOT_CHECK_FAIL.md 了解失败原因。
+读取 .claude/skills/phase-runner.md 了解你的角色边界。
+读取 .claude/skills/phase6-coding.md 了解任务细节。
+执行完整 implementer→spec→verif 修复链（模式 B：重试修复，不得跳过任何环节）。
+"""
+)
+```
+
+重试后换一个脚本再次抽查。连续 5 次驳回 → 停止，向人类报告。
 
 ## Phase Script 绑定
 
@@ -81,8 +120,11 @@ verification L2: 重跑 Phase 1-5 的全部 scripts/（共 11 个脚本）。
 
 ## 关键约束
 
-- implementer 不跑测试、不判 PASS
-- spec 先审 → ✅ 才到 verif
-- verif 做 L1+L2
-- 主 Agent 禁止降级子代理结论
+- 主 Agent 只做调度 + 抽查，不亲自 orchestrate 三角色
+- phase-runner 内部 implementer/spec-reviewer/verification 三角色物理隔离（Shell claude -p）
+- 审查串行：spec ✅ 才到 verif。spec ❌ 时 verif 不启动
+- verif 做 L1（Phase 6 脚本）+ L2（Phase 1-5 回归）
+- 主 Agent 抽查是最终裁定——不一致就驳回，连续 5 次才停止
+- 主 Agent 禁止降级/修改子代理结论
 - PID 互不相同
+- scripts/ 不可修改。测试不过 → 改实现代码，不改脚本

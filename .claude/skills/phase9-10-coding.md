@@ -6,7 +6,7 @@
 
 ## 概述
 
-这是最后两个 Phase——Phase 9 将 Scheduler 和 ModelRunner 胶合为 LLMEngine，Phase 10 做最终验收。
+这是最后两个 Phase——Phase 9 将 Scheduler 和 ModelRunner 胶合为 LLMEngine，Phase 10 做最终验收。每个 Phase 通过 spawn phase-runner 子代理完成内部对抗审查，主 Agent 只做调度和防假 PASS 抽查。
 
 ---
 
@@ -19,7 +19,7 @@
 
 ## 你的角色
 
-读取本目录的 CLAUDE.md。这是最后两个 Phase——Phase 9 将 Scheduler 和 ModelRunner 胶合为 LLMEngine，Phase 10 做最终验收。
+你是**主 Agent**——只做高层调度和抽查，不亲自 orchestrate 三角色。每个 Phase 通过 spawn phase-runner 子代理执行，你只看到结构化摘要，保持上下文轻量。
 
 ## Phase 9: 引擎集成
 
@@ -75,18 +75,50 @@
 - HCU/VRAM 监控: 4 卡 VRAM% 同量级、HCU% 峰值 > 0
 - **无证据 = 假推理 = 验收失败**
 
-## 执行步骤（每 Phase 独立）
+## 执行方式
 
-步骤 1: implementer → ./phase_report/PHASE<N>_IMPLEMENTER_REPORT.md（SUBMITTED）
-步骤 2: spec-reviewer → ./phase_report/PHASE<N>_SPEC_REVIEW_REPORT.md（Shell claude -p --allowedTools，独立 PID）
-步骤 3: verification → ./phase_report/PHASE<N>_VERIFICATION_REPORT.md（Shell claude -p --allowedTools，独立 PID。Phase 9: L1+L2。Phase 10: L1+L2+L3 全量）
-步骤 4: 主 Agent 汇总（含步骤 3.5 防假 PASS 抽查）→ ./phase_report/PHASE{N}_SUMMARY.md（PID 验证 + 原样转述）
+对 Phase 9 和 Phase 10，分别执行以下循环：
+
+### 步骤 1：spawn phase-runner
+
+```
+Agent(
+  subagent_type: "general-purpose",
+  description: "Phase N runner",
+  prompt: """
+Phase N: [Phase名称]。
+读取 .claude/skills/phase-runner.md 了解你的角色边界。
+读取 .claude/skills/phase9-10-coding.md 了解本 Phase 的任务细节。
+执行完整 implementer→spec→verif 对抗审查链（模式 A：首次执行）。
+"""
+)
+```
+
+phase-runner 返回结构化摘要后，进入步骤 2。
+
+### 步骤 2：主 Agent 防假 PASS 抽查
+
+```bash
+RANDOM_SCRIPT=$(ls scripts/test_phase${N}_*.py scripts/test_phase${N}_*.sh 2>/dev/null | shuf -n1)
+ACTUAL_OUTPUT=$(python "${RANDOM_SCRIPT}" 2>&1 || bash "${RANDOM_SCRIPT}" 2>&1)
+```
+
+读取 `./phase_report/PHASE${N}_VERIFICATION_REPORT.md` 中该脚本的原始 stdout 比对：
+- **一致** ✅ → 该 Phase 交付，进入步骤 3
+- **不一致** ❌ → 写 `./phase_report/PHASE${N}_SPOT_CHECK_FAIL.md` → 回到步骤 1（重试模式，模式 B）。连续 5 次驳回 → 停止，向人类报告。
+
+### 步骤 3：写 Phase 汇总
+
+抽查通过后，写 `./phase_report/PHASE${N}_SUMMARY.md`，含 PID 交叉验证和抽查结果。然后进入下一 Phase。
 
 ## 关键约束
 
-- implementer 不跑测试、不判 PASS
-- spec 先审 → ✅ 才到 verif
+- 主 Agent 只做调度 + 抽查，不亲自 orchestrate 三角色
+- phase-runner 内部 implementer/spec-reviewer/verification 三角色物理隔离（Shell claude -p）
+- 审查串行：spec ✅ 才到 verif。spec ❌ 时 verif 不启动
 - Phase 9 verif L2: 重跑 Phase 1-8 全部 scripts/（共 22 个脚本）
 - Phase 10 verif L3: **强制** profiler + HCU 证据
-- 主 Agent 禁止降级子代理结论
+- 主 Agent 抽查是最终裁定——不一致就驳回，连续 5 次才停止
+- 主 Agent 禁止降级/修改子代理结论
 - PID 互不相同
+- scripts/ 不可修改。测试不过 → 改实现代码，不改脚本

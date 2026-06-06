@@ -178,19 +178,29 @@ Phase 7: 权重加载     → Phase 8: 框架外壳  → Phase 9: 引擎集成
 | Phase 11 性能优化 | `test_phase11_throughput.py` + `test_phase11_profiler.sh` | 2 |
 | **总计** | **28 个脚本（19 .py + 9 .sh）** | **28** |
 
-**逐 Phase 交付流程（不可跳过）**：
+**逐 Phase 交付流程（四层协作，不可跳过）**：
 
 ```
-Phase N 实现代码写完
-  → 运行 Phase N 的所有 scripts/test_phaseN_* 脚本
-    → 任一 FAIL → 根据 FM-XXX/KERNEL-XXX 错误码修复实现 → 重跑
-    → 全部 PASS → Phase N 交付完成 → 进入 Phase N+1
+主 Agent 触发 /phaseN
+  → spawn phase-runner（Agent 工具，承担全部编排上下文）
+    → phase-runner 内部:
+      → spawn implementer（写代码 → SUBMITTED）
+      → shell claude -p spec-reviewer（物理隔离，对照蓝图审查）
+        → ❌ FAIL → 打回 implementer
+        → ✅ PASS → 继续
+      → shell claude -p verification（物理隔离，跑全部脚本 + L2 回归）
+        → ❌ FAIL → 打回 implementer（附失败报告，implementer 修复后 spec 重新审查）
+        → ✅ PASS → 返回结构化摘要给主 Agent
+  → 主 Agent 防假 PASS 抽查（亲自跑 1 个随机脚本，比对 verification 报告原始 stdout）
+    → 一致 ✅ → Phase N 交付完成 → 进入 Phase N+1
+    → 不一致 ❌ → 写 SPOT_CHECK_FAIL.md → 重新 spawn phase-runner（完整修复链）
+    → 连续 5 次驳回 → 停止并向人类报告
 ```
 
-**严禁行为**：
-- 跳过某 Phase 的脚本检查直接写下一 Phase 代码
-- 修改 scripts/ 下的脚本来"通过"测试
-- 用 Agent 自写的 tests/ 替代 scripts/ 的检查
+此流程确保：
+- 主 Agent 上下文始终保持轻量（不因 compact 丢失关键约束）
+- implementer/spec-reviewer/verification 三角色物理隔离，互不信任
+- 防假 PASS 抽查由主 Agent 独立执行，phase-runner 无权自证清白
 
 ### 2.0.1 Phase → 完整知识链路（JSON + ref_docs + ref_code）
 
@@ -575,7 +585,7 @@ prefill 不在 CUDA graph 内，直接赋值比 index_copy_ 快。
 所有不变 tensor 用 `register_buffer(persistent=False, dtype=...)` 注册：
 `_kv_len_gpu`, `_slot_mapping_decode`, `_q_norm_out`, `_k_norm_out`, `_silu_out`, cos_sin cache。
 
-审计检查：`grep 'register_buffer' engine/models/qwen.py | wc -l` 应 ≥ 6。
+审计检查：`grep 'register_buffer' engine/models/qwen.py | wc -l` 应 ≥ 8。
 
 **O7 懒 contiguous（LOW — 正确补充）**
 
