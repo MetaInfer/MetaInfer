@@ -16,6 +16,31 @@
   ❌ 不跳过三角色中的任何一环
 ```
 
+## 前置：CLI 路径检测
+
+在执行任何 `claude -p` 命令前，先检测 `claude` CLI 是否可用：
+
+```bash
+# 检测 claude 命令
+CLAUDE_CLI=$(which claude 2>/dev/null || echo "")
+if [ -z "$CLAUDE_CLI" ]; then
+  # 回退：尝试 bun run
+  if [ -f "/home/honglin/claude-code/dist/cli.js" ]; then
+    CLAUDE_CLI="bun run /home/honglin/claude-code/dist/cli.js"
+  else
+    echo "错误：找不到 claude CLI，请确认 claude 在 PATH 中或 claude-code 已构建"
+    exit 1
+  fi
+fi
+```
+
+后续所有 `claude -p` 命令使用 `${CLAUDE_CLI}` 代替 `claude`。
+
+**注意事项**：
+- `claude -p` 每次启动需 30-60 秒 bootstrap（加载 feature flags、MCP、项目 CLAUDE.md 等），属正常现象
+- prompt 通过 **heredoc** 传入 stdin（不用位置参数），避免多行中文被 shell 截断
+- 必须在 Konwldge 项目根目录下执行（确保能读到 inference_blueprint.json、scripts/ 等）
+
 ## 两种执行模式
 
 ### 模式 A：首次执行
@@ -59,8 +84,13 @@ implementer 返回后，**必须读它的完整输出**，确认 status=SUBMITTE
 
 **步骤 A3：shell spec-reviewer（Shell claude -p，物理隔离）**
 
+注意事项：
+- 使用 heredoc 传递多行 prompt（避免 shell 引号截断导致 prompt 为空）
+- `claude` 需在 PATH 中（如不在，尝试 `bun run /path/to/claude-code/dist/cli.js`）
+- `claude -p` 每次启动需 30-60 秒 bootstrap（完整加载项目上下文），属正常现象，不是卡死
+
 ```bash
-claude -p --allowedTools "Read(*),Write(*),Bash(*)" "
+claude -p --allowedTools "Read(*),Write(*),Bash(*)" << 'SPECEOF'
 读取 .claude/roles/spec-reviewer-inference.md 了解你的角色边界。
 
 审查对象：./engine/ 下的代码文件。
@@ -71,7 +101,7 @@ claude -p --allowedTools "Read(*),Write(*),Bash(*)" "
 
 将审查结果写入 ./phase_report/PHASE<N>_SPEC_REVIEW_REPORT.md。
 文件头部必须包含 PID（os.getpid()）、Role=spec-reviewer、Timestamp、Phase=N。
-"
+SPECEOF
 ```
 
 spec-reviewer 返回后：
@@ -82,7 +112,7 @@ spec-reviewer 返回后：
 **步骤 A4：shell verification（Shell claude -p，物理隔离，仅 spec ✅ 后执行）**
 
 ```bash
-claude -p --allowedTools "Read(*),Write(*),Bash(*)" "
+claude -p --allowedTools "Read(*),Write(*),Bash(*)" << 'VERIFEOF'
 读取 .claude/roles/verification-inference.md 了解你的角色边界。
 
 验收对象：./engine/ 下的代码文件。
@@ -98,7 +128,7 @@ claude -p --allowedTools "Read(*),Write(*),Bash(*)" "
 
 将验收结果写入 ./phase_report/PHASE<N>_VERIFICATION_REPORT.md。
 文件头部必须包含 PID（os.getpid()）、Role=verification、Timestamp、Phase=N。
-"
+VERIFEOF
 ```
 
 verification 返回后：
