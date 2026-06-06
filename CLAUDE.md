@@ -52,25 +52,18 @@ inference-agent-system/         ← 本包（工程根目录）
 
 ## 启动时强制动作
 
-0. **询问用户环境配置**：在开始任何工作前，必须先确认以下路径（如果用户尚未提供）：
-   - **模型目录 (MODEL_DIR)**：模型权重文件所在的目录（如 `/data/models`）
-   - **Python 环境 (PYTHON_PATH)**：包含 `python`、`flash_attn`、`vLLM` 的 conda/venv 的 bin 目录（如 `/opt/conda/envs/meta/bin`）
-   
-   验证方式：
-   ```bash
-   # 验证 MODEL_DIR
-   ls "${MODEL_DIR}/config.json" 2>&1 && echo "MODEL_DIR OK" || echo "MODEL_DIR 下找不到 config.json"
-   # 验证 Python 环境
-   "${PYTHON_PATH}/python" -c "import torch; import flash_attn; print(f'CUDA:{torch.cuda.is_available()} flash_attn OK')"
-   ```
+0. **环境配置——由第一个 Phase（phase1-4）的步骤 0 自动处理**：
+   用户触发 `/phase1-4` 后，Agent 会通过 `AskUserQuestion` 询问：
+   - **Python 环境 (PYTHON_PATH)**：支持 conda 环境名（如 "meta"）或完整 bin 目录路径（如 `/opt/conda/envs/meta/bin`）。Agent 自动解析 conda 环境名为 bin 目录。
+   - **模型目录 (MODEL_DIR)**：模型权重文件所在目录（如 `/data/models`）
+
+   验证通过后写入 `.env_agent_infer` 文件，后续所有 Phase（Phase 2-11）通过 `source .env_agent_infer` 加载。
 
 1. 读取 `inference_blueprint.json`（先看 `agent_navigation`，再按需展开）
 2. 读取 `AGENT_SKILL.md`（含编码铁律、Phase-Script 绑定表、Debug 指南）
 3. 在运行 scripts/ 前设置环境：
    ```bash
-   export AGENT_INFER_ROOT="$(pwd)"
-   export PATH="${PYTHON_PATH}:$PATH"
-   export PYTHONPATH="${AGENT_INFER_ROOT}:$PYTHONPATH"
+   source .env_agent_infer
    ```
 4. 确认目标模型 `config.json`（architectures, rope_scaling, num_heads 等）
 5. 输出"模型路由结论"：Dense 还是 MLA+MoE

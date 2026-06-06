@@ -10,12 +10,6 @@
 
 ---
 
-## 环境
-
-- 模型权重: `${MODEL_DIR}`
-- Conda: `${PYTHON_PATH}/python`
-- GPU: 4×A800（CUDA_VISIBLE_DEVICES=0,1,2,3）
-
 ## 你的角色
 
 你是**主 Agent**——只做高层调度和抽查，不亲自 orchestrate 三角色。每个 Phase 通过 spawn phase-runner 子代理执行，你只看到结构化摘要，保持上下文轻量。
@@ -33,7 +27,90 @@
 
 本 Phase 使用 **phase-runner 子代理** 完成编码和对抗审查。你（主 Agent）只做高层调度和防假 PASS 抽查——不再亲自 orchestrate implementer/spec/verif，避免上下文膨胀导致 compact 后约束丢失。
 
-对每个 Phase（1, 2, 3, 4），依次执行以下循环：
+### 步骤 0：环境配置（仅 Phase 1 启动前执行一次）
+
+在开始任何编码工作前，必须先向用户确认两个关键路径。如果用户已经提供过且 `.env_agent_infer` 文件存在，则跳过此步骤，直接 `source .env_agent_infer`。
+
+**0.1 询问用户：**
+
+```
+使用 AskUserQuestion 工具一次性询问用户两个问题：
+
+问题1: Python 环境
+说明：请提供 conda 环境名（如 "meta"）或 python bin 目录的完整路径（如 "/opt/conda/envs/meta/bin"）。
+      如果是 conda 环境名，Agent 会自动解析为 bin 目录路径。
+
+问题2: 模型目录
+说明：模型权重文件所在的目录（如 "/data/models"）。该目录下应包含 config.json。
+```
+
+**0.2 解析 PYTHON_PATH：**
+
+如果用户提供的是 conda 环境名（不含 `/` 的字符串），自动解析为 bin 目录：
+
+```bash
+# 方式1：通过 conda info --envs 解析
+CONDA_ENV_NAME="<用户提供的环境名>"
+CONDA_ENV_PATH=$(conda info --envs 2>/dev/null | grep "^${CONDA_ENV_NAME} " | awk '{print $NF}')
+if [ -n "${CONDA_ENV_PATH}" ]; then
+  PYTHON_PATH="${CONDA_ENV_PATH}/bin"
+else
+  # 方式2：通过 which conda 推断 base 路径再拼接
+  CONDA_BASE=$(dirname $(dirname $(which conda 2>/dev/null)))
+  PYTHON_PATH="${CONDA_BASE}/envs/${CONDA_ENV_NAME}/bin"
+fi
+```
+
+如果用户直接提供了完整路径（含 `/`），则直接使用。
+
+**0.3 验证路径：**
+
+```bash
+# 验证 MODEL_DIR
+ls "${MODEL_DIR}/config.json" 2>&1 && echo "MODEL_DIR OK" || echo "MODEL_DIR 下找不到 config.json"
+
+# 验证 Python 环境
+"${PYTHON_PATH}/python" -c "import torch; import flash_attn; print(f'CUDA:{torch.cuda.is_available()} flash_attn OK')"
+```
+
+两项验证都通过后才继续，否则向用户报告失败原因并重新询问。
+
+**0.4 持久化环境变量：**
+
+验证通过后，写入 `.env_agent_infer` 文件供所有后续 Phase 使用：
+
+```bash
+cat > .env_agent_infer << ENVEOF
+export AGENT_INFER_ROOT="\$(pwd)"
+export PYTHON_PATH="${PYTHON_PATH}"
+export MODEL_DIR="${MODEL_DIR}"
+export PATH="\${PYTHON_PATH}:\$PATH"
+export PYTHONPATH="\${AGENT_INFER_ROOT}:\$PYTHONPATH"
+ENVEOF
+```
+
+**0.5 设置当前 shell 环境 + 模型路由：**
+
+```bash
+export AGENT_INFER_ROOT="$(pwd)"
+export PATH="${PYTHON_PATH}:$PATH"
+export PYTHONPATH="${AGENT_INFER_ROOT}:$PYTHONPATH"
+
+# 读取模型 config.json 输出路由结论
+python -c "
+import json
+with open('${MODEL_DIR}/config.json') as f:
+    cfg = json.load(f)
+print('architectures:', cfg.get('architectures', 'UNKNOWN'))
+print('num_hidden_layers:', cfg.get('num_hidden_layers', '?'))
+print('num_attention_heads:', cfg.get('num_attention_heads', '?'))
+print('num_key_value_heads:', cfg.get('num_key_value_heads', '?'))
+"
+```
+
+根据 architectures 输出"模型路由结论"：Dense 还是 MLA+MoE。
+
+然后才开始执行 Phase 1。
 
 ### 步骤 1：spawn phase-runner（首次）
 

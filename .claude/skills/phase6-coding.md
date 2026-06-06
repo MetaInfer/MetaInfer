@@ -12,6 +12,7 @@
 
 ## 环境
 
+- **必须先执行** `source .env_agent_infer` 加载 MODEL_DIR 和 PYTHON_PATH
 - 模型权重: `${MODEL_DIR}`
 - Conda: `${PYTHON_PATH}/python`
 - GPU: 4×A800

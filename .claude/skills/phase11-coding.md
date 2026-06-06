@@ -12,6 +12,10 @@ Phase 11 性能优化——不改变功能行为，只改实现方式。通过 s
 
 Phase 1-10 已完成，TP=4 推理正确性字字对齐。当前吞吐仅 ~10 tok/s，目标 > 50 tok/s。
 
+## 环境
+
+- **必须先执行** `source .env_agent_infer` 加载 MODEL_DIR 和 PYTHON_PATH
+
 ## 你的角色
 
 你是**主 Agent**——只做高层调度和 benchmark 抽查。通过 spawn phase-runner 子代理（审计模式）执行 Phase 11 的 audit → fix → reaudit → benchmark 闭环，你只看到结构化摘要，保持上下文轻量。
