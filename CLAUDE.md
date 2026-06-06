@@ -241,6 +241,7 @@ verification           → phase-runner 动作
 | `/phase7-8` | 权重加载 + 框架外壳 |
 | `/phase9-10` | 引擎集成 + E2E 验收 |
 | `/phase11` | 性能优化（审计-修复-再审计闭环） |
+| `/phase-all` | 全量一次性编码，依次执行 Phase 1-11 |
 
 详见 `prompts.md`。
 
