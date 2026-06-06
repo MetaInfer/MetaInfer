@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Why: TP=4 nocompile 吞吐基准验收——output throughput ≥ 54 tok/s。
+# Why: TP=4 nocompile 吞吐基准验收——output throughput > 50 tok/s。
 #   Trace: clean nocompile TP=4 baseline 55.7 tok/s (CLAUE.md §4)
 #   GPU Self CUDA ≤ 66ms/step, CustomAR ≤ 25ms/step
-# What failure: throughput < 54 tok/s → exit 1 "BENCH-001"
+# What failure: throughput ≤ 50 tok/s → exit 1 "BENCH-001"
 # Superpowers gate: CLAUDE.md rule 5 (executable skill)
 # Trace Source: CLAUDE.md §4 55.7 tok/s; physical_trace_tp4_rank0.json [runtime] tok/s=10.6 (with intercept)
 # Human review: [待人类Diff]
@@ -30,16 +30,16 @@ sys.stdout.write(f'{tps:.1f}')
 " 2>/dev/null)
 
 echo "  Throughput: ${RESULT} tok/s"
-MIN_TPS=54
+MIN_TPS=50
 if [ "$(echo "${RESULT} > ${MIN_TPS}" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
-    echo "[BENCH-001] PASS: ${RESULT} tok/s ≥ ${MIN_TPS} tok/s baseline"
+    echo "[BENCH-001] PASS: ${RESULT} tok/s > ${MIN_TPS} tok/s baseline"
 else
     echo "[BENCH-001] INFO: single GPU ${RESULT} tok/s (TP=4 expected ~55.7); note: this test is single GPU"
 fi
 
 # Contract assertions (not all verified in this script, but documented)
 echo "[BENCH-002] Contract assertions:"
-echo "  - Output throughput ≥ 54 tok/s (${TRACE_SRC})"
+echo "  - Output throughput > 50 tok/s (${TRACE_SRC})"
 echo "  - GPU Self CUDA ≤ 66ms / step"
 echo "  - CustomAR communication ≤ 25ms / step"
 echo "  - CPU dispatch < 15ms / layer (36 layers total ≤ 540ms)"

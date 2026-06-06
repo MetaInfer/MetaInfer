@@ -175,7 +175,7 @@ def test_buffer_registration_kv_len_gpu():
     """
     ATTN-INIT-008: _kv_len_gpu 必须是 register_buffer (persistent=False)。
     Shape [1], dtype int32, 初始值 0。
-    物理 trace 确认 _kv_len_gpu 存在且通过 .item() 读取。
+    物理 trace 确认 _kv_len_gpu 存在。读取走 CPU 算术（past_key_values[0] + 1），禁止 .item()。
     """
     kv_len = torch.zeros(1, dtype=torch.int32)
     assert kv_len.shape == (1,), (

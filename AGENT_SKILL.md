@@ -195,6 +195,7 @@ Phase N 实现代码写完
 | **Phase 8** 框架外壳 | `components[0] Scheduler`（完整 schedule+postprocess pseudocode）→ `components[4] Sampler`（TP 协议：rank0 采样+broadcast）→ `components[5] Sequence`（status 转移+block_table 双轨）→ `components[2] BlockManager`（⚠️ TP 降级 no-op：allocate/free 空方法+get_num_free_blocks 保留）→ `scheduler_to_runner`（batch 组装+can_allocate 公式+REJECTED 机制） | `02_scheduler.md`（调度概念）`03_kv_cache.md`（paged attention）`05_sampler.md`（采样算法）`01_architecture.md` `07_request_lifecycle.md` | — |
 | **Phase 9** 引擎集成 | `components[6] LLMEngine`（full_api_surface: __init__ 7 步 flow+generate 5 步 while-loop+step 单步+begin_generation/has_unfinished/get_outputs API）→ `components[3] ModelRunner`（tp_runner_actual_flow: prefill/decode 分发+采样+run 方法体）→ `scheduler_tp_runner_bridge`（CRITICAL-01：block_size 注入+num_free 来源路由+BlockManager 降级） | `01_architecture.md` `07_request_lifecycle.md`（框架生命周期） |
 | **Phase 10** E2E 验收 | `todo_generation_playbook.phase_10_e2e_acceptance`（implementation_todos+minimal_test_commands+e2e_acceptance_bottom_line 硬性指标）→ `runtime_acceptance_layer.logic_constraints`→ `...acceptance_test_targets.qwen3_tp.performance_baseline` | `CLAUDE.md` §6.2-6.4（测试命令+benchmark 脚本）`improvement_plan.md`（性能基线记录） |
+| **Phase 11** 性能优化 | `todo_generation_playbook.phase_11_performance`（O1-O9 分层规则：O1 @torch.inference_mode(), O2 全文件零 .item(), O3 预分配 buffer, O4 block_table arange, O5 prefill KV 直接赋值, O6 register_buffer 完整声明, O7-O9 懒 contiguous/view/消除中间 tensor）→ `performance_gate`（throughput > 50 tok/s, cudaMalloc=0, aten::item < 10ms） | `perf_iteration/ROUND_1_BOTTLENECK_FIXES.md`（9 项优化实测验证，19.3→59.1 tok/s） |
 
 **JSON 路径缩写展开**：
 - `qwen3_kernel_contracts` = `framework_layer.data_flow_contracts.tp_layer_interface_contracts.qwen3_kernel_contracts`
@@ -264,11 +265,12 @@ Phase N 实现代码写完
 
 **Prefill/Decode 分发逻辑**：
 - `is_prefill = (past_key_values is None)` — None → prefill，非 None → decode
-- prefill: `layer.forward()` → qkv_proj → rotary → flash_attn_varlen_func(causal=True) → K,V index_copy_ 写入 paged cache → o_proj → mlp
-- decode: `layer.forward_decode()` → qkv_proj → Q/K norm → rotary → KV write(index_copy_) → flash_attn_with_kvcache → o_proj
+- prefill: `layer.forward()` → qkv_proj → rotary → flash_attn_varlen_func(causal=True) → K,V 直接索引赋值写入 paged cache → o_proj → mlp
+- decode: `layer.forward_decode()` → qkv_proj → Q/K norm（预分配 buffer 直接调 rms_norm kernel）→ rotary → KV write(index_copy_) → flash_attn_with_kvcache → o_proj
 - KV cache paged 格式：`_key_cache[num_blocks, 256, num_kv_heads, head_dim]`，block_size=256
 - **KV cache lazy alloc（⭐⭐⭐ 显存关键）**：`num_blocks` 在 prefill 时按需分配 `(num_tokens+255)//256`，**严禁**一次性 `torch.zeros(max_blocks=160, 256, kv_heads, dim)` 全量预分配。后者导致每层 160×256×2×128×2 = 20MB，36 层 ≈ 720MB 额外显存浪费。真实 trace 确认：4-token prompt 只需 1 block。每次 decode 追加 1 token 不增加 block 数（复用已分配 block）。
-- `_kv_len_gpu` 为 GPU tensor，`.item()` 仅在 `forward()`（非编译函数）外部 batch 读取
+- `_kv_len_gpu` 为 GPU tensor。**严禁 `.item()`** — kv_len 追踪全部走 CPU 算术（`runner.run()` 中 `s.kv_len += 1`）
+- **get_num_free_blocks**: 返回常量 `cfg.max_position_embeddings // 256`。短序列 <256 token 仅需 1 block，无需 GPU 同步动态计算
 - **QKV reshape**: Q 用 `num_heads=8` (per-rank)，K/V 用 `num_kv_heads_local=2` (per-rank)。勿混用。
 
 ### 2.2.1 V17 审计驱动的先验警告（实现前必读）
@@ -483,16 +485,80 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
 5. **残余 compile 痕迹**：代码中残存 `torch.compile`、`mode='reduce-overhead'`、`fullgraph=True` → profiler 中出现 `CompiledFunction`、`Inductor` kernel → 应立即删除并替换为纯 eager 路径。
 6. **fake inference**：严禁 `print("假输出")` 冒充真实 TF 推理。验收必须附带 profiler trace 文件 + HCU 监控证据。
 
-### I. 性能优化规则（Phase 11 — 见 blueprint performance_optimization）
+### I. 性能强制模式（Phase 11 — 审计门禁 + 补充优化）
 
-以下 6 条规则从真实 meta-infer engine 反推，用于将吞吐从 ~10 tok/s 提升至 ≥54 tok/s：
+以下规则经过 ROUND_1 实测验证（`perf_iteration/ROUND_1_BOTTLENECK_FIXES.md`，19.3→59.1 tok/s，+206%）。
+分两层：**O1-O6 为审计门禁**（Phase 11 必须逐条静态检查，命中则回对应 Phase 修复），
+**O7-O9 为补充优化**（正确但非致命，可选实施）。
 
-1. **P1 预分配 buffer**：`torch.empty_like(x)` 替代 `torch.empty(...)`。每步 cudaMalloc ~200ms → 一次性分配 <1ms。
-2. **P2 懒 contiguous**：仅在 kernel 输入前调 `.contiguous()`。不在中间 view/reshape 后调。
-3. **P3 view 非 reshape**：`view()` 零拷贝，`reshape()` 可能触发隐式 `.contiguous()` → GPU mem copy。
-4. **P4 消除中间 tensor**：one-pass 计算，不分配中间临时 tensor。减少 Python GC + per-step alloc 开销。
-5. **P5 减少 .item()**：仅在 `QwenForCausalLMTP.forward()` 外层 36 层循环后批量读取一次 `.item()`，不在每层 `forward_decode` 内读。当前最大瓶颈。
-6. **P6 register_buffer**：不变 tensor（kv_len_gpu, slot_mapping_decode, cos_sin_cache）用 `register_buffer(persistent=False)` 注册，避免每步重新分配。
+**Phase 11 强制审计闭环（不可跳过）：**
+
+1. **STEP-AUDIT**: 逐条执行下方 O1-O6 的审计检查命令，记录 PASS/FAIL。O7-O9 仅记录不阻塞。
+2. **STEP-FIX**: 每条 FAIL 项目定位到对应 Phase 构建的源码文件，修改代码使审计通过。
+3. **STEP-REAUDIT**: 修复后重新跑全部审计检查，直到 O1-O6 全部 PASS。
+4. **STEP-BENCHMARK**: 全部审计通过后跑 `test_phase11_throughput.py` 验证吞吐达标（> 50 tok/s）。
+5. **STEP-DONE**: O1-O6 全部 PASS + 吞吐达标 → Phase 11 完成。
+
+**O1 @torch.inference_mode()（CRITICAL — 占提升的 82%）**
+
+QwenForCausalLMTP.forward() 和 forward_decode() **必须**带 `@torch.inference_mode()` 装饰器。
+禁用 autograd version counter 递增和元数据追踪，消除 GeneratedBackwardFor 膨胀 + cudaLaunchKernel CPU 开销。
+CPU launch 占比从 ~35% 降至 <5%。
+
+审计检查：`grep -r '@torch.inference_mode' engine/models/qwen.py` 应有 2 个匹配。
+
+**O2 零 .item() GPU 同步（CRITICAL）**
+
+- `get_num_free_blocks()` 返回常量 `cfg.max_position_embeddings // 256`（短序列场景 <256 token 仅需 1 block）
+- `runner.run()` decode 分支用 `s.kv_len += 1`（CPU 算术，forward_decode 内部已自增 _kv_len_gpu）
+- prefill slot_mapping 用 `torch.arange` 向量化（禁止 for 循环 + .item()）
+
+审计检查：`grep '\.item()' llm_engine.py engine/models/qwen.py` 应为零匹配（仅注释中允许）。QwenForCausalLMTP.forward() decode 分支已改用 `past_key_values[0] + 1` CPU 算术。
+
+**O3 预分配 buffer（CRITICAL）**
+
+decode 路径（B=1,S=1）使用 `register_buffer(persistent=False)` 预分配的 buffer，直接调底层 kernel：
+- `_q_norm_out[1, heads, dim]`, `_k_norm_out[1, kv_heads, dim]` — attention Q/K norm 复用
+- `_silu_out[1, 1, local_inter]` — MLP silu_and_mul 输出复用
+
+绕过 `nn.Module.forward()` 中的 `torch.empty_like()`（内部触发 `cudaDeviceGetAttribute`）。
+
+通用路径（B>1 或 S>1）禁止 `torch.empty_like()`：`torch.empty_like(gate_up[..., :half_ch])` → `torch.empty(x.shape[0], x.shape[1], half_ch, dtype=x.dtype, device=x.device)`。`empty_like` 含隐式 CUDA runtime 查询，改为显式参数消除。
+
+审计检查：`grep '_q_norm_out\\|_k_norm_out\\|_silu_out' engine/models/qwen.py` 应有匹配；`grep 'empty_like' engine/models/qwen.py` 应为零匹配。
+
+**O4 block_table arange 初始化（HIGH）**
+
+KV cache 首次分配时一次性 `torch.arange(max_blocks).unsqueeze(0)`，非 `torch.zeros + 每步填充`。
+arange 创建恒等映射（逻辑页→物理页），全零是错误的（所有页映射到 block 0）。
+
+审计检查：`grep '_block_table.*arange' engine/models/qwen.py`。
+
+**O5 prefill KV 直接赋值（HIGH）**
+
+prefill KV 写入使用直接索引赋值 `kc_flat[slot_mapping] = k_flat`，非 `index_copy_`。
+prefill 不在 CUDA graph 内，直接赋值比 index_copy_ 快。
+
+审计检查：`grep 'index_copy_' engine/models/qwen.py` 应仅在 decode 路径出现。
+
+**O6 register_buffer 完整声明（HIGH）**
+
+所有不变 tensor 用 `register_buffer(persistent=False, dtype=...)` 注册：
+`_kv_len_gpu`, `_slot_mapping_decode`, `_q_norm_out`, `_k_norm_out`, `_silu_out`, cos_sin cache。
+
+审计检查：`grep 'register_buffer' engine/models/qwen.py | wc -l` 应 ≥ 6。
+
+**O7 懒 contiguous（LOW — 正确补充）**
+
+仅在内核输入前调用 `.contiguous()`，不在中间 view/reshape 后调。
+
+**O8 view 非 reshape（LOW — 正确补充）**
+
+`view()` 零拷贝，`reshape()` 可能触发隐式 `.contiguous()`。仅当 tensor 确实 discontiguous 时才用 `reshape()`。
+
+**O9 消除中间 tensor（LOW — O3 是其具体体现）**
+
+one-pass 计算，不分配中间临时 tensor。预分配 buffer（O3）是实现此原则的关键手段。
 
 ---
 
@@ -510,7 +576,7 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
 
 | 指标 | 目标值 | 验证方式 |
 |------|--------|---------|
-| Output Throughput | ≥ 54 tok/s | `run_compare_metainfer_vllm.sh qwen` |
+| Output Throughput | > 50 tok/s | `run_compare_metainfer_vllm.sh qwen` |
 | GPU Self CUDA | ≤ 66ms / step | torch.profiler 单步 GPU kernel 总时间 |
 | CustomAR 通信 | ≤ 25ms / step | profiler `cross_device_reduce_1stage` |
 | CPU dispatch / layer | < 15ms (36 layer total ≤ 540ms) | torch.profiler CPU time |

@@ -519,9 +519,8 @@ class QwenForCausalLMTP(nn.Module):
                 hidden_states, residual = layer.forward_decode(
                     hidden_states, positions, kv_len,
                     max_seq_len=max_seq_len, residual=residual)
-            # Batch read kv_lens AFTER all layers (P5: 1x .item() from layer 0,
-            # since all layers share the same kv_len at decode start)
-            kv_len = int(self.layers[0].self_attn._kv_len_gpu[0].item())
+            # kv_len = past_key_values[0] + 1 (forward_decode 内部自增 _kv_len_gpu)
+            kv_len = past_key_values[0] + 1
             kv_lens = [kv_len] * len(self.layers)
             hidden_states, _ = self.norm(hidden_states, residual)
 

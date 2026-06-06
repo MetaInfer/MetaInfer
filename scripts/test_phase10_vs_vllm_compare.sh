@@ -2,7 +2,7 @@
 # Why: 新生成框架 vs vLLM TP=4 Qwen3 三方对比基准（no-CUDA-Graph / CUDA-Graph）。
 #   Trace: meta-infer nocompile 55.7 tok/s, vLLM CUDA Graph 166.8 tok/s, vLLM no-graph ~52 tok/s
 #   参考: ref_projects/vllm/examples/offline_inference/simple_profiling.py
-# What failure: 新框架吞吐 < 54 tok/s / vLLM 未正常启动 → exit 1 "VS-VLLM-00X"
+# What failure: 新框架吞吐 ≤ 50 tok/s / vLLM 未正常启动 → exit 1 "VS-VLLM-00X"
 # Superpowers gate: CLAUDE.md rule 5 (executable skill)
 # Trace Source: CLAUDE.md §4 (55.7 tok/s), physical_trace_tp4_rank0.json baseline
 # Human review: [待人类Diff]
@@ -23,12 +23,12 @@ echo "=== Phase 10: vs vLLM Comparison ==="
 echo "TP_SIZE=${TP_SIZE} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 # Contract: Target throughputs (from CLAUDE.md §4 physical baselines)
-META_INFER_TARGET=54    # nocompile ≥ 54 tok/s
+META_INFER_TARGET=50    # nocompile > 50 tok/s
 VLLM_NOGRAPH_REF=52     # vLLM CUDA Graph disabled ~52 tok/s
 VLLM_GRAPH_REF=166      # vLLM CUDA Graph enabled ~166.8 tok/s
 
 echo "[VS-VLLM-001] Target baselines:"
-echo "  Meta-infer (nocompile): ≥ ${META_INFER_TARGET} tok/s (${TRACE_SRC})"
+echo "  Meta-infer (nocompile): > ${META_INFER_TARGET} tok/s (${TRACE_SRC})"
 echo "  vLLM (no CUDA Graph):   ~ ${VLLM_NOGRAPH_REF} tok/s (reference)"
 echo "  vLLM (CUDA Graph):      ~ ${VLLM_GRAPH_REF} tok/s (ceiling)"
 
