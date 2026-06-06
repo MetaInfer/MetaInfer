@@ -23,7 +23,7 @@
 主 Agent 提示词示例：
 ```
 Phase 5: Attention + KV Cache。
-读取 .claude/skills/phase5-coding.md 了解任务细节。
+读取 .claude/skills/phase5/SKILL.md 了解任务细节。
 执行完整 implementer→spec→verif 对抗审查链。
 ```
 
@@ -36,7 +36,7 @@ Agent(
   subagent_type: "general-purpose",
   description: "Phase N implementer",
   prompt: """
-读取 .claude/skills/implementer-inference.md 了解你的角色边界。
+读取 .claude/roles/implementer-inference.md 了解你的角色边界。
 你的 Task：实现 [Phase N 的具体组件，从 phase coding skill 中提取]。
 
 启动前强制读取：
@@ -61,7 +61,7 @@ implementer 返回后，**必须读它的完整输出**，确认 status=SUBMITTE
 
 ```bash
 claude -p --allowedTools "Read(*),Write(*),Bash(*)" "
-读取 .claude/skills/spec-reviewer-inference.md 了解你的角色边界。
+读取 .claude/roles/spec-reviewer-inference.md 了解你的角色边界。
 
 审查对象：./engine/ 下的代码文件。
 （不要读 implementer 的报告或任何对话日志——只读代码文件本身）
@@ -83,7 +83,7 @@ spec-reviewer 返回后：
 
 ```bash
 claude -p --allowedTools "Read(*),Write(*),Bash(*)" "
-读取 .claude/skills/verification-inference.md 了解你的角色边界。
+读取 .claude/roles/verification-inference.md 了解你的角色边界。
 
 验收对象：./engine/ 下的代码文件。
 
@@ -123,7 +123,7 @@ implementer PID: ZZZZ
 ```
 Phase 5 RETRY。
 读取 ./phase_report/PHASE5_SPOT_CHECK_FAIL.md 了解失败原因。
-读取 .claude/skills/phase5-coding.md 了解任务细节。
+读取 .claude/skills/phase5/SKILL.md 了解任务细节。
 执行完整 implementer→spec→verif 修复链（不得跳过任何环节）。
 ```
 
@@ -166,7 +166,7 @@ Phase 11 不按 implementer→spec→verif 流程，而是**审计-修复-再审
 
 ```
 Phase 11: 性能优化（审计模式）。
-读取 .claude/skills/phase11-coding.md 了解审计规则。
+读取 .claude/skills/phase11/SKILL.md 了解审计规则。
 执行 STEP-AUDIT → STEP-FIX → STEP-REAUDIT → STEP-BENCHMARK 闭环。
 ```
 

@@ -90,8 +90,8 @@ Agent(
   description: "Phase N runner",
   prompt: """
 Phase N: [Phase名称]。
-读取 .claude/skills/phase-runner.md 了解你的角色边界。
-读取 .claude/skills/phase7-8-coding.md 了解本 Phase 的任务细节。
+读取 .claude/roles/phase-runner.md 了解你的角色边界。
+读取 .claude/skills/phase7-8/SKILL.md 了解本 Phase 的任务细节。
 执行完整 implementer→spec→verif 对抗审查链（模式 A：首次执行）。
 """
 )

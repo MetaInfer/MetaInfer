@@ -119,8 +119,8 @@ Agent(
   description: "Phase 11 runner (audit)",
   prompt: """
 Phase 11: 性能优化（审计模式）。
-读取 .claude/skills/phase-runner.md 了解你的角色边界（使用模式 C：审计闭环）。
-读取 .claude/skills/phase11-coding.md 了解审计规则和 O1-O9 优化清单。
+读取 .claude/roles/phase-runner.md 了解你的角色边界（使用模式 C：审计闭环）。
+读取 .claude/skills/phase11/SKILL.md 了解审计规则和 O1-O9 优化清单。
 执行 STEP-AUDIT → STEP-FIX → STEP-REAUDIT → STEP-BENCHMARK 完整闭环。
 """
 )
@@ -150,8 +150,8 @@ Agent(
   prompt: """
 Phase 11 RETRY。
 读取 ./phase_report/PHASE11_SPOT_CHECK_FAIL.md 了解失败原因。
-读取 .claude/skills/phase-runner.md 了解你的角色边界（使用模式 D：审计重试）。
-读取 .claude/skills/phase11-coding.md 了解审计规则。
+读取 .claude/roles/phase-runner.md 了解你的角色边界（使用模式 D：审计重试）。
+读取 .claude/skills/phase11/SKILL.md 了解审计规则。
 从 STEP-AUDIT 重新开始完整审计闭环（不得跳过任何步骤）。
 """
 )

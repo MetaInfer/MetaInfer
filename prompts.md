@@ -6,12 +6,12 @@
 
 | 触发词 | 对应 Skill | Phase 范围 | 说明 |
 |--------|-----------|-----------|------|
-| `/phase1-4` | `phase1-4-coding.md` | Phase 1-4 | 数值基元 + TP通信 + TP线性层 + TP Embedding |
-| `/phase5` | `phase5-coding.md` | Phase 5 | Attention + KV Cache（最高错误密度） |
-| `/phase6` | `phase6-coding.md` | Phase 6 | MLP + Decoder Layer（最高错误密度） |
-| `/phase7-8` | `phase7-8-coding.md` | Phase 7-8 | 权重加载 + 框架外壳 |
-| `/phase9-10` | `phase9-10-coding.md` | Phase 9-10 | 引擎集成 + E2E 验收 |
-| `/phase11` | `phase11-coding.md` | Phase 11 | 性能优化（审计-修复-再审计闭环） |
+| `/phase1-4` | `phase1-4/SKILL.md` | Phase 1-4 | 数值基元 + TP通信 + TP线性层 + TP Embedding |
+| `/phase5` | `phase5/SKILL.md` | Phase 5 | Attention + KV Cache（最高错误密度） |
+| `/phase6` | `phase6/SKILL.md` | Phase 6 | MLP + Decoder Layer（最高错误密度） |
+| `/phase7-8` | `phase7-8/SKILL.md` | Phase 7-8 | 权重加载 + 框架外壳 |
+| `/phase9-10` | `phase9-10/SKILL.md` | Phase 9-10 | 引擎集成 + E2E 验收 |
+| `/phase11` | `phase11/SKILL.md` | Phase 11 | 性能优化（审计-修复-再审计闭环） |
 
 ## 使用方式
 
@@ -22,7 +22,7 @@
 /phase5
 ```
 
-Agent 将读取 `.claude/skills/phase5-coding.md`，获得 Phase 5 的完整编码指导。
+Agent 将读取 `.claude/skills/phase5/SKILL.md`，获得 Phase 5 的完整编码指导。
 
 ## 全量一次性编码
 

@@ -273,7 +273,7 @@ cd /path/to/target && python perf_iteration/profiler_compare.py target
 <错误做法及为什么错>
 ```
 
-将 skill 文件保存到 `.claude/skills/` 目录，命名遵循 `<关键词>.md` 格式。
+将 skill 文件保存到 `.claude/skills/` 目录，命名遵循 `<关键词>/SKILL.md` 格式。
 
 **skill 的作用**：在下一次 agent 从零构建推理框架时，这些 skill 会在相应阶段自动匹配并被加载到 agent 上下文中，帮助 agent 在第一版代码中就做对，而非事后修复。
 
@@ -304,7 +304,7 @@ print("性能对齐完成，输出最终摘要")
 | 基线 benchmark | `perf_iteration/ROUND_0_BASELINE.md` | Markdown 表格 | 两框架首次对比 + profiler 差异表 + 问题清单 |
 | 每轮迭代记录 | `perf_iteration/ROUND_N_<主题>.md` | Markdown | 优化过程表 + 修复详情 + profiler 对比 + 错误记录 |
 | Profiler trace | `perf_iteration/trace_<name>/` | JSON + txt | Chrome trace + key_avg.txt |
-| 通用 issue/skill | `.claude/skills/<关键词>.md` | Markdown | 模式 + 原理 + 识别 + 验证 + 反模式 |
+| 通用 issue/skill | `.claude/skills/<关键词>/SKILL.md` | Markdown | 模式 + 原理 + 识别 + 验证 + 反模式 |
 | Profiler 脚本 | `perf_iteration/profiler_compare.py` | Python | 可切换两个框架，可复用 |
 
 ## 注意事项

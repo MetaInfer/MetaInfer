@@ -144,16 +144,16 @@ Phase 7: 权重加载     → Phase 8: 框架外壳  → Phase 9: 引擎集成
 
 ### 编码入口：Skill 触发器
 
-用户通过简短触发词启动各阶段编码，Agent 自动加载 `.claude/skills/phaseN-coding.md` 获得完整 prompt（含任务上下文、执行步骤、知识映射、高发错误清单）。
+用户通过简短触发词启动各阶段编码，Agent 自动加载 `.claude/skills/phaseN/SKILL.md` 获得完整 prompt（含任务上下文、执行步骤、知识映射、高发错误清单）。
 
 | 触发词 | Phase | Skill 文件 |
 |--------|-------|-----------|
-| `/phase1-4` | 1-4 | `phase1-4-coding.md` |
-| `/phase5` | 5 | `phase5-coding.md` |
-| `/phase6` | 6 | `phase6-coding.md` |
-| `/phase7-8` | 7-8 | `phase7-8-coding.md` |
-| `/phase9-10` | 9-10 | `phase9-10-coding.md` |
-| `/phase11` | 11 | `phase11-coding.md` |
+| `/phase1-4` | 1-4 | `phase1-4/SKILL.md` |
+| `/phase5` | 5 | `phase5/SKILL.md` |
+| `/phase6` | 6 | `phase6/SKILL.md` |
+| `/phase7-8` | 7-8 | `phase7-8/SKILL.md` |
+| `/phase9-10` | 9-10 | `phase9-10/SKILL.md` |
+| `/phase11` | 11 | `phase11/SKILL.md` |
 
 详见 `prompts.md`。
 

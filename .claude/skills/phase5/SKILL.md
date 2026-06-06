@@ -41,8 +41,8 @@ Agent(
   description: "Phase 5 runner",
   prompt: """
 Phase 5: Attention + KV Cache。
-读取 .claude/skills/phase-runner.md 了解你的角色边界。
-读取 .claude/skills/phase5-coding.md 了解本 Phase 的任务细节。
+读取 .claude/roles/phase-runner.md 了解你的角色边界。
+读取 .claude/skills/phase5/SKILL.md 了解本 Phase 的任务细节。
 执行完整 implementer→spec→verif 对抗审查链（模式 A：首次执行）。
 """
 )
@@ -68,8 +68,8 @@ Agent(
   prompt: """
 Phase 5 RETRY。
 读取 ./phase_report/PHASE5_SPOT_CHECK_FAIL.md 了解失败原因。
-读取 .claude/skills/phase-runner.md 了解你的角色边界。
-读取 .claude/skills/phase5-coding.md 了解任务细节。
+读取 .claude/roles/phase-runner.md 了解你的角色边界。
+读取 .claude/skills/phase5/SKILL.md 了解任务细节。
 执行完整 implementer→spec→verif 修复链（模式 B：重试修复，不得跳过任何环节）。
 """
 )
