@@ -318,6 +318,20 @@ Rank 1-3: while True: cmd=broadcast_obj({}) → 相同 engine.generate()
 - `GET /health` → `{"status":"ok"}`
 - `POST /v1/completions`：支持 stream=true(SSE) 和 stream=false(JSON)
 
+**SSE 连接生命周期（2026-06-06 线上 hang 根因）**：
+- SSE 响应无 Content-Length，客户端依赖连接关闭判定流结束。BaseHTTPRequestHandler 默认 keep-alive。
+- **必须**：`Connection: close` header + `self.close_connection = True`（成功路径和 except/finally 路径都要设）
+- 缺少 close_connection → 连接永不关闭 → benchmark warmup 请求持有 engine_lock → 0/N 请求成功
+
+**Non-rank0 Worker 信号处理（2026-06-06 进程残留根因）**：
+- Worker 主线程阻塞在 `dist.broadcast_object_list`（C 调用），Python 信号处理延迟到 C 返回后
+- **必须**：注册 SIGTERM + SIGINT handler，handler 内调用 `os._exit(0)`（不经过 Python 解释器，直接终止进程）。注意 handler 必须接受 `(signum, frame)` 两个参数
+- 缺少 handler → torchrun kill 后子进程残留，每进程占 ~6.5GB GPU 显存
+
+**Benchmark 脚本清理要点**：
+- `pkill -9 -f "openai_tp_server.py"` 匹配 python 子进程，不要用 `pkill -f "torchrun.*openai_tp_server"`
+- 使用 `trap cleanup EXIT INT TERM` 确保一切退出路径都清理
+
 **启动方式**：
 ```bash
 TP_SIZE=4 PORT=9000 bash start_tp_infer_service.sh qwen   # 终端1

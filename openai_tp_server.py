@@ -134,6 +134,19 @@ def _tp_worker_loop(model_dir, backend='qwen_tp', max_num_seqs=8):
     engine = _get_or_create_engine(model_dir, backend, max_num_seqs)
     rank = dist.get_rank() if dist.is_initialized() else -1
 
+    # Register signal handlers for graceful shutdown.
+    # When torchrun sends SIGTERM, os._exit(0) is the only reliable way
+    # to terminate because the main thread may be blocked in NCCL/Gloo
+    # collectives (broadcast_object_list, all_reduce) and Python's
+    # default signal handling defers signals until the C call returns.
+    def _worker_signal_handler(signum, frame):
+        print(f"\n[TP Worker Rank {rank}] Received signal {signum}, "
+              f"exiting immediately.", flush=True)
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _worker_signal_handler)
+    signal.signal(signal.SIGTERM, _worker_signal_handler)
+
     print(f"[TP Worker Rank {rank}] Model loaded. Waiting for requests...",
           flush=True)
 
@@ -340,7 +353,7 @@ class CompletionHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
         self.send_header('Cache-Control', 'no-cache, no-transform')
-        self.send_header('Connection', 'keep-alive')
+        self.send_header('Connection', 'close')
         self.send_header('X-Accel-Buffering', 'no')   # disable nginx buffering
         self.end_headers()
 
@@ -421,6 +434,11 @@ class CompletionHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b'data: [DONE]\n\n')
                 self.wfile.flush()
 
+            # Signal HTTP/1.1 connection close after SSE stream ends.
+            # Without this, the client hangs waiting for more chunks
+            # because Content-Length is not set for SSE.
+            self.close_connection = True
+
         except Exception as e:
             # Send error via SSE so the client doesn't hang
             error_chunk = {
@@ -447,6 +465,8 @@ class CompletionHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except Exception:
                 pass  # client may have disconnected
+            finally:
+                self.close_connection = True
 
     # ----------------------------------------------------------------
     # TP broadcast

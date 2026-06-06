@@ -372,10 +372,21 @@
             "broadcast_obj": "dist.broadcast_object_list([payload if rank0 else None], src=0) → 所有 rank 返回 payload[0]"
           },
           "streaming": {
-            "flow": "engine.generate_stream() → SSE data chunks → final chunk finish_reason='stop' → data: [DONE]"
+            "flow": "engine.begin_generation() + step() loop → SSE data chunks → final chunk finish_reason='stop' → data: [DONE]",
+            "critical_constraints": {
+              "_why": "SSE 无 Content-Length，浏览器/客户端依赖连接关闭来判定流结束。BaseHTTPRequestHandler 默认 keep-alive，必须显式关闭。",
+              "connection_header": "Connection: close（不是 keep-alive）",
+              "close_connection_flag": "self.close_connection = True 必须在 try 成功路径和 except/finally 错误路径都设置。只设 header 不设 flag → 连接仍不关闭。",
+              "past_bug_20260606": "keep-alive + 缺少 close_connection=True → benchmark 0/5 请求成功，warmup 请求持有 engine_lock 永久不释放 → 所有后续请求超时"
+            }
           },
           "non_streaming": {
             "flow": "engine.generate() → JSON response with choices/text/usage"
+          },
+          "worker_signal_handling": {
+            "_why": "non-rank0 worker 主线程阻塞在 dist.broadcast_object_list（NCCL/Gloo collective）。Python 默认信号处理在 C 调用返回后才执行，因此 SIGTERM 被无限延迟。",
+            "solution": "signal.signal(SIGTERM, handler) → handler 中调用 os._exit(0)。os._exit() 不经过 Python 解释器，直接终止进程。",
+            "past_bug_20260606": "缺少 signal handler → torchrun kill 后 4 个 python 子进程残留，各占 ~6.5GB GPU 显存"
           }
         },
         "startup_sequence": [
@@ -2264,8 +2275,10 @@
         },
         "failure_fallback_strategy": [
           "OpenAI server TP 不同步 → 检查 request_lock 是否序列化请求，broadcast 是否所有 rank 参与",
-          "non-rank0 卡死 → broadcast_obj 超时，检查 rank0 是否正确发送 action",
+          "non-rank0 卡死 → broadcast_obj 超时，检查 rank0 是否正确发送 action；检查 _tp_worker_loop 是否有 os._exit(0) signal handler",
           "streaming 无输出 → generate_stream() generator 是否正常迭代",
+          "SSE 连接不关闭（benchmark hang 根因 #1）→ 检查 Connection header 是 close 非 keep-alive；检查 try+except 路径都设置了 self.close_connection = True。症状：benchmark 0/N 成功，curl 超时 exit 28",
+          "benchmark 后 GPU 进程残留 → 检查 non-rank0 _tp_worker_loop 是否有 SIGTERM handler → os._exit(0)；检查清理脚本用 pkill -9 -f 'openai_tp_server.py' 而非 pkill -f 'torchrun'",
           "benchmark 吞吐不达标 → 回退到 phase_9 做性能诊断（clone 冗余、.item() sync、slot_mapping 循环）",
           "若正确性失败，回退到 phase_6（单层）或 phase_7（权重加载）做数值对齐。"
         ],

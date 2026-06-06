@@ -389,6 +389,8 @@ Phase 8 的组件（Scheduler/Sequence/Sampler/BlockManager）与模型层物理
 - openai_tp_server.py: ThreadingHTTPServer + /v1/completions
 - TP 同步: non-rank0 while-loop(broadcast_obj) + rank0 HTTP handler + threading.Lock 序列化
 - streaming(SSE) + non-streaming(JSON)
+- **SSE 响应必须** `Connection: close` + `self.close_connection = True`（SSE 无 Content-Length，keep-alive 导致客户端永久 hang）
+- **Non-rank0 worker 必须注册 SIGTERM handler → os._exit(0)**（主线程阻塞在 NCCL collective 时 Python 信号被延迟，os._exit 直接终止进程）
 
 ### Phase 10 Scripts（含硬性验收底线）
 

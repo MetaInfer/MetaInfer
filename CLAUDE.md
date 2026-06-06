@@ -280,6 +280,7 @@ verification           → 主 Agent 动作
 5. **跨 Phase 回归强制**：Phase 3 开始，verification 必须重跑所有前序 Phase 的 scripts/。任一回滚 → 打回。
 6. **证据优先**：Phase 10 必须有 profiler trace + HCU/VRAM 监控证据。无证据 = 假推理 = 验收失败。
 7. **本目录即是工程根**：所有生成代码直接写入本目录（`./engine/`、`./llm_engine.py`、`./openai_tp_server.py`）。严禁创建子目录 `agent-infer/` 并在其中写入代码——scripts/ 的 PYTHONPATH 指向本目录，不指向任何子目录。所有报告写入 `./phase_report/`，文件名前缀 PHASE<N>_。
+8. **API 服务生命周期完整**：openai_tp_server.py 的 SSE 流式响应必须设置 `Connection: close` header 并在成功和异常路径都设置 `self.close_connection = True`（SSE 无 Content-Length，keep-alive 导致 benchmark 永久 hang）。non-rank0 TP worker 必须在 `_tp_worker_loop` 注册 SIGTERM + SIGINT handler 并在 handler 内调用 `os._exit(0)`（主线程阻塞在 NCCL collective 时 Python 信号被延迟）。详见 AGENT_SKILL.md §2.4、inference_blueprint.json OpenAITPServer 组件。
 
 ## 包内文件说明
 
