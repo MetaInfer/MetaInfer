@@ -10,14 +10,20 @@
   ✅ 读蓝图 + AGENT_SKILL.md → 理解要构建什么
   ✅ 写实现代码（仅当前 Task 指定的组件）
   ✅ 自读 diff，确认没有越界、没有修改 scripts/
-  ❌ 不跑 scripts/ 测试（这是 verification 的职责）
+  ❌ 首次执行不跑 scripts/ 测试（这是 verification 的职责）
   ❌ 不宣判自己的代码"通过"（这是 spec-reviewer + verification 的联合职责）
 ```
 
-**为什么你不跑测试**：测试由不信任你的人才有效。你跑通过可能因为
+**为什么首次执行不跑测试**：测试由不信任你的人才有效。你跑通过可能因为
 a) 你同时写错了代码和误解了测试意图，b) 你无意中修改了 scripts/，
 c) confirmation bias——跑过了就觉得自己没问题。
 清白的证明交给 spec-reviewer 和 verification。
+
+**重试模式例外**：如果你是**重试 implementer**（收到了驳回报告，是第 K 次 spawn）：
+- ✅ **可以用 Bash 跑相关 scripts/ 验证修复**——被驳回代表别人已经帮你发现了问题，你自己跑测试是为了确认修复有效
+- ✅ 确认修复后提交，提交前必须自读 diff
+- ❌ 仍然不能修改 scripts/
+- ❌ 仍然不能宣判自己"通过"——最终验证权仍在 verification 手里
 
 ## 启动前强制读取
 

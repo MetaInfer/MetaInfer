@@ -161,34 +161,80 @@ Phase 5 RETRY。
 
 **步骤 B2：读取已有报告** — 打开 IMPLEMENTER_REPORT.md / SPEC_REVIEW_REPORT.md / VERIFICATION_REPORT.md，了解上次的状态和 spec-reviewer 发现的契约问题。
 
-**步骤 B3-B5** — 与模式 A 的步骤 A2-A4 相同，完整走 implementer → spec-reviewer → verification。**不得跳过任何环节。**
+**步骤 B3-B5** — 与模式 A 的步骤 A2-A4 相同。**重试 implementer 必须使用重试协议**（保留上下文 + 本地验证）而非首次执行 prompt。
 
 - implementer 根据 SPOT_CHECK_FAIL.md 的失败信息精准修复代码
-- spec-reviewer 重新对照蓝图审查（不知道上次结果）
-- verification 重新跑全部脚本
+- 打回 implementer 时遵循**重试协议**和**短路上报规则**（verification 行级错误跳过 spec 重审）
 - implementer→spec FAIL 或 implementer→verif FAIL 时，在内部打回 implementer，直到全部 PASS
 
 **步骤 B6：返回结构化摘要** — 与模式 A 相同格式。
 
-## implementer 打回循环
+## implementer 重试协议
 
-任一环节失败时的内部处理：
+### 重试 implementer spawn（保留上下文 + 本地验证）
+
+implementer 被驳回时，**禁止用步骤 A2 的首次执行 prompt**，必须使用以下增强 prompt：
+
+```
+Agent(
+  subagent_type: "general-purpose",
+  description: "Phase N implementer (RETRY #K)",
+  prompt: """
+你是 Phase N 的 implementer，这是第 K 次重试。你不是从头开始——你上一次已经写了代码，现在要精准修复被驳回的问题。
+
+## 你的上一次实现（保留上下文）
+<读取 PHASE<N>_IMPLEMENTER_REPORT.md，下文是该报告的完整粘贴>
+
+## 驳回原因
+<spec-reviewer 或 verification 的失败报告全文，含具体 file:line + 错误描述>
+
+## 当前代码
+先 Read ./engine/ 下的现有代码，理解当前状态。
+
+## 修复规则
+1. 读上一次实现报告，理解原始设计意图——**不要推翻重来，只修复被驳回的具体问题**
+2. 读驳回报告，定位具体 file:line 和错误原因
+3. 修改代码
+4. **用 Bash 工具本地跑相关 scripts/ 验证修复**——你自己能看测试输出，比靠别人转述的报告更准确
+5. 确认通过后提交。报告状态为 SUBMITTED，不是 PASS
+6. 禁止重构无关代码
+
+代码直接写入本目录下（./engine/、./llm_engine.py、./openai_tp_server.py）。
+"""
+)
+```
+
+### 短路上报：verification 发现行级错误时跳过 spec 重审
+
+verification 报告中的失败分两类，处理方式不同：
+
+| 失败类型 | 特征 | 处理 |
+|---------|------|------|
+| **行级错误** | verification 指出具体 file:line + 明确错误（变量名错误、缺参数、维度不对、缩进问题） | implementer 修复后**直接重跑 verification**，**不重跑 spec-reviewer** |
+| **架构问题** | 函数签名变更、新模块增删、接口改动、蓝图契约违反 | implementer 修复后 **spec-reviewer 必须重审**，再进入 verification |
+
+判断方法：读 verification 报告的失败条目。有明确 file:line + 修复方向 → 行级错误 → 走短路上报。描述涉及"架构/模式/契约"等大改 → 走完整链。
+
+---
+
+## implementer 打回循环
 
 ```
 implementer 返回 SUBMITTED
   → spec-reviewer 审查
-    → ❌ FAIL → 将 spec 报告原文传给 implementer
-      → implementer 修复 → 重新 SUBMITTED
-      → spec-reviewer 重新审查
-        → ✅ PASS → 进入 verification
-          → ❌ FAIL → 将 verification 报告原文传给 implementer
-            → implementer 修复 → 重新 SUBMITTED
-            → spec-reviewer 重新审查（必须重新通过）
-              → ✅ PASS → verification 重新验收
-                → ✅ PASS → 完成
+    → ❌ FAIL → implementer 重试（附上一次实现报告 + spec 报告，保留上下文）
+    → ✅ PASS → 进入 verification
+      → ❌ FAIL →
+          ├─ 行级错误 → implementer 重试（附实现报告 + verification 报告）→ 直接重跑 verification
+          └─ 架构问题 → implementer 重试 → spec-reviewer 重审 → verification 重跑
+      → ✅ PASS → 完成
 ```
 
-每次 implementer 重 spawn 时，**必须附带上一个失败环节的完整报告**，让 implementer 精准定位问题。
+**重试铁律**：
+- 重试 implementer 必须收到上一次的 IMPLEMENTER_REPORT.md（保留设计意图）
+- 重试 implementer 可以用 Bash 跑 scripts/ 验证修复（不再盲写）
+- 禁止推翻重来——只修复被驳回的具体问题
+- 短路上报仅限 verification → implementer 路径；spec-reviewer 驳回始终需要重新审查
 
 ### 模式 C：审计闭环（Phase 11 专用）
 
