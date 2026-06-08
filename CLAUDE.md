@@ -9,6 +9,7 @@
 第一层：先验知识（人类写，你只读）
   ├── inference_blueprint.json    ← 架构知识图谱（唯一契约来源）
   ├── AGENT_SKILL.md              ← 执行 SOP + 编码铁律
+  ├── .claude/skills/             ← Phase 任务卡 + 通用性能 skill（短触发词驱动）
   └── scripts/                    ← 固定测试合约（26 个，不可修改）
 
 第二层：生成产物（你写，受第一层约束，直接写入本目录）
@@ -52,7 +53,10 @@ inference-agent-system/         ← 本包（工程根目录）
 
 ## 启动时强制动作
 
-0. **询问用户环境配置**：在开始任何工作前，必须先确认以下路径（如果用户尚未提供）：
+0. **询问用户环境配置**：在开始任何工作前，必须先确认以下路径（如果用户尚未提供）。
+
+   如果 `.env_agent_infer` 文件已存在，直接 `source .env_agent_infer` 加载，跳过询问步骤。
+   否则使用 AskUserQuestion 一次性询问用户两个问题：
    - **模型目录 (MODEL_DIR)**：模型权重文件所在的目录（如 `/data/models`）
    - **Python 环境 (PYTHON_PATH)**：包含 `python`、`flash_attn`、`vLLM` 的 conda/venv 的 bin 目录（如 `/opt/conda/envs/meta/bin`）
    
@@ -63,6 +67,20 @@ inference-agent-system/         ← 本包（工程根目录）
    # 验证 Python 环境
    "${PYTHON_PATH}/python" -c "import torch; import flash_attn; print(f'CUDA:{torch.cuda.is_available()} flash_attn OK')"
    ```
+   
+   验证通过后，持久化环境变量到 `.env_agent_infer`（供当前及后续 Phase 子代理 `source` 加载）：
+   ```bash
+   cat > .env_agent_infer << 'ENVEOF'
+   export AGENT_INFER_ROOT="$(pwd)"
+   export PYTHON_PATH="__PYTHON_PATH__"
+   export MODEL_DIR="__MODEL_DIR__"
+   export PATH="${PYTHON_PATH}:$PATH"
+   export PYTHONPATH="${AGENT_INFER_ROOT}:$PYTHONPATH"
+   ENVEOF
+   sed -i "s|__PYTHON_PATH__|${PYTHON_PATH}|g" .env_agent_infer
+   sed -i "s|__MODEL_DIR__|${MODEL_DIR}|g" .env_agent_infer
+   ```
+   `.env_agent_infer` 不提交到 git（加入 `.gitignore`），每台机器独立生成。
 
 1. 读取 `inference_blueprint.json`（先看 `agent_navigation`，再按需展开）
 2. 读取 `AGENT_SKILL.md`（含编码铁律、Phase-Script 绑定表、Debug 指南）
@@ -74,6 +92,16 @@ inference-agent-system/         ← 本包（工程根目录）
    ```
 4. 确认目标模型 `config.json`（architectures, rope_scaling, num_heads 等）
 5. 输出"模型路由结论"：Dense 还是 MLA+MoE
+6. **ref_projects 预拉取**：检查 `ref_projects/` 目录是否为空（或不存在关键参考文件）。若为空：
+   ```bash
+   # 尝试 git submodule update（如果项目使用 submodule）
+   git submodule update --init --recursive 2>/dev/null || true
+   
+   # 验证 ref_projects 下至少有一个参考工程目录
+   ls ref_projects/nano-vllm/ 2>/dev/null || echo "WARNING: ref_projects 为空，知识将从蓝图+AGENT_SKILL.md 获取"
+   ```
+   如果 git clone / submodule 均不可用（无网络、无 git），提示用户手动下载参考工程到 `ref_projects/` 目录，然后跳过继续。ref_projects 是辅助参考——蓝图和 AGENT_SKILL.md 已包含核心知识，缺失不影响构建。
+7. **MEMORY 回溯**：检查 `./phase_report/` 下是否存在前序 Phase 的 `PHASE<N>_MEMORY.md` 文件。若存在 → 读取最近完成的 Phase MEMORY，快速重建上下文（已完成的 Phase、通过的脚本、关键文件改动）。这对长对话恢复至关重要。
 
 ## 对抗子代理协作流（Superpowers 风格）
 
@@ -82,6 +110,10 @@ inference-agent-system/         ← 本包（工程根目录）
 **核心原则**：implementer 不自证清白——它只产出代码，不跑测试，不宣判 PASS。
 审查串行执行：先 spec-reviewer（蓝图契约核验），通过后才到 verification（测试+证据）。
 二者不并行——spec-reviewer ❌ 时，verification 根本不需要跑，节省资源且消除"测试都过了就放行"的降级冲动。
+
+**双轨审查**：完整串行路径（impl→spec→verify）是默认路径，适用于首次大段构建。当 implementer 被驳回后进行**小范围修复**（几行代码改动）时，可走快速修复路径——跳过 spec-reviewer，直接 impl→verify→impl 闭环迭代，以 verification 的测试结果作为反馈信号驱动修复。两条路径的红线不变：impl 只写不测，verify 只测不改。
+
+### 完整串行路径（首次大段构建，强制）
 
 ```
                     ┌─────────────────────┐
@@ -102,7 +134,7 @@ inference-agent-system/         ← 本包（工程根目录）
                           ▼
                     ┌────────────┐      ❌ FAIL
                     │spec-reviewer│ ──────────→ 打回 implementer
-                    │ 对照蓝图审查 │
+                    │ 对照蓝图审查 │              （重走完整串行）
                     │ 独立读代码   │
                     │ 核对契约     │
                     └─────┬──────┘
@@ -110,7 +142,7 @@ inference-agent-system/         ← 本包（工程根目录）
                           ▼
                     ┌────────────┐      ❌ FAIL
                     │verification│ ──────────→ 打回 implementer
-                    │ L1:scripts/ │
+                    │ L1:scripts/ │              （重走完整串行）
                     │ L2:跨Phase  │
                     │ L3:profiler │
                     │   +HCU证据  │
@@ -120,6 +152,42 @@ inference-agent-system/         ← 本包（工程根目录）
                     ┌────────────┐
                     │  Phase 交付 │
                     └────────────┘
+```
+
+### 快速修复路径（小范围改动，跳过 spec-reviewer）
+
+仅当 implementer 被驳回后进行**几行代码的修复**时可用。首次大段构建禁止走此路径。
+
+```
+                    ┌─────────────────────┐
+                    │  主 Agent（你）       │
+                    │  收到 FAIL 报告      │
+                    │  判断：小范围修复？   │
+                    └──────┬──────────────┘
+                           │ ✅ 是（几行改动）
+                           ▼
+                    ┌────────────┐
+                    │ implementer│
+                    │ 读 FAIL 报告│
+                    │ 定位根因    │
+                    │ 修改几行代码 │
+                    │ → SUBMITTED│
+                    └─────┬──────┘
+                          │
+                          ▼
+                    ┌────────────┐      ❌ FAIL
+                    │verification│ ──────────→ 打回 implementer
+                    │ 跑 scripts/ │              （继续快速修复闭环）
+                    │ 返回测试结果 │
+                    └─────┬──────┘
+                          │ ✅ PASS
+                          ▼
+                    ┌────────────┐
+                    │  Phase 交付 │
+                    └────────────┘
+
+快速修复路径下，verification 报告即是交付凭证。
+连续 2 次快速修复仍 FAIL → 升级为完整串行路径（重新走 spec-reviewer）。
 ```
 
 ### 子代理 Prompt 模板位置
@@ -182,7 +250,7 @@ Agent(
 **步骤 2**：implementer 返回后，主 Agent 先启动 spec-reviewer（Shell `claude -p`）：
 
 ```bash
-claude -p "
+source .env_agent_infer && claude -p "
 读取 .claude/skills/spec-reviewer-inference.md 了解你的角色边界。
 
 审查对象：./engine/ 下的代码文件。
@@ -203,7 +271,7 @@ spec-reviewer 返回后：
 **步骤 3**：spec-reviewer ✅ 后，主 Agent 启动 verification（Shell `claude -p`）：
 
 ```bash
-claude -p "
+source .env_agent_infer && claude -p "
 读取 .claude/skills/verification-inference.md 了解你的角色边界。
 
 验收对象：./engine/ 下的代码文件。
@@ -227,6 +295,7 @@ verification 返回后，主 Agent 须完成**两步验证**才能进入步骤 4
 **步骤 3.5（防假 PASS 抽查）**：verification 报告声称全部 PASS 后，主 Agent **必须**从 Phase N 的 scripts/ 中随机抽取 1 个脚本，亲自重跑：
 
 ```bash
+source .env_agent_infer
 # 随机选 1 个脚本重跑，比对 verification 报告中的原始 stdout 是否一致
 RANDOM_SCRIPT=$(ls scripts/test_phase${N}_*.py scripts/test_phase${N}_*.sh 2>/dev/null | shuf -n1)
 ACTUAL_OUTPUT=$(python "${RANDOM_SCRIPT}" 2>&1 || bash "${RANDOM_SCRIPT}" 2>&1)
@@ -237,7 +306,56 @@ ACTUAL_OUTPUT=$(python "${RANDOM_SCRIPT}" 2>&1 || bash "${RANDOM_SCRIPT}" 2>&1)
 - 输出不一致或脚本报错 → verification 报告作假 → **整个 Phase 驳回** → 重新 spawn verification（不是 implementer 的问题）
 - 如果 Phase 只有 .sh 脚本（无 .py），用 bash 运行
 
-**步骤 4**：抽查通过后，主 Agent 收集两个子代理的报告，作为**信使**（非裁判）汇总结果：
+**步骤 4**：抽查通过后，主 Agent 收集两个子代理的报告，作为**信使**（非裁判）汇总结果。
+
+**步骤 5（MEMORY 强制）**：步骤 4 完成后，写入物理 MEMORY 文件——这是防上下文失忆的关键机制。
+
+写入 `./phase_report/PHASE<N>_MEMORY.md`：
+
+```markdown
+# Phase N Memory — [Phase 名称]
+
+| 字段 | 值 |
+|------|-----|
+| Timestamp | [ISO 时间戳] |
+| Status | ✅ DELIVERED |
+| Track | 完整串行 / 快速修复 |
+| PID impl | [pid] |
+| PID spec | [pid]（快速修复路径填 N/A） |
+| PID verif | [pid] |
+
+## Scripts Passed
+- [脚本名]: PASS
+- ...
+
+## Files Changed
+- [文件路径]（+N 行 / -M 行）
+- ...
+
+## Spot Check
+- 抽查脚本: [脚本名]
+- 结果: 一致 ✅ / 不一致 ❌
+
+## Errors Encountered
+- [错误描述] → [根因] → [修复方式]
+- 如无则写 "None"
+```
+
+后续会话或后续 Phase 的主 Agent 在启动前应读取前序 Phase 的 MEMORY 文件，快速重建上下文。
+
+**步骤 6（git commit 存档）**：步骤 5 完成后，检测 git 可用性并提交：
+
+```bash
+# 检测 git 是否可用
+if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null; then
+    git add engine/ llm_engine.py openai_tp_server.py phase_report/ .env_agent_infer 2>/dev/null || true
+    git commit -m "phase${N}: [Phase名称] — spec=✅ verif=✅"
+else
+    echo "[GIT] git 不可用（环境无 git 或非 git 仓库），跳过 commit 存档"
+fi
+```
+
+commit message 含 spec/verif 结论，方便日后 `git log --oneline` 快速定位各 Phase 状态。
 
 ```
 主 Agent 的步骤 4 职责边界：
@@ -250,7 +368,19 @@ ACTUAL_OUTPUT=$(python "${RANDOM_SCRIPT}" 2>&1 || bash "${RANDOM_SCRIPT}" 2>&1)
   ❌ 不得绕过子代理自行判断代码是否合格
 ```
 
-判定逻辑（串行，硬编码，不可修改）：
+判定逻辑（双轨，硬编码，不可修改）：
+
+**轨道选择（主 Agent 在 spawn implementer 前判断）：**
+
+```
+implementer 任务类型        → 审查轨道
+─────────────────────────────────────────
+首次大段构建（新 Phase）     → 完整串行路径（impl→spec→verify）
+驳回后修复，改动 >10 行      → 完整串行路径（impl→spec→verify）
+驳回后修复，改动 ≤10 行      → 快速修复路径（impl→verify 闭环）
+```
+
+**完整串行路径判定：**
 
 ```
 spec-reviewer          → 主 Agent 动作
@@ -265,8 +395,18 @@ verification           → 主 Agent 动作
 ❌ FAIL                → 打回 implementer（附 verification 报告全文）
 ```
 
+**快速修复路径判定：**
+
+```
+verification           → 主 Agent 动作
+─────────────────────────────────────────
+✅ PASS                → Phase N 交付（verification 报告即交付凭证）
+❌ FAIL                → 打回 implementer（附 verification 报告全文），继续快速修复闭环
+                         连续 2 次 FAIL → 升级为完整串行路径（加入 spec-reviewer）
+```
+
 **不存在"部分通过""有条件交付""MINOR 可忽略"等中间状态。** spec-reviewer 或 verification 的 ❌ 就是 ❌，主 Agent 无权降级。
-如有 implementer 连续 2 次被驳回 → 主 Agent 停下来，向人类报告阻塞点与驳回报告全文。
+如有 implementer 连续 2 次被驳回（任一轨道）→ 主 Agent 停下来，向人类报告阻塞点与驳回报告全文。
 
 ### 反模式警告
 
@@ -281,6 +421,8 @@ verification           → 主 Agent 动作
 | 主 Agent 手动修改 implementer 的代码后再交给 reviewer | reviewer 不知道改动来源，无法追溯 |
 | implementer 在提交前自己跑了 scripts/ 并声称 PASS | implementer 可能同时误解了测试意图和代码逻辑，两边一起错 |
 | 主 Agent 手动将 spec-reviewer 的 ❌FAIL 降级为"MINOR""有条件交付" | 主 Agent 不是裁判——它没读代码细节，没资格判断 FAIL 是否"可忽略"。这是对抗结构最致命的破坏 |
+| 首次大段构建或大范围改动（>10行）走快速修复路径跳过 spec-reviewer | 大段代码未经蓝图契约核验，verification PASS 不代表架构正确。快速修复路径仅限驳回后的小修小补 |
+| 快速修复路径中 implementer 自己跑测试 | 破坏 impl/verify 红线——快速修复路径只是跳过 spec，impl 与 verify 的对峙关系不变 |
 
 ### 执行铁律
 
@@ -291,6 +433,10 @@ verification           → 主 Agent 动作
 5. **跨 Phase 回归强制**：Phase 3 开始，verification 必须重跑所有前序 Phase 的 scripts/。任一回滚 → 打回。
 6. **证据优先**：Phase 10 必须有 profiler trace + HCU/VRAM 监控证据。无证据 = 假推理 = 验收失败。
 7. **本目录即是工程根**：所有生成代码直接写入本目录（`./engine/`、`./llm_engine.py`、`./openai_tp_server.py`）。严禁创建子目录 `agent-infer/` 并在其中写入代码——scripts/ 的 PYTHONPATH 指向本目录，不指向任何子目录。所有报告写入 `./phase_report/`，文件名前缀 PHASE<N>_。
+8. **快速修复路径准入条件**：仅当 implementer 被驳回后进行小范围修复（≤10 行代码改动）时可跳过 spec-reviewer，走 impl→verify 闭环。首次大段构建**必须**走完整串行路径（impl→spec→verify）。快速修复连续 2 次 FAIL → 强制升级为完整串行路径。无论哪条路径，红线不变：impl 只写不测，verify 只测不改。
+9. **MEMORY 强制（防上下文失忆）**：每个 Phase 交付后，必须将本轮构建详情写入 `./phase_report/PHASE<N>_MEMORY.md`（结构化记录：时间戳、通过的脚本清单、改动的文件清单、PID 交叉验证结果、遇到的错误及修复方式）。该文件是跨会话恢复上下文的关键——当 agent 上下文因长对话被压缩后，后续 Phase 通过读取 MEMORY 文件重建前序状态。也是失败回溯时的重要参考。
+10. **git commit 强制（代码存档）**：每个 Phase 交付后，检测当前目录是否为 git 仓库且有 `git` 命令可用。若是 → `git add` 本 Phase 产生的代码+文档+报告，`git commit` 存档。若不可用（如用户 download zip 或环境无 git）→ 跳过并打印提示。commit message 格式：`phase<N>: <Phase名称> — spec=✅/❌ verif=✅/❌`。
+11. **ref_projects 预拉取**：Phase 1 启动前，检查 `ref_projects/` 目录是否为空。若为空，执行 `git submodule update --init --recursive` 或提示用户手动下载参考工程。若 GitHub 不可达 → 跳过，继续正常构建（知识从蓝图和 AGENT_SKILL.md 获取，ref_projects 是辅助参考）。
 
 ## 包内文件说明
 
@@ -300,7 +446,37 @@ verification           → 主 Agent 动作
 | `AGENT_SKILL.md` | 执行 SOP，含 §0.-2 路径兼容规则 |
 | `notebooks-cn/` | 知识文档（中文） |
 | `ref_projects/` | 参考工程源码（nano-vllm, vllm, sglang） |
-| `scripts/` | 固定测试合约（26 个，不可修改） |
+| `scripts/` | 固定测试合约（28 个，不可修改） |
+| `.claude/skills/phase1-4/SKILL.md` | Phase 1-4 任务卡：数值基元 → TP Embedding |
+| `.claude/skills/phase5/SKILL.md` | Phase 5 任务卡：Attention + KV Cache（最高错误密度） |
+| `.claude/skills/phase6/SKILL.md` | Phase 6 任务卡：MLP + Decoder Layer |
+| `.claude/skills/phase7-8/SKILL.md` | Phase 7-8 任务卡：权重加载 + 框架外壳 |
+| `.claude/skills/phase9-10/SKILL.md` | Phase 9-10 任务卡：引擎集成 + E2E 验收 |
+| `.claude/skills/phase11/SKILL.md` | Phase 11 任务卡：性能优化 |
+| `.claude/skills/torch-inference-mode.md` | 通用 skill：@torch.inference_mode() 模式 |
+| `.claude/skills/performance_alignment_by_tracing.md` | 通用 skill：基于 tracing 的性能对齐方法论 |
+
+## Phase Skill 触发体系
+
+本包采用**短触发词 + 任务卡**模式替代传统的大篇幅 prompt 粘贴。用户只需输入触发词（如 `/phase5`），主 Agent 读取对应的 SKILL.md 了解**构建什么**，然后按 CLAUDE.md 的 spawn 协议执行**怎么构建**。
+
+```
+用户输入触发词（如 /phase5）
+  → 主 Agent 读取 .claude/skills/phase5/SKILL.md（任务卡：构建目标+脚本门禁+知识映射+高发错误）
+  → 按 CLAUDE.md §对抗子代理协作流 执行完整串行路径（impl→spec→verify→抽查→汇总）
+  → 工作流细节不写入 SKILL.md（避免重复），SKILL.md 仅含 Phase 特有信息
+```
+
+| 触发词 | Skill 文件 | 构建范围 |
+|--------|-----------|---------|
+| `/phase1-4` | `.claude/skills/phase1-4/SKILL.md` | 数值基元 → TP Embedding（4 Phase 依次） |
+| `/phase5` | `.claude/skills/phase5/SKILL.md` | Attention + KV Cache |
+| `/phase6` | `.claude/skills/phase6/SKILL.md` | MLP + Decoder Layer |
+| `/phase7-8` | `.claude/skills/phase7-8/SKILL.md` | 权重加载 + 框架外壳 |
+| `/phase9-10` | `.claude/skills/phase9-10/SKILL.md` | 引擎集成 + E2E 验收 |
+| `/phase11` | `.claude/skills/phase11/SKILL.md` | 性能优化 |
+
+**工作流不变**：所有 Phase 仍然走 impl→spec→verify 三层对抗串行（含快速修复路径），主 Agent 直接 orchestrate 三角色，不引入 phase-runner 中间层。
 
 ## Phase-Script 绑定（快速参考）
 
@@ -321,9 +497,8 @@ verification           → 主 Agent 动作
 ## 测试运行
 
 ```bash
-# 在本目录下执行，先设置环境
-export PATH="${PYTHON_PATH}:$PATH"
-export PYTHONPATH="$(pwd):$PYTHONPATH"
+# 在本目录下执行，先加载环境
+source .env_agent_infer
 
 # Python 合约
 python scripts/test_phaseN_xxx.py

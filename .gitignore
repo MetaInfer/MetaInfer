@@ -35,3 +35,6 @@ Thumbs.db
 
 # uv
 uv.lock
+
+# Agent-infer 环境文件（每台机器独立生成，不提交）
+.env_agent_infer

@@ -85,6 +85,44 @@ cd /path/to/target && PYTHONPATH="$(pwd):$PYTHONPATH" \
 | 目标框架 | Y.YYYs | YY.Y tok/s | -Z% |
 ```
 
+#### 以 vLLM Eager 模式为基准（Phase 11 场景）
+
+当基准框架为 vLLM Eager 模式（无 CUDA Graph）时，使用 `torch.profiler.ProfilerConfig` 建立 profiler 基线：
+
+```python
+import torch
+import os
+from vllm import LLM, SamplingParams
+from vllm.config import ProfilerConfig
+
+MODEL_DIR = os.environ.get("MODEL_DIR", "")
+TP_SIZE = int(os.environ.get("TP_SIZE", "4"))
+PROMPT = "苏州园林的特点是"
+MAX_TOKENS = 32
+
+# vLLM Eager 模式（enforce_eager=True 禁用 CUDA Graph）
+llm = LLM(
+    model=MODEL_DIR,
+    tensor_parallel_size=TP_SIZE,
+    enforce_eager=True,
+    gpu_memory_utilization=0.85,
+    max_model_len=4096,
+    profiler_config=ProfilerConfig(
+        enabled=True,
+        trace_path="./perf_iteration/trace_baseline",
+        record_shapes=True,
+        with_stack=True,
+        profile_memory=True,
+    ),
+)
+
+sampling_params = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
+outputs = llm.generate([PROMPT], sampling_params)
+print(f"vLLM eager output: {outputs[0].outputs[0].text}")
+```
+
+如果 `ref_projects/vllm/examples/offline_inference/simple_profiling.py` 存在，可直接复用；否则使用上述代码（Python 环境中的 vLLM 包即可，无需 ref_projects）。
+
 ### 步骤 2：编写统一 profiler 脚本
 
 编写一个可切换两个框架的 profiler 脚本（参考 `perf_iteration/profiler_compare.py`），关键要素：
