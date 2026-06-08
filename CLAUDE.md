@@ -9,7 +9,8 @@
 第一层：先验知识（人类写，你只读）
   ├── inference_blueprint.json    ← 架构知识图谱（唯一契约来源）
   ├── AGENT_SKILL.md              ← 执行 SOP + 编码铁律
-  ├── .claude/skills/             ← Phase 任务卡 + 通用性能 skill（短触发词驱动）
+  ├── .claude/skills/             ← Phase 任务卡（短触发词驱动，仅目录+SKILL.md）
+  ├── .claude/roles/              ← 子代理角色定义 + 通用性能模板（不被 skill loader 扫描）
   └── scripts/                    ← 固定测试合约（26 个，不可修改）
 
 第二层：生成产物（你写，受第一层约束，直接写入本目录）
@@ -194,9 +195,9 @@ inference-agent-system/         ← 本包（工程根目录）
 
 | 角色 | Prompt 文件 | 职责 | 跑测试？ | 宣判 PASS？ |
 |------|-----------|------|---------|-----------|
-| implementer | `.claude/skills/implementer-inference.md` | 读蓝图+AGENT_SKILL → 写代码 → 自读diff → 提交 | ❌ | ❌ |
-| spec-reviewer | `.claude/skills/spec-reviewer-inference.md` | 不信任实现者 → 独立逐行读代码 → 对照蓝图每条契约核验 | ❌ | ❌ |
-| verification | `.claude/skills/verification-inference.md` | **唯一测试执行者**：L1 scripts/ + L2 跨Phase回归 + L3 profiler/HCU | ✅ | ✅ |
+| implementer | `.claude/roles/implementer-inference.md` | 读蓝图+AGENT_SKILL → 写代码 → 自读diff → 提交 | ❌ | ❌ |
+| spec-reviewer | `.claude/roles/spec-reviewer-inference.md` | 不信任实现者 → 独立逐行读代码 → 对照蓝图每条契约核验 | ❌ | ❌ |
+| verification | `.claude/roles/verification-inference.md` | **唯一测试执行者**：L1 scripts/ + L2 跨Phase回归 + L3 profiler/HCU | ✅ | ✅ |
 
 ### ⚠️ 子代理必须物理隔离——禁止同一 Agent 扮演三个角色
 
@@ -228,7 +229,7 @@ Agent(
   subagent_type: "general-purpose",
   description: "Phase N implementer",
   prompt: """
-读取 .claude/skills/implementer-inference.md 了解你的角色边界。
+读取 .claude/roles/implementer-inference.md 了解你的角色边界。
 你的 Task：实现 Phase N [具体组件名]。
 
 启动前强制读取：
@@ -251,7 +252,7 @@ Agent(
 
 ```bash
 source .env_agent_infer && claude -p "
-读取 .claude/skills/spec-reviewer-inference.md 了解你的角色边界。
+读取 .claude/roles/spec-reviewer-inference.md 了解你的角色边界。
 
 审查对象：./engine/ 下的代码文件。
 （不要读 implementer 的报告或任何其他对话日志——只读代码文件本身）
@@ -272,7 +273,7 @@ spec-reviewer 返回后：
 
 ```bash
 source .env_agent_infer && claude -p "
-读取 .claude/skills/verification-inference.md 了解你的角色边界。
+读取 .claude/roles/verification-inference.md 了解你的角色边界。
 
 验收对象：./engine/ 下的代码文件。
 
@@ -453,8 +454,8 @@ verification           → 主 Agent 动作
 | `.claude/skills/phase7-8/SKILL.md` | Phase 7-8 任务卡：权重加载 + 框架外壳 |
 | `.claude/skills/phase9-10/SKILL.md` | Phase 9-10 任务卡：引擎集成 + E2E 验收 |
 | `.claude/skills/phase11/SKILL.md` | Phase 11 任务卡：性能优化 |
-| `.claude/skills/torch-inference-mode.md` | 通用 skill：@torch.inference_mode() 模式 |
-| `.claude/skills/performance_alignment_by_tracing.md` | 通用 skill：基于 tracing 的性能对齐方法论 |
+| `.claude/roles/torch-inference-mode.md` | 通用 skill：@torch.inference_mode() 模式 |
+| `.claude/roles/performance_alignment_by_tracing.md` | 通用 skill：基于 tracing 的性能对齐方法论 |
 
 ## Phase Skill 触发体系
 

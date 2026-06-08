@@ -1,6 +1,20 @@
 # Phase 触发词速查
 
-直接输入触发词即可启动对应 Phase 的 agent 构建流程。所有 Phase 均遵循 `CLAUDE.md` 定义的三代理对抗协作流（implementer → spec-reviewer → verification）。
+## 快速开始
+
+1. `cd` 到本项目根目录
+2. 让 agent **先阅读 `CLAUDE.md`** 理解三代理对抗协作流
+3. 输入下方触发词即可启动构建
+
+```
+# 示例：在新会话中启动 Phase 1-4
+cd /path/to/meta-infer
+# 然后对 agent 说："请阅读 CLAUDE.md，然后执行 /phase1-4"
+```
+
+> **注意**：首次使用需要配置 Python 环境和模型路径。启动任一 Phase 后 agent 会自动询问 `MODEL_DIR` 和 `PYTHON_PATH`，写入 `.env_agent_infer` 供后续会话复用。
+
+## 触发词
 
 | 触发词 | Phase | 构建内容 |
 |--------|-------|---------|
@@ -12,8 +26,6 @@
 | `/phase11` | 11 | 性能优化（知识规则 + Tracing 对齐） |
 
 ## Skill 文件位置
-
-每个 Phase 的详细任务卡位于：
 
 ```
 .claude/skills/phase1-4/SKILL.md
