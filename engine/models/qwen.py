@@ -389,11 +389,10 @@ class QwenAttentionTP(nn.Module):
         self._kv_len_gpu[0] += 1
 
         # 6. Flash attention with paged KV cache
-        # q format: [1, num_heads, head_dim] (reshape from [1,1,H,D])
-        q_attn = q.reshape(1, self.num_heads, self.head_dim)
+        # q: [1, 1, num_heads, head_dim] for flash_attn_with_kvcache
 
         out = flash_attn_with_kvcache(
-            q_attn,
+            q,
             self._key_cache,
             self._value_cache,
             cache_seqlens=self._kv_len_gpu,
@@ -540,15 +539,23 @@ class QwenDecoderLayerTP(nn.Module):
           fused_add_rms_norm → attention → fused_add_rms_norm → mlp
           → return (mlp_out, residual)
 
-        residual is never None in decode — it is carried from prefill.
+        residual is never None in decode — set by first layer's clone guard.
         """
-        # residual always provided in decode (carried from prefill stage)
-        fused_add_rms_norm(
-            hidden_states,
-            residual,
-            self.input_layernorm.weight,
-            self.input_layernorm.eps,
-        )
+        if residual is None:
+            residual = hidden_states.clone()
+            rms_norm(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+            )
+        else:
+            fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+            )
 
         attn_out = self.self_attn.forward_decode(
             hidden_states, positions, kv_len, max_seq_len
@@ -837,3 +844,74 @@ class QwenForCausalLMTP(nn.Module):
             cat_gate_up = torch.cat([parts["gate"], parts["up"]], dim=0)
             self.layers[layer_idx].mlp.gate_up_proj.load_weight_shard(cat_gate_up)
             del pending_gate_up[layer_idx]  # free memory
+
+    # ------------------------------------------------------------------
+    # Unified forward dispatch (prefill / decode)
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values=None,
+        position_offset: int = 0,
+        max_seq_len: int = 40960,
+    ) -> torch.Tensor:
+        """Unified forward dispatch: prefill (past_key_values=None) vs decode.
+
+        Prefill (B=1 single-seq):
+          embed → loop layers.forward() → norm → lm_head → logits [1, S, vocab]
+
+        Decode (B=1 single-seq):
+          embed → loop layers.forward_decode() → norm → lm_head → logits [1, 1, vocab]
+
+        Args:
+            input_ids: [B, S] for prefill or [B, 1] for decode.
+            past_key_values: None = prefill; int = decode (current kv_len before step).
+            position_offset: starting position index (0 for prefill, kv_len for decode).
+            max_seq_len: max model context length.
+
+        Returns:
+            logits: [B, S, vocab_size] prefill or [B, 1, vocab_size] decode.
+        """
+        if past_key_values is None:
+            # —— Prefill ——
+            B, S = input_ids.shape
+            hidden_states = self.embed_tokens(input_ids)  # [B, S, hidden_size]
+            positions = torch.arange(
+                position_offset, position_offset + S,
+                dtype=torch.int64, device=input_ids.device,
+            )
+
+            residual = None
+            for layer in self.layers:
+                hidden_states, residual = layer(
+                    hidden_states, positions, None, max_seq_len, residual
+                )
+
+            hidden_states, _ = self.norm(hidden_states, residual)
+            logits = self.lm_head(hidden_states)  # [B, S, vocab_size]
+            return logits, None
+        else:
+            # —— Decode ——
+            kv_len = (
+                past_key_values
+                if isinstance(past_key_values, int)
+                else past_key_values[0]
+            )
+            B, S = input_ids.shape  # B=1, S=1
+            hidden_states = self.embed_tokens(input_ids)  # [1, 1, hidden_size]
+            positions = torch.tensor(
+                [kv_len], dtype=torch.int64, device=input_ids.device
+            )
+
+            residual = None
+            for layer in self.layers:
+                hidden_states, residual = layer.forward_decode(
+                    hidden_states, positions, kv_len, max_seq_len, residual
+                )
+
+            hidden_states, _ = self.norm(hidden_states, residual)
+            logits = self.lm_head(hidden_states)  # [1, 1, vocab_size]
+            kv_lens = [int(l.self_attn._kv_len_gpu[0].item()) for l in self.layers]
+            return logits, kv_lens

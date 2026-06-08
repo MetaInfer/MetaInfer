@@ -6,10 +6,10 @@
 # Superpowers gate: CLAUDE.md rule 2 — FG-4 real gap from V17 audit
 # Trace Source: physical_trace_tp4_rank0.json [derived] max_blocks=160, block_size=256
 # Human review: [待人类Diff]
-import json; import torch; torch.manual_seed(42)
+import json; import os; import torch; torch.manual_seed(42)
 TRACE="physical_trace_tp4_rank0.json"
 
-CFG_PATH="${MODEL_DIR}/config.json"
+CFG_PATH=os.path.join(os.environ["MODEL_DIR"], "config.json")
 
 
 def test_select_tp_backend_qwen():

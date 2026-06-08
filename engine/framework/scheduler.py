@@ -67,6 +67,7 @@ class Scheduler:
     def __init__(self, block_size: int, max_blocks: int):
         self._block_size = block_size
         self._max_blocks = max_blocks
+        self._reserved_blocks = 0
 
     # ------------------------------------------------------------------
     # schedule — main entry point
@@ -102,7 +103,7 @@ class Scheduler:
 
         # Step 1: Prefill first — try to schedule waiting sequences
         scheduled_prefill: List[Sequence] = []
-        free = num_free_blocks
+        free = num_free_blocks - self._reserved_blocks
         for seq in remaining_waiting:
             req_blocks = self._required_blocks_for_prompt(seq.prompt_len)
             if req_blocks <= free:
@@ -113,6 +114,10 @@ class Scheduler:
             # else: not enough blocks, stays WAITING until next schedule() call
 
         if scheduled_prefill:
+            self._reserved_blocks += sum(
+                self._required_blocks_for_prompt(s.prompt_len)
+                for s in scheduled_prefill
+            )
             return ScheduleResult(
                 scheduled_prefill=scheduled_prefill,
                 scheduled_decode=[],
@@ -129,6 +134,7 @@ class Scheduler:
             # Sequences that can't get a decode block will be retried
             # on the next schedule() call.
 
+        self._reserved_blocks += len(scheduled_decode)
         return ScheduleResult(
             scheduled_prefill=[],
             scheduled_decode=scheduled_decode,
@@ -170,6 +176,9 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
             elif len(seq.output_ids) >= seq.max_output_len:
                 seq.status = SequenceStatus.FINISHED
+
+        # Reset reservation counter after forward pass completes
+        self._reserved_blocks = 0
 
     # ------------------------------------------------------------------
     # Helpers
