@@ -16,7 +16,7 @@ dependencies = []
 dev = ["ruff", "pre-commit"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/meta_infer"]
+packages = ["engine"]
 
 [tool.ruff]
 target-version = "py310"
