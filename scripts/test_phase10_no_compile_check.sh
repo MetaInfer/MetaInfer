@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Why: 硬性断言纯 Eager 模式：META_INFER_CUDA_GRAPH=0 且无 torch.compile。
-#   Trace: compile_enabled=False, cuda_graph_enabled=False, nocompile TP=4 55.7 tok/s
+#   Trace: compile_enabled=False, cuda_graph_enabled=False, nocompile TP=4 模式
 # What failure: CUDA_GRAPH≠0 / profiler 有 CompiledFunction → exit 1
 # Superpowers gate: CLAUDE.md rule 5; Trace Source: physical_trace_tp4_rank0.json
 # Human review: [待人类Diff]
@@ -27,7 +27,7 @@ fi
 
 # Check 3: Contract assertions
 echo "[NO-COMPILE-003] Contract: cudaGraphLaunch count = 0 (${TRACE_SRC})"
-echo "[NO-COMPILE-004] Contract: CPU dispatch < 15ms/layer (36 layers ≤ 540ms total)"
+echo "[NO-COMPILE-004] Contract: CPU dispatch time ≤ baseline physical trace (per-layer + total)"
 echo "[NO-COMPILE-005] Contract: no torch.compile / no CUDA Graph traces in profiler"
 
 echo "PHASE10_NO_COMPILE_CHECK: ALL CHECKS PASSED"

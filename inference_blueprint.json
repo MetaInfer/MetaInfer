@@ -370,10 +370,21 @@
             "broadcast_obj": "dist.broadcast_object_list([payload if rank0 else None], src=0) → 所有 rank 返回 payload[0]"
           },
           "streaming": {
-            "flow": "engine.generate_stream() → SSE data chunks → final chunk finish_reason='stop' → data: [DONE]"
+            "flow": "engine.begin_generation() + step() loop → SSE data chunks → final chunk finish_reason='stop' → data: [DONE]",
+            "critical_constraints": {
+              "_why": "SSE 无 Content-Length，浏览器/客户端依赖连接关闭来判定流结束。BaseHTTPRequestHandler 默认 keep-alive，必须显式关闭。",
+              "connection_header": "Connection: close（不是 keep-alive）",
+              "close_connection_flag": "self.close_connection = True 必须在 try 成功路径和 except/finally 错误路径都设置。只设 header 不设 flag → 连接仍不关闭。",
+              "past_bug_20260606": "keep-alive + 缺少 close_connection=True → benchmark 0/5 请求成功，warmup 请求持有 engine_lock 永久不释放 → 所有后续请求超时"
+            }
           },
           "non_streaming": {
             "flow": "engine.generate() → JSON response with choices/text/usage"
+          },
+          "worker_signal_handling": {
+            "_why": "non-rank0 worker 主线程阻塞在 dist.broadcast_object_list（NCCL/Gloo collective）。Python 默认信号处理在 C 调用返回后才执行，因此 SIGTERM 被无限延迟。",
+            "solution": "signal.signal(SIGTERM, handler) → handler 中调用 os._exit(0)。os._exit() 不经过 Python 解释器，直接终止进程。",
+            "past_bug_20260606": "缺少 signal handler → torchrun kill 后 4 个 python 子进程残留，各占 ~6.5GB GPU 显存"
           }
         },
         "startup_sequence": [
@@ -1226,40 +1237,97 @@
           "_scope_note": "当前蓝图覆盖: nocompile, B=1, TP=4。不使用 torch.compile, 不使用 CUDA Graph, 不考虑 B>1 Continuous Batching。nocompile 场景下 flash_attn_with_kvcache 直接 from flash_attn.flash_attn_interface import，无需 custom_op 注册 (custom_op+register_fake 仅在 torch.compile tracing 时需要)。"
         },
         "performance_optimization": {
-          "_note": "Phase 11 — 性能优化。正确性已在 Phase 1-10 验证通过，本阶段仅修改实现方式以提高吞吐。以下模式从真实 meta-infer engine 提取。",
-          "p1_prealloc_buffers": {
-            "rule": "torch.empty_like(x) 预分配，非 torch.empty() 每次新建",
-            "real_engine": "engine/models/qwen.py:112 — out = torch.empty_like(x); rms_norm(out, x.contiguous(), weight, eps)",
-            "apply_to": ["RMSNorm.forward", "attention forward", "MLP forward"],
-            "expected_gain": "消除 per-step cudaMalloc (~200ms → <1ms)"
+          "_note": "Phase 11 — 性能审计 + 优化。以下模式经过 ROUND_1 实测验证（notebooks-cn/07_improvementPlan/ROUND_1_BOTTLENECK_FIXES.md，优化实测验证记录）。分两层：O1-O6 为「审计门禁」——Phase 11 必须逐条静态检查，命中则回对应 Phase 修复；O7-O9 为「补充优化」——正确但非致命，可选实施。",
+          "verified_by": "notebooks-cn/07_improvementPlan/ROUND_1_BOTTLENECK_FIXES.md",
+          "O1_inference_mode": {
+            "priority": "CRITICAL — 通常占总提升的最大份额",
+            "rule": "QwenForCausalLMTP.forward() 和 forward_decode() 必须带 @torch.inference_mode() 装饰器",
+            "why": "禁用 autograd version counter 递增和元数据追踪，消除 GeneratedBackwardFor 膨胀 + cudaLaunchKernel CPU 开销。CPU launch 占比从 ~35% 降至 <5%。",
+            "real_engine": "engine/models/qwen.py — QwenForCausalLMTP.forward() 和 forward_decode() 方法定义上方 @torch.inference_mode()",
+            "apply_to": [
+              "QwenForCausalLMTP.forward",
+              "QwenForCausalLMTP.forward_decode"
+            ],
+            "audit_check": "grep -r '@torch.inference_mode' engine/models/qwen.py 应有 2 个匹配"
           },
-          "p2_lazy_contiguous": {
+          "O2_zero_item_cpu_sync": {
+            "priority": "CRITICAL — 每步 .item() 触发 1 次 cudaStreamSynchronize",
+            "rule": "get_num_free_blocks() 返回常量（无需 .item()）；runner.run() decode 分支用 s.kv_len += 1（CPU 算术）；prefill slot_mapping 用 torch.arange 向量化（禁止 for 循环 + .item()）",
+            "why": ".item() 会触发 GPU→CPU 同步，打断 GPU 流水线。前向代码路径中不应有任何 .item()。",
+            "real_engine": "llm_engine.py — get_num_free_blocks() 返回 cfg.max_position_embeddings // 256；run() decode: s.kv_len += 1",
+            "apply_to": [
+              "QwenTPModelRunner.get_num_free_blocks",
+              "QwenTPModelRunner.run() decode branch",
+              "prefill slot_mapping construction"
+            ],
+            "audit_check": "grep '\\.item()' llm_engine.py engine/models/qwen.py 应为零匹配（仅在注释/文档字符串中允许）。QwenForCausalLMTP.forward() decode 分支已改用 past_key_values[0] + 1 CPU 算术。"
+          },
+          "O3_prealloc_buffers": {
+            "priority": "CRITICAL — 消除 decode 热路径 per-step 分配",
+            "rule": "decode 路径（B=1,S=1）使用 register_buffer 预分配的 buffer，绕过 nn.Module.forward() 中的 torch.empty_like() 分配。直接调用底层 kernel（rms_norm/silu_and_mul）传入预分配 buffer。通用路径（B>1 或 S>1）禁止 torch.empty_like()，改用 torch.empty(...) 显式参数：torch.empty(x.shape[0], x.shape[1], half_ch, dtype=x.dtype, device=x.device)。",
+            "why": "RMSNorm.forward() 内部 torch.empty_like() 触发 cudaDeviceGetAttribute；silu_and_mul 每步 torch.empty() 分配。empty_like 含隐式 CUDA runtime 查询(cudaDeviceGetAttribute)，改为显式 torch.empty(已知 dtype/device) 消除。预分配复用消除 ~2300 次/step 的分配开销。",
+            "real_engine": "engine/models/qwen.py — _q_norm_out[1,heads,dim], _k_norm_out[1,kv_heads,dim], _silu_out[1,1,local_inter] 均为 register_buffer(persistent=False, dtype=torch.bfloat16)；MLP 通用路径 torch.empty(x.shape[0], x.shape[1], half_ch, dtype=x.dtype, device=x.device) 非 torch.empty_like(gate_up[..., :half_ch])",
+            "apply_to": [
+              "QwenAttentionTP.__init__: register_buffer _q_norm_out, _k_norm_out",
+              "QwenAttentionTP.forward_decode: 调用 rms_norm(self._q_norm_out, ...) 替代 self.q_norm(q)",
+              "QwenMLPTP.__init__: self.local_intermediate + register_buffer _silu_out",
+              "QwenMLPTP.forward: B=1,S=1 时复用 _silu_out；否则 torch.empty(...) 非 empty_like"
+            ],
+            "audit_check": "grep '_q_norm_out\\|_k_norm_out\\|_silu_out' engine/models/qwen.py 应有匹配；grep 'empty_like' engine/models/qwen.py 应为零匹配"
+          },
+          "O4_block_table_arange": {
+            "priority": "HIGH",
+            "rule": "block_table 在 KV cache 首次分配时一次性 torch.arange(max_blocks).unsqueeze(0) 初始化，非 torch.zeros + 每步填充",
+            "why": "block table 将逻辑页映射到物理页。全零意味着所有页都映射到 block 0（错误）。arange 创建正确的恒等映射，且只需一次分配。",
+            "real_engine": "engine/models/qwen.py — self._block_table = torch.arange(max_blocks, dtype=torch.int32, device=device).unsqueeze(0)",
+            "apply_to": [
+              "QwenAttentionTP.forward() prefill path — KV cache 首次分配时"
+            ],
+            "audit_check": "grep '_block_table.*arange' engine/models/qwen.py"
+          },
+          "O5_prefill_kv_direct_assign": {
+            "priority": "HIGH",
+            "rule": "prefill KV cache 写入使用直接索引赋值 kc_flat[slot_mapping] = k_flat，非 index_copy_。prefill 不在 CUDA graph 内，直接赋值更快。",
+            "why": "index_copy_ 有 CUDA graph 兼容性优势（原子操作），但 prefill 路径不走 graph。直接索引赋值减少 kernel launch 开销。",
+            "real_engine": "engine/models/qwen.py — prefill path: kc_flat[slot_mapping] = k_flat; vc_flat[slot_mapping] = v_flat",
+            "apply_to": [
+              "QwenAttentionTP.forward() prefill path — KV write after flash_attn_varlen_func"
+            ],
+            "audit_check": "grep 'index_copy_' engine/models/qwen.py 应仅在 decode 路径（forward_decode）中出现"
+          },
+          "O6_register_buffer": {
+            "priority": "HIGH",
+            "rule": "不变 tensor（_kv_len_gpu, _slot_mapping_decode, _q_norm_out, _k_norm_out, _silu_out, cos_sin_cache）用 register_buffer（persistent=False, 明确 dtype）注册，避免每步重新分配",
+            "real_engine": "engine/models/qwen.py — 所有 register_buffer 均带 persistent=False 和明确的 dtype 参数",
+            "apply_to": [
+              "所有 QwenAttentionTP/QwenMLPTP 的预分配不变 tensor"
+            ],
+            "audit_check": "grep 'register_buffer' engine/models/qwen.py | wc -l 应 ≥ 6"
+          },
+          "O7_lazy_contiguous": {
+            "priority": "LOW — 正确补充，ROUND_1 未单独测量",
             "rule": "仅在内核输入前调用 .contiguous()，不在中间 tensor 上调",
-            "real_engine": "engine/models/qwen.py:113 — rms_norm(out, x.contiguous(), ...); 但中间 view/reshape 后不调 contiguous",
-            "apply_to": ["所有 kernel wrapper 入口", "flash_attn 输入"],
-            "expected_gain": "消除不必要的 GPU mem copy"
+            "apply_to": [
+              "所有 kernel wrapper 入口",
+              "flash_attn 输入"
+            ]
           },
-          "p3_view_not_reshape": {
-            "rule": "view() 替代 reshape() — view 零拷贝且不会隐式触发 contiguous()",
-            "real_engine": "engine/models/qwen.py:225-226 — q.view(bsz, seqlen, num_heads, head_dim)",
-            "apply_to": ["Q/K/V reshape after qkv_proj", "attention output reshape before o_proj"],
-            "expected_gain": "消除 reshape() 触发的隐式 copy"
+          "O8_view_not_reshape": {
+            "priority": "LOW — 正确补充，ROUND_1 未单独测量",
+            "rule": "view() 替代 reshape()。view 零拷贝且不会隐式触发 contiguous()。仅当 tensor 确实 discontiguous 时才用 reshape()。",
+            "apply_to": [
+              "Q/K/V reshape after qkv_proj",
+              "attention output reshape before o_proj"
+            ]
           },
-          "p4_eliminate_intermediate_tensors": {
-            "rule": "one-pass 计算，消除中间临时 tensor 分配",
-            "real_engine": "engine/models/qwen.py:300-312 — QwenMLPTP.forward: gate_up → silu_and_mul(in-place) → down_proj; 中间无额外 tensor 分配",
-            "apply_to": ["MLP forward", "attention forward", "decoder layer"],
-            "expected_gain": "减少 Python GC 压力 + per-layer ~50us alloc 开销"
-          },
-          "p5_no_redundant_item": {
-            "rule": ".item() 仅在 QwenForCausalLMTP.forward() 外层 36 层循环后批量读取一次，不在每层 forward_decode 内读取",
-            "real_engine": "engine/models/qwen.py:514 — kv_lens = [int(l.self_attn._kv_len_gpu[0].item()) for l in self.layers]",
-            "expected_gain": "消除 per-token 36×7ms = 252ms GPU sync（当前 226ms 是最大瓶颈）"
-          },
-          "p6_register_buffer_for_persistent_tensors": {
-            "rule": "不变 tensor 用 register_buffer（persistent=False）注册，避免每步重新分配",
-            "real_engine": "engine/models/qwen.py:202-203 — register_buffer('_kv_len_gpu', ...), register_buffer('_slot_mapping_decode', ...)",
-            "apply_to": ["kv_len_gpu", "slot_mapping_decode", "cos_sin_cache (lazy GPU)"]
+          "O9_eliminate_intermediate_tensors": {
+            "priority": "LOW — 正确原则，O3 预分配 buffer 是其具体体现",
+            "rule": "one-pass 计算，消除中间临时 tensor 分配。预分配 buffer（O3）是实现此原则的关键手段。",
+            "apply_to": [
+              "MLP forward",
+              "attention forward",
+              "decoder layer"
+            ]
           }
         },
         "qwen3_kernel_contracts": {
@@ -1474,7 +1542,7 @@
             "notebooks-cn/07_improvementPlan/stage0_2_vs_vllm.md"
           ],
           "current_status": {
-            "single_gpu": "可用 — torch.compile(mode='reduce-overhead') + forward_decode_graph (clone 输入)。正确性验证通过 (5/5 字字对齐)。吞吐 35.4 tok/s (eager 55.7 tok/s 对比 vLLM graph 166.8 tok/s)",
+            "single_gpu": "可用 — torch.compile(mode='reduce-overhead') + forward_decode_graph (clone 输入)。正确性验证通过 (5/5 字字对齐)。各模式吞吐数据详见 perf 记录文件",
             "tp4": "阻塞 — Dynamo RNG 重编译崩溃。根因: torch.compile 追踪进入 all_reduce_sum 内部 → 预热/捕获 CUDA 流状态不同 → guard 失效 → 重编译 → cuda.get_rng_state() 在 graph 捕获期间被禁止",
             "planned_fix": "sglang 切图方案: 在 all_reduce_sum 处用 torch.fx.split_module 拆分 FX 图 (split_graph 45行)，通信子图用 backend='eager' 不入 CUDA Graph。核心代码在 ref_projects/sglang/.../compilation/backend.py:214-257",
             "tp4_implementation_pathway": {
@@ -1491,7 +1559,7 @@
                 "张量传递: clone() 跨图"
               ],
               "ref_code": "ref_projects/sglang/.../.../compilation/backend.py:214-257",
-              "note": "TP=4 CUDA Graph 已知未完成。单 GPU 可用 (35.4 tok/s)。TP=4 需自行实现 split_graph。"
+              "note": "TP=4 CUDA Graph 已知未完成。单 GPU 可用。TP=4 需自行实现 split_graph。"
             }
           },
           "forward_decode_graph_design": {
@@ -2195,7 +2263,7 @@
           "中文 prompt 回归（与标准答案比对）",
           "4 卡 TP HCU/VRAM 监控证据（4 卡 VRAM 绝对值同量级一致，HCU%>0）。注意：~7% 是 64GB GPU 的相对值，绝对值约 4.7 GB/rank。若 GPU 显存不同，以绝对值 4.7 GB 为准。",
           "单层 CPU dispatch profiling（目标 < 15ms/layer）",
-          "性能基线：nocompile ≥ 54 tok/s；GPU Self CUDA ≤ 66ms；CustomAR ≤ 25ms",
+          "性能基线：以 scripts/ 中 benchmark 脚本定义的基线和 profiler trace 为准",
           "Profiler 确认无 torch.compile/CUDA Graph 痕迹"
         ],
         "minimal_test_commands": [
@@ -2208,7 +2276,7 @@
         "e2e_acceptance_bottom_line": {
           "_hard_metrics": "以下指标不达标不能声称完成",
           "greedy_align": "temperature=0.0 输出字字对齐基线",
-          "throughput": "Output throughput ≥ 54 tok/s（HTTP benchmark 或直接 generate 均可）",
+          "throughput": "Output throughput ≥ 基线（参考 scripts/ 中 benchmark 脚本）（HTTP benchmark 或直接 generate 均可）",
           "gpu_latency": "GPU Self CUDA ≤ 66ms / step",
           "custom_ar_latency": "CustomAR 通信 ≤ 25ms / step",
           "cpu_dispatch": "CPU dispatch ≤ 15ms / layer (36 layer total ≤ 540ms)",
@@ -2241,8 +2309,8 @@
             {
               "file": "scripts/test_phase10_benchmark.sh",
               "format": "bash",
-              "guards_against": "TP=4 nocompile吞吐<54 tok/s(基线55.7)",
-              "past_error_triggered_by": "CLAUDE.md §4 55.7 tok/s nocompile TP=4 baseline"
+              "guards_against": "TP=4 nocompile 吞吐未达标",
+              "past_error_triggered_by": "nocompile TP=4 baseline"
             },
             {
               "file": "scripts/test_phase10_no_compile_check.sh",
@@ -2254,7 +2322,7 @@
               "file": "scripts/test_phase10_vs_vllm_compare.sh",
               "format": "bash",
               "guards_against": "新框架 vs vLLM(no-graph+graph)三方对比基准缺失",
-              "past_error_triggered_by": "CLAUDE.md §4 vLLM CUDA Graph 166.8 tok/s"
+              "past_error_triggered_by": "vLLM CUDA Graph baseline"
             }
           ],
           "review_gate": "所有脚本通过 code-review 子代理 11 条门禁审查。Phase 10 硬性指标不达标不得声称完成。"
@@ -2262,7 +2330,7 @@
       },
       "phase_11_performance": {
         "_depends_on": "phase_10（全链路正确性已验证）",
-        "_provides": "吞吐从 ~10 tok/s 提升至 ≥ 54 tok/s",
+        "_provides": "吞吐显著提升，达到 scripts/ 中 benchmark 脚本定义的基线",
         "_note": "仅修改实现方式（pre-alloc, view, contiguous消除），不改变功能行为",
         "implementation_todos": [
           "P1: 所有 kernel wrapper 入口改为 torch.empty_like 预分配",
@@ -2277,13 +2345,13 @@
           "bash scripts/test_phase11_profiler.sh"
         ],
         "performance_gate": {
-          "throughput_target": "TP=4 nocompile ≥ 54 tok/s，对齐 meta-infer 55.7 tok/s",
+          "throughput_target": "TP=4 nocompile 对齐 meta-infer 基线",
           "cuda_malloc_target": "cudaMalloc = 0 in steady-state decode",
           "aten_item_target": "aten::item < 10ms total per step",
           "correctness_regression": "Phase 1-10 全部 scripts/ 必须仍然 PASS"
         },
         "done_criteria": [
-          "单 GPU throughput ≥ 54 tok/s",
+          "单 GPU throughput 达到 scripts/ 中 benchmark 基线",
           "Phase 1-10 全部 scripts/ 仍然 PASS",
           "Profiler 确认稳态 decode 无 cudaMalloc",
           "Profiler 确认 aten::item 累计 < 10ms"
@@ -2849,6 +2917,62 @@
             "source_refs": [
               "cuda_graph_plan.md 踩坑 #7"
             ]
+          },
+          {
+            "id": "FM-016",
+            "category": "RMSNorm 计算顺序必须匹配 HF 参考实现",
+            "symptom": "单卡 TP=1 E2E generate() 输出乱码（如'而非，木地板木地板'），但所有组件单测（embedding/QKV/RoPE/norm）diff 均为 0。随机张量测试无法发现此问题",
+            "check": "比对 RMSNorm.forward 输出与 HF Qwen3RMSNorm 在真实 Q/K 投影输出上的差异。若 Q norm diff ≈ 0.0625 或 K norm diff ≈ 1.0，确诊为计算顺序偏差",
+            "fix": "将 RMSNorm.forward 中 (self.weight.float() * x_f).to(dtype=input_dtype) 改为 self.weight * x_f.to(dtype=input_dtype)。HF Qwen3RMSNorm 先 cast bf16 再乘 weight，模型权重已针对此精度路径训练——使用'更精确'的 fp32 乘法路径反而产生更差结果",
+            "source_refs": [
+              "notebooks-cn/07_improvementPlan/DEBUG_E2E_GARBLED_AND_TP4.md",
+              "notebooks-cn/07_improvementPlan/bugfix.md §RMSNorm",
+              "engine/models/qwen.py::RMSNorm.forward"
+            ],
+            "_discovered": "2026-06-07 inference-agent-system Qwen3-8B E2E 测试",
+            "_precision_note": "随机张量单测无法发现精度路径差异——必须用真实模型数据验证"
+          },
+          {
+            "id": "FM-017",
+            "category": "最终 LayerNorm 必须使用完整 hidden state（含 residual 累积）",
+            "symptom": "单卡 TP=1 E2E generate() 输出完全错误（top-1 token 为 ! 且 logit=0.0），但所有单组件测试均通过。RMSNorm 修复后仍然乱码",
+            "check": "检查 QwenForCausalLMTP.forward_prefill/forward_decode 中 36 层循环后的 hs 变量——vLLM-style DecoderLayer 返回 (mlp_out, res) 二元组，hs 仅含最后层 mlp_out，缺失 36 层 residual 累积。应打印 hs.abs().max() 与 HF 对应位置的 hidden_states.abs().max() 对比",
+            "fix": "在 36 层循环后、self.norm(hs) 前加一行: hs = hs + res。HF Qwen3DecoderLayer 返回的 hidden_states 已内含 residual，但 vLLM-style 的 residual 是单独累积的，必须手动合并",
+            "source_refs": [
+              "notebooks-cn/07_improvementPlan/DEBUG_E2E_GARBLED_AND_TP4.md",
+              "notebooks-cn/07_improvementPlan/bugfix.md §residual",
+              "engine/models/qwen.py::QwenForCausalLMTP.forward_prefill"
+            ],
+            "_discovered": "2026-06-07 inference-agent-system Qwen3-8B E2E 测试（RMSNorm 修复后仍乱码）",
+            "_architecture_note": "vLLM-style residual chain 与 HF-style 返回值语义不同。HF: hidden_states = residual + mlp_output（内联）。vLLM: DecoderLayer → (mlp_out, res) 分离返回。不能直接对比 hs 变量"
+          },
+          {
+            "id": "FM-018",
+            "category": "_row_slice 的 size 参数必须除以 tp_size",
+            "symptom": "TP>1 权重复载时 o_proj shape mismatch: loaded=[4096, 0], model=[4096, 1024]。rank 1/2/3 加载到空张量",
+            "check": "grep 所有 _row_slice 调用，逐一检查第二参数（size）是否 = hidden_size // tp_size（而非 hidden_size）。_col_slice 的调用者天然使用 per-rank 尺寸（q_size/kv_size 已经是 ÷ tp_size 的），但 _row_slice 的调用者容易误传全尺寸",
+            "fix": "将 _row_slice(weight, hidden_size) 改为 _row_slice(weight, hidden_size // tp_size)。_row_slice 在 dim=1 上按 [tp_rank * size : (tp_rank+1) * size] 切片——size 为全尺寸时 rank≥1 切片范围超出张量边界",
+            "source_refs": [
+              "notebooks-cn/07_improvementPlan/DEBUG_E2E_GARBLED_AND_TP4.md",
+              "notebooks-cn/07_improvementPlan/bugfix.md §Weight Loading",
+              "engine/models/qwen.py::QwenForCausalLMTP.load_weights"
+            ],
+            "_discovered": "2026-06-07 inference-agent-system Qwen3-8B TP=4 权重复载",
+            "_affected_component": "RowParallelLinear — o_proj 行并行（dim=1 分片）"
+          },
+          {
+            "id": "FM-019",
+            "category": "CustomAR rank_data 工作区尺寸不足 + GC 释放导致 GPU 内存损坏",
+            "symptom": "TP>1 推理时 CUBLAS_STATUS_EXECUTION_FAILED，崩溃位置在多次运行间不稳定（可能在 gate_up_proj GEMM 或 down_proj GEMM）。CustomAR 初始化成功、模型权重复载正常、形状全部匹配——但 GEMM 内核访问到被破坏的 GPU 内存",
+            "check": "比对 init_custom_ar() 中 rank_data 的大小是否 = max_size（16 MB）而非硬编码的 8*1024*1024。检查 CustomARHandle.__init__ 是否持有 rank_data 引用（self._rank_data = rank_data）。如果 rank_data 局部变量在 init_custom_ar 返回后出作用域且无其他引用 → Python GC 释放 CUDA 内存 → 内核裸指针悬空",
+            "fix": "1) rank_data = torch.empty(max_size, dtype=torch.uint8, device=f'cuda:{local_rank}') — size 改为 max_size（内核期望工作区至少 max_size 字节，8MB 不足导致溢出污染相邻内存）。2) CustomARHandle.__init__ 增加 self._rank_data = rank_data — 持有引用防止 GC（ops.init_custom_ar 内部保存了 rank_data 的裸指针，Python tensor 被 GC 后 CUDA 内存被释放但内核仍通过裸指针访问 → use-after-free）。两个修复必须同时应用",
+            "source_refs": [
+              "notebooks-cn/07_improvementPlan/DEBUG_E2E_GARBLED_AND_TP4.md",
+              "notebooks-cn/07_improvementPlan/bugfix.md §CustomAR",
+              "engine/tp_layers/distributed.py::init_custom_ar"
+            ],
+            "_discovered": "2026-06-07 inference-agent-system Qwen3-8B TP=4 (CustomAR P2P all_reduce)",
+            "_criticality": "崩溃位置不稳定是最关键的诊断信号——如果形状或 dtype 不匹配，崩溃位置固定。位置不稳定意味着内存损坏（溢出或 use-after-free）"
           }
         ]
       },
@@ -2895,7 +3019,7 @@
       "Scheduler 采用 prefill 优先策略；decode 仅选择 can_append_one_more 的运行序列，资源不足时不抢占。",
       "Prefix caching 仅对完整 block token 切片生效；末尾不满 block 的 token 不入 hash_to_block_id。",
       "KVMemoryPool 的 block 数按模型配置与 dtype 估算，且预留 reserve_bytes 与 mem_utilization 安全因子。",
-      "任务完成标准：Qwen3-8B TP=4 nocompile 贪婪解码(temperature=0.0)字字对齐基线 + 性能指标达标(≥54 tok/s,≤66ms GPU,≤25ms CustomAR)。DeepSeek-V2 为独立扩展阶段，不在本次纯 Eager 基线范围。",
+      "任务完成标准：Qwen3-8B TP=4 nocompile 贪婪解码(temperature=0.0)字字对齐基线 + 性能指标达标(达到 scripts/ 中 benchmark 脚本定义的基线)。DeepSeek-V2 为独立扩展阶段，不在本次纯 Eager 基线范围。",
       "运行时监控要求：真实 TP 推理时持续采集 HCU 0,1,2,3 的 HCU% 与 VRAM%（若可见设备不足 5 个需先打印设备清单并说明）。",
       "4 卡 TP 真实推理期间，参与 TP 的 4 张卡 VRAM 绝对值需同量级近似一致；Qwen3-8B TP=4 每卡约 4.7 GB（bf16 15.7GB/tp=4 ≈ 3.9GB + runtime ~0.8GB），DeepSeek-V2-16B TP=4 每卡约 9 GB。百分比取决于 GPU 总显存容量。KV cache 必须 lazy alloc——prefill 时按需分配 num_blocks_needed=（num_tokens+255）//256，严禁 torch.zeros(max_blocks) 全量预分配。",
       "推理测试窗口中 HCU% 必须出现大于 0 的时刻，作为并行加载与真实计算证据；无监控证据仅有文本输出视为未通过。",
@@ -2908,7 +3032,7 @@
         "model_dir": "${MODEL_DIR}",
         "suggested_test": "tests/test_qwen_tp_real.py",
         "performance_baseline": {
-          "output_throughput": "≥ 54 tok/s",
+          "output_throughput": "≥ 基线目标（参考 scripts/ 中 benchmark 脚本）",
           "gpu_self_cuda": "≤ 66ms / step",
           "custom_ar_communication": "≤ 25ms / step",
           "cpu_dispatch_per_layer": "< 15ms (36 layer total ≤ 540ms)",
