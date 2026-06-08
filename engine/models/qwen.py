@@ -85,6 +85,10 @@ class RMSNorm(nn.Module):
             )
             return x, residual
 
+    def load_weight_shard(self, weight: torch.Tensor) -> None:
+        """RMSNorm weight is replicated — all ranks receive the full [hidden_size] weight."""
+        self.weight.data.copy_(weight)
+
 
 # ===========================================================================
 # QwenAttentionTP — TP attention with paged KV cache + flash attention
@@ -559,3 +563,277 @@ class QwenDecoderLayerTP(nn.Module):
 
         mlp_out = self.mlp(attn_out)
         return mlp_out, residual
+
+
+# ===========================================================================
+# QwenTPConfig — dataclass from config.json (dynamic read, no hardcoded dims)
+# ===========================================================================
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+
+@dataclass
+class QwenTPConfig:
+    """Tensor-parallel model configuration read from config.json.
+
+    All fields dynamically populated — NO hardcoded dimensions.
+    head_dim fallback: cfg.head_dim = hidden_size // num_attention_heads
+    """
+
+    model_dir: Path
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    vocab_size: int
+    rms_norm_eps: float
+    rope_theta: float
+    rope_scaling: Optional[dict] = None
+    max_position_embeddings: int = 32768
+
+    @classmethod
+    def from_config(cls, config_source):
+        """Create QwenTPConfig from a dict, Path to config.json, or model_dir.
+
+        Args:
+            config_source: dict of config values, Path to config.json file,
+                           or Path to model_dir containing config.json.
+
+        Returns:
+            QwenTPConfig instance with all fields populated from the source.
+        """
+        import json
+
+        if isinstance(config_source, dict):
+            d = config_source
+            model_dir = Path(".")
+        elif isinstance(config_source, (str, Path)):
+            p = Path(config_source)
+            if p.is_dir():
+                model_dir = p
+                config_path = p / "config.json"
+            else:
+                model_dir = p.parent
+                config_path = p
+            with open(config_path) as f:
+                d = json.load(f)
+        else:
+            raise TypeError(f"Expected dict or Path, got {type(config_source)}")
+
+        head_dim = d.get("head_dim", d["hidden_size"] // d["num_attention_heads"])
+
+        return cls(
+            model_dir=model_dir,
+            hidden_size=d["hidden_size"],
+            intermediate_size=d["intermediate_size"],
+            num_hidden_layers=d["num_hidden_layers"],
+            num_attention_heads=d["num_attention_heads"],
+            num_key_value_heads=d["num_key_value_heads"],
+            head_dim=head_dim,
+            vocab_size=d["vocab_size"],
+            rms_norm_eps=d["rms_norm_eps"],
+            rope_theta=d["rope_theta"],
+            rope_scaling=d.get("rope_scaling", None),
+            max_position_embeddings=d["max_position_embeddings"],
+        )
+
+
+# ===========================================================================
+# QwenForCausalLMTP — TP model shell: embed → layers → norm → lm_head
+# ===========================================================================
+
+from engine.tp_layers.embedding import VocabParallelEmbedding, ParallelLMHead
+
+
+class QwenForCausalLMTP(nn.Module):
+    """Tensor-parallel causal LM for Qwen3 Dense.
+
+    Construction chain (5 steps):
+        cfg = QwenTPConfig.from_config(model_dir)
+        model = QwenForCausalLMTP(cfg, device=device, dtype=torch.bfloat16)
+        model.load_weights()
+        model.eval()
+        init_custom_ar(device=device)
+
+    Module tree:
+        self.embed_tokens  — VocabParallelEmbedding
+        self.layers        — nn.ModuleList[QwenDecoderLayerTP]
+        self.norm          — RMSNorm
+        self.lm_head       — ParallelLMHead
+    """
+
+    def __init__(self, cfg: QwenTPConfig, device=None, dtype=None):
+        super().__init__()
+        self.cfg = cfg
+        self.device = device
+        self.dtype = dtype
+
+        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
+        self.layers = nn.ModuleList(
+            [QwenDecoderLayerTP(cfg) for _ in range(cfg.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.lm_head = ParallelLMHead(cfg.vocab_size, cfg.hidden_size)
+
+    # ------------------------------------------------------------------
+    # Weight loading
+    # ------------------------------------------------------------------
+
+    def load_weights(self, model_dir=None):
+        """Load weights from safetensors shards with HF key mapping.
+
+        Algorithm:
+          1. Read model.safetensors.index.json → weight_map
+          2. Group keys by safetensors file
+          3. For each HF key, route to module via _dispatch_weight
+          4. QKV: cat([q_full, k_full, v_full], dim=0) in Q-K-V order
+             → qkv_proj.load_weight_shard() (auto per-rank slice)
+          5. Gate-Up: cat([gate_full, up_full], dim=0) in gate-up order
+             → gate_up_proj.load_weight_shard()
+          6. All load_weight_shard() calls have built-in double_shard_guard
+          7. dist.barrier() + init_custom_ar() after all weights loaded
+        """
+        import json
+        import os
+        from safetensors.torch import safe_open
+        import torch.distributed as dist
+        from engine.tp_layers.distributed import init_custom_ar
+
+        model_dir = Path(model_dir or self.cfg.model_dir)
+
+        # 1. Read weight_map
+        index_path = model_dir / "model.safetensors.index.json"
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+
+        # 2. Group by safetensors file
+        files: dict[str, list[str]] = {}
+        for hf_key, fname in weight_map.items():
+            files.setdefault(fname, []).append(hf_key)
+
+        # Pending merge buffers (QKV and Gate-Up may span multiple files)
+        pending_qkv: dict[int, dict[str, torch.Tensor]] = {}
+        pending_gate_up: dict[int, dict[str, torch.Tensor]] = {}
+
+        # 3. Load each safetensors shard
+        for fname, keys in files.items():
+            with safe_open(model_dir / fname, framework="pt") as f:
+                for hf_key in keys:
+                    full_weight = f.get_tensor(hf_key)
+                    self._dispatch_weight(
+                        hf_key, full_weight, pending_qkv, pending_gate_up
+                    )
+
+        # 4. Finalize any remaining merges (if QKV or Gate-Up parts
+        #    were the last keys processed and already merged, these are no-ops)
+        for layer_idx in sorted(pending_qkv.keys()):
+            parts = pending_qkv[layer_idx]
+            if len(parts) >= 3:
+                cat_qkv = torch.cat(
+                    [parts["q"], parts["k"], parts["v"]], dim=0
+                )  # Q-K-V order!
+                self.layers[layer_idx].self_attn.qkv_proj.load_weight_shard(cat_qkv)
+
+        for layer_idx in sorted(pending_gate_up.keys()):
+            parts = pending_gate_up[layer_idx]
+            if len(parts) >= 2:
+                cat_gate_up = torch.cat(
+                    [parts["gate"], parts["up"]], dim=0
+                )  # gate-up order!
+                self.layers[layer_idx].mlp.gate_up_proj.load_weight_shard(cat_gate_up)
+
+        # 5. Barrier + CustomAR init
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            init_custom_ar(device=local_rank)
+
+    def _dispatch_weight(
+        self, hf_key: str, full_weight: torch.Tensor,
+        pending_qkv: dict, pending_gate_up: dict,
+    ) -> None:
+        """Parse HF key and route to the correct module attribute.
+
+        HF key patterns (12 mappings):
+          model.embed_tokens.weight                              → embed_tokens
+          model.layers.N.input_layernorm.weight                   → layers[N].input_layernorm
+          model.layers.N.post_attention_layernorm.weight          → layers[N].post_attention_layernorm
+          model.layers.N.self_attn.q_proj.weight                  → layers[N].self_attn.qkv_proj (Q, cat Q-K-V)
+          model.layers.N.self_attn.k_proj.weight                  → layers[N].self_attn.qkv_proj (K)
+          model.layers.N.self_attn.v_proj.weight                  → layers[N].self_attn.qkv_proj (V)
+          model.layers.N.self_attn.o_proj.weight                  → layers[N].self_attn.o_proj
+          model.layers.N.self_attn.q_norm.weight                  → layers[N].self_attn.q_norm
+          model.layers.N.self_attn.k_norm.weight                  → layers[N].self_attn.k_norm
+          model.layers.N.mlp.gate_proj.weight                     → layers[N].mlp.gate_up_proj (gate, cat gate-up)
+          model.layers.N.mlp.up_proj.weight                       → layers[N].mlp.gate_up_proj (up)
+          model.layers.N.mlp.down_proj.weight                     → layers[N].mlp.down_proj
+          model.norm.weight                                       → norm
+          lm_head.weight                                          → lm_head
+        """
+        parts = hf_key.split(".")
+
+        if hf_key == "model.embed_tokens.weight":
+            self.embed_tokens.load_weight_shard(full_weight)
+        elif hf_key == "model.norm.weight":
+            self.norm.load_weight_shard(full_weight)
+        elif hf_key == "lm_head.weight":
+            self.lm_head.load_weight_shard(full_weight)
+        elif parts[0] == "model" and parts[1] == "layers":
+            layer_idx = int(parts[2])
+            sub = parts[3]
+            layer = self.layers[layer_idx]
+
+            if sub == "input_layernorm":
+                layer.input_layernorm.load_weight_shard(full_weight)
+            elif sub == "post_attention_layernorm":
+                layer.post_attention_layernorm.load_weight_shard(full_weight)
+            elif sub == "self_attn":
+                attn_part = parts[4]
+                if attn_part == "q_proj":
+                    pending_qkv.setdefault(layer_idx, {})["q"] = full_weight
+                    self._try_merge_qkv(layer_idx, pending_qkv)
+                elif attn_part == "k_proj":
+                    pending_qkv.setdefault(layer_idx, {})["k"] = full_weight
+                    self._try_merge_qkv(layer_idx, pending_qkv)
+                elif attn_part == "v_proj":
+                    pending_qkv.setdefault(layer_idx, {})["v"] = full_weight
+                    self._try_merge_qkv(layer_idx, pending_qkv)
+                elif attn_part == "o_proj":
+                    layer.self_attn.o_proj.load_weight_shard(full_weight)
+                elif attn_part == "q_norm":
+                    layer.self_attn.q_norm.load_weight_shard(full_weight)
+                elif attn_part == "k_norm":
+                    layer.self_attn.k_norm.load_weight_shard(full_weight)
+            elif sub == "mlp":
+                mlp_part = parts[4]
+                if mlp_part == "gate_proj":
+                    pending_gate_up.setdefault(layer_idx, {})["gate"] = full_weight
+                    self._try_merge_gate_up(layer_idx, pending_gate_up)
+                elif mlp_part == "up_proj":
+                    pending_gate_up.setdefault(layer_idx, {})["up"] = full_weight
+                    self._try_merge_gate_up(layer_idx, pending_gate_up)
+                elif mlp_part == "down_proj":
+                    layer.mlp.down_proj.load_weight_shard(full_weight)
+
+    def _try_merge_qkv(self, layer_idx: int, pending_qkv: dict) -> None:
+        """If all 3 Q/K/V weights for layer are available, merge in Q-K-V order."""
+        parts = pending_qkv.get(layer_idx, {})
+        if len(parts) == 3:
+            # CRITICAL: Q-K-V order, NOT K-Q-V
+            cat_qkv = torch.cat([parts["q"], parts["k"], parts["v"]], dim=0)
+            self.layers[layer_idx].self_attn.qkv_proj.load_weight_shard(cat_qkv)
+            del pending_qkv[layer_idx]  # free memory
+
+    def _try_merge_gate_up(self, layer_idx: int, pending_gate_up: dict) -> None:
+        """If both gate/up weights for layer are available, merge in gate-up order."""
+        parts = pending_gate_up.get(layer_idx, {})
+        if len(parts) == 2:
+            # CRITICAL: gate-up order (gate first, up second)
+            cat_gate_up = torch.cat([parts["gate"], parts["up"]], dim=0)
+            self.layers[layer_idx].mlp.gate_up_proj.load_weight_shard(cat_gate_up)
+            del pending_gate_up[layer_idx]  # free memory
