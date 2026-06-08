@@ -1556,10 +1556,10 @@
             "pytorch_2_10_upgrade": "实测 2.10.0 仍 crash"
           },
           "failure_modes": [
-            "FM-014: Dynamo RNG 重编译崩溃",
-            "FM-015: cuBLAS 图池地址漂移 → replay 数值错误 (差 3.4)",
-            "FM-016: mutated inputs → skipping cudagraphs",
-            "FM-017: clone 在 eager 路径的 ~15% 性能回退"
+            "FM-012: 无条件 clone 性能回退（~15%）",
+            "FM-013: Dynamo RNG 重编译崩溃 (TP=4)",
+            "FM-014: cuBLAS 图池地址漂移 → replay 数值错误 (差 3.4)",
+            "FM-015: mutated inputs → skipping cudagraphs"
           ],
           "all_reduce_sum_custom_op_template": {
             "registration": "@torch.library.custom_op('meta_infer::all_reduce_sum',mutates_args=())",
@@ -1752,7 +1752,7 @@
         "_provides": "所有 TP 层的通信结构",
         "implementation_todos": [
           "实现 init_tp_distributed()：torch.cuda.set_device(LOCAL_RANK) + dist.init_process_group('nccl','env://') + dist.barrier()。⚠️ 必须内置 WORLD_SIZE <= 1 guard——单进程场景（WORLD_SIZE=1 或未设置）直接 return，严禁调用 dist.init_process_group（会永久 hang 等待不存在的 NCCL master）。LLMEngine 调用侧也必须加 _world_size > 1 条件才进入 init_tp_distributed()",
-          "实现 init_custom_ar(device)：gloo ProcessGroup + IPC exchange (allocate_shared_buffer_and_handle + all_gather_object) + ops.init_custom_ar + ops.register_buffer。world_size==1 直接 return",
+          "实现 init_custom_ar(device)：gloo ProcessGroup + IPC exchange (allocate_shared_buffer_and_handle + all_gather_object) + ops.init_custom_ar + ops.register_buffer。⚠️ rank_data = torch.empty(max_size, dtype=torch.uint8, device=f'cuda:{local_rank}') —— 尺寸必须 = max_size（16 MB），严禁硬编码 8*1024*1024（8 MB）。CustomARHandler.__init__ 必须持有 rank_data 引用（self._rank_data = rank_data）防止 Python GC 提前释放——ops.init_custom_ar 内部保存了 rank_data 的裸指针，tensor 被 GC 后 CUDA 内存被回收但内核仍通过裸指针读写 → GPU 内存损坏（use-after-free）。两个问题必须同时修复。详见 FM-019。world_size==1 直接 return",
           "实现 all_reduce_sum(x)：@torch.library.custom_op 注册 + CustomAR P2P → NCCL fallback + register_fake。⚠️ CustomAR P2P 路径的 reg_buf 必须使用 buf_ptrs[dist.get_rank()]（当前 rank 的 staging buffer 地址），严禁 buf_ptrs[0]——rank 0 恰好正确仅因巧合，rank 1/2/3 用 buf_ptrs[0] 会触发 'buffer address not registered' RuntimeError",
           "实现 all_gather_last_dim(x)：dist.all_gather(outs, x) + torch.cat(outs, dim=-1)"
         ],
@@ -1771,7 +1771,8 @@
           "CustomAR init 失败 → 检查 torch.cuda.can_device_access_peer（所有 rank 对可见）",
           "dist.all_reduce 超时 → 检查 NCCL 初始化顺序：set_device → init_process_group → barrier",
           "单 GPU 非 torchrun 启动 hang（Phase 9 发现）→ init_tp_distributed 缺少 WORLD_SIZE <= 1 guard。LLMEngine.__init__ 侧也要加 _world_size > 1 条件才进入。前序 Phase 2 测试全部通过 torchrun 启动，单进程路径未被覆盖",
-          "'buffer address not registered' (rank≠0, Phase 9 发现) → all_reduce_sum 中 reg_buf 错误地用了 buf_ptrs[0] 而非 buf_ptrs[dist.get_rank()]。rank 0 正常仅因 buf_ptrs[0]==buf_ptrs[rank] 的巧合。注册了哪个 buffer 就必须传哪个 buffer 的地址"
+          "'buffer address not registered' (rank≠0, Phase 9 发现) → all_reduce_sum 中 reg_buf 错误地用了 buf_ptrs[0] 而非 buf_ptrs[dist.get_rank()]。rank 0 正常仅因 buf_ptrs[0]==buf_ptrs[rank] 的巧合。注册了哪个 buffer 就必须传哪个 buffer 的地址",
+          "CUBLAS_STATUS_EXECUTION_FAILED 在 GEMM 调用处崩溃，位置不稳定——第一次在 down_proj，第二次在 gate_up_proj（Konwldge 2026-06-07 发现）→ CustomAR rank_data 工作区尺寸不足或 GPU 内存被 GC 释放。检查 1) rank_data 是否 = torch.empty(max_size, ...) 而非 8*1024*1024；2) CustomARHandle 是否持有 rank_data 引用（self._rank_data = rank_data）。崩溃位置不稳定说明不是形状/dtype 问题而是内存损坏（溢出或 use-after-free）。详见 FM-019"
         ],
         "done_criteria": [
           "2 卡和 4 卡通信单测全部通过。",
@@ -1912,7 +1913,8 @@
           "实现 QwenAttentionTP.forward_decode(decode)：qkv_proj→Q/K norm→rotary→slot_mapping=_kv_len_gpu[0]→index_copy_→_kv_len_gpu+=1→flash_attn_with_kvcache(causal=False)→o_proj。⚠️ flash_attn_with_kvcache 调用必须使用 keyword args（cache_seqlens=, block_table=, softmax_scale=, causal=），严禁 positional args——不同 flash_attn 版本（如 2.8.3）参数顺序可能不同，positional 会导致参数错位（与真实引擎 custom_ops.py 对齐）",
           "KV reshape 链：K/V reshape [num_tokens,kv_heads,head_dim] contiguous；KV cache view flat [-1,heads,dim]；index_copy_ dim=0",
           "QKV reshape 约束：Q 用 num_heads=8 (per-rank), K/V 用 num_kv_heads_local=2 (per-rank)。勿用 num_heads reshape K/V",
-          "⚠️ RMSNorm.forward(x, residual=None) 必须统一返回 2-tuple：(out, residual)。residual is None 时返回 (out, None)；residual is not None 时返回 (x, residual)。严禁两个分支返回类型不一致——调用方（QwenForCausalLMTP.forward 的 hidden_states,_ = self.norm(...)、QwenAttentionTP 的 q_flat,_ = self.q_norm(...)）全部使用 2-tuple unpacking。Phase 6 QwenDecoderLayerTP 使用裸 kernel 函数绕过此问题，但 QwenForCausalLMTP 直接调用 RMSNorm.forward"
+          "⚠️ RMSNorm.forward(x, residual=None) 必须统一返回 2-tuple：(out, residual)。residual is None 时返回 (out, None)；residual is not None 时返回 (x, residual)。严禁两个分支返回类型不一致——调用方（QwenForCausalLMTP.forward 的 hidden_states,_ = self.norm(...)、QwenAttentionTP 的 q_flat,_ = self.q_norm(...)）全部使用 2-tuple unpacking。Phase 6 QwenDecoderLayerTP 使用裸 kernel 函数绕过此问题，但 QwenForCausalLMTP 直接调用 RMSNorm.forward",
+          "⚠️ RMSNorm 计算顺序必须匹配 HF Qwen3RMSNorm：self.weight * x_f.to(dtype=input_dtype)，严禁 (self.weight.float() * x_f).to(dtype=input_dtype)。HF 模型权重已针对'先 cast bf16 再乘 weight'的精度路径训练——使用 fp32 乘法路径虽然理论更精确，但在真实 Q/K 投影输出上产生系统性偏差（Q norm diff=0.0625, K norm diff=1.0），随机张量测试无法发现此问题。详见 FM-016"
         ],
         "minimal_test_commands": [
           "python -m pytest tests/test_attention_tp.py -v -s"
@@ -1929,7 +1931,8 @@
           "flash_attn_with_kvcache 报错 → 检查 block_size >= 256，block_table dtype=int32。若报参数类型错误或 kernel 内部 crash → 检查是否使用了 positional args（必须全部 keyword，与 flash_attn 2.8.3+ 兼容）",
           "index_copy_ shape mismatch → 检查 k_flat reshape 和 kc_flat view 的 heads dim 一致",
           "KV cache 全零 → prefill 后是否执行了 index_copy_ 写入",
-          "ValueError: not enough values to unpack (Phase 9 发现) → RMSNorm.forward 某分支返回了单 Tensor 非 2-tuple。QwenDecoderLayerTP 用裸 kernel 绕过此问题，但 QwenForCausalLMTP.forward 直接调 self.norm()。检查 residual is None 分支是否返回 (out, None)"
+          "ValueError: not enough values to unpack (Phase 9 发现) → RMSNorm.forward 某分支返回了单 Tensor 非 2-tuple。QwenDecoderLayerTP 用裸 kernel 绕过此问题，但 QwenForCausalLMTP.forward 直接调 self.norm()。检查 residual is None 分支是否返回 (out, None)",
+          "E2E generate() 输出乱码但所有组件单测（embedding/QKV/RoPE/norm）diff=0（Konwldge 2026-06-07 发现）→ 检查 RMSNorm 计算顺序是否是 self.weight * x_f.to(bf16) 而非 (self.weight.float() * x_f).to(bf16)。用真实 Q/K 投影输出对比 HF 参考值——Q norm diff ≈ 0.0625 或 K norm diff ≈ 1.0 即可确诊。详见 FM-016"
         ],
         "done_criteria": [
           "单卡随机权重 prefill/decode 通过（shape 校验 + NaN/Inf 检查）。",
@@ -1986,7 +1989,8 @@
           "实现 QwenDecoderLayerTP.forward(prefill)：rms_norm(input)→attention.forward→fused_add_rms_norm(post_attn,self.post_attention_layernorm.weight)→mlp→return(hs,residual)",
           "实现 QwenDecoderLayerTP.forward_decode(decode)：fused_add_rms_norm(input,self.input_layernorm.weight)→attention.forward_decode→fused_add_rms_norm(post_attn,self.post_attention_layernorm.weight)→mlp→return(hs,residual)",
           "Residual chain：首层 res=None→clone+rms_norm；后续层 fused_add_rms_norm（res+=hs; hs=rms_norm(res)）",
-          "关键约束：所有4处 fused_add_rms_norm 的 weight 均为本层 self.xxx.weight（非跨层）"
+          "关键约束：所有4处 fused_add_rms_norm 的 weight 均为本层 self.xxx.weight（非跨层）",
+          "⚠️ QwenForCausalLMTP.forward_prefill/forward_decode 在 36 层循环后必须执行 hs = hs + res 再 self.norm(hs)。vLLM-style DecoderLayer 返回 (mlp_out, res) 分离二元组——hs 仅含最后层 mlp_out，res 单独累积了全部 residual。HF Qwen3DecoderLayer 返回的 hidden_states 已内含 residual，但引擎的 residual chain 语义与之不同。若省略 hs + res，最终 norm 的输入只含最后一层 MLP 输出，缺失全部 residual 信息 → E2E 输出完全错误。详见 FM-017"
         ],
         "minimal_test_commands": [
           "python -m pytest tests/test_decoder_layer.py -v -s"
@@ -2000,7 +2004,8 @@
         "failure_fallback_strategy": [
           "residual NaN → 首层 res=None 分支是否 clone+rms_norm（非 fused_add_rms_norm）",
           "fused_add_rms_norm weight 参数错误 → 对照 AGENT_SKILL.md §G.6",
-          "mlp 输出 shape 不对 → gate_up_proj 输出 = [B,T,2*inter/tp], silu_and_mul 后 = [B,T,inter/tp]"
+          "mlp 输出 shape 不对 → gate_up_proj 输出 = [B,T,2*inter/tp], silu_and_mul 后 = [B,T,inter/tp]",
+          "E2E generate() 输出完全错误（top-1 token 异常，logit=0.0）但所有组件单测通过（Konwldge 2026-06-07 发现）→ 检查 QwenForCausalLMTP.forward_prefill/decode 在 36 层循环后是否有 hs = hs + res 语句。vLLM-style residual chain 与 HF-style 返回值语义不同——hs 仅含最后层 mlp_out，必须在 norm 前合并累积的 residual。详见 FM-017"
         ],
         "done_criteria": [
           "单卡随机权重 QwenDecoderLayerTP prefill/decode 通过。",
@@ -2045,7 +2050,7 @@
           "实现 _load_qwen_tp_config(model_dir)：AutoConfig.from_pretrained → QwenTPConfig(...)",
           "实现 QwenForCausalLMTP.__init__：embed_tokens(VocabParallelEmbedding)→layers[QwenDecoderLayerTP]*36→norm(RMSNorm)→lm_head(ParallelLMHead)。正确 attr 名：.self_attn, .mlp, .input_layernorm, .post_attention_layernorm。⚠️ 必须始终执行 self.to(device=device, dtype=bf16)——即使 device=None 也要 to(dtype=bf16)。默认 PyTorch float32 下 8B 参数 = ~32GB 显存（单卡 OOM）。调用方 LLMEngine 必须显式传 device 和 dtype=torch.bfloat16",
           "实现 HF key mapping：QKV merge torch.cat([q_slice,k_slice,v_slice],dim=0) Q-K-V 顺序。Gate-Up merge torch.cat([gate_slice,up_slice],dim=0)。⚠️ Qwen3 特有的 self_attn.q_norm.weight 和 self_attn.k_norm.weight 两条映射必须包含在 _dispatch_weight 中——缺失不会报错（权重保持 torch.ones 初始值），但 generate() 输出全错（垃圾 token），是最隐蔽的 bug",
-          "实现 load_weights()：读 model.safetensors.index.json→safe_open→_load_one_weight(hf_key,full)→double shard guard。load_weights 后 dist.barrier()+init_custom_ar(device)"
+          "实现 load_weights()：读 model.safetensors.index.json→safe_open→_load_one_weight(hf_key,full)→double shard guard。⚠️ _row_slice 用于 RowParallelLinear（如 o_proj）时 size 参数必须 = in_features // tp_size，严禁传全量 in_features —— rank≥1 时全量 size 会导致切片越界（loaded=[4096,0]）。_col_slice 的调用者天然使用 per-rank 尺寸，但 _row_slice 的调用者容易误传全尺寸。load_weights 后 dist.barrier()+init_custom_ar(device)。详见 FM-018"
         ],
         "minimal_test_commands": [
           "python -m pytest tests/test_weight_loading.py -v -s",
@@ -2064,7 +2069,8 @@
           "Embedding size mismatch (0) → double shard guard: _load_tensor 是否二次切片",
           "CustomAR block → dist.barrier() 是否在 load_weights 后、init_custom_ar 前",
           "rank0 显存 > 30GB（Phase 9 发现）→ QwenForCausalLMTP 未应用 bf16。检查 __init__ 中 device=None 分支是否跳过了 self.to(dtype=bf16)。调用方 LLMEngine 是否显式传了 dtype 参数",
-          "generate() 输出乱码/垃圾 token 但 forward 不报错（Phase 9 发现）→ 检查 _dispatch_weight 是否遗漏了 self_attn.q_norm.weight 和 self_attn.k_norm.weight。这两条缺失导致 Q/K norm 保持 torch.ones 初始值，logits 全错但不 crash"
+          "generate() 输出乱码/垃圾 token 但 forward 不报错（Phase 9 发现）→ 检查 _dispatch_weight 是否遗漏了 self_attn.q_norm.weight 和 self_attn.k_norm.weight。这两条缺失导致 Q/K norm 保持 torch.ones 初始值，logits 全错但不 crash",
+          "o_proj shape mismatch loaded=[4096, 0] model=[4096, 1024]（Konwldge 2026-06-07 发现）→ _row_slice 的 size 参数未除以 tp_size。_row_slice(weight, hidden_size) 应改为 _row_slice(weight, hidden_size // tp_size)。rank=0 可能侥幸正确（size=4096 恰好超边界但 rank 0 的切片范围仍在 [0,4096]），但 rank 1/2/3 全部空张量。详见 FM-018"
         ],
         "done_criteria": [
           "Qwen3-8B 权重成功加载到 4 卡，每卡显存约 4.7 GB（bf16 权重 15.7GB/tp=4 ≈ 3.9GB + runtime buffers ~0.8GB）。KV cache 必须 lazy alloc——prefill 时按需分配 num_blocks_needed（非 max_blocks 全量），否则显存膨胀至 7+ GB。",
@@ -2907,6 +2913,58 @@
             "source_refs": [
               "cuda_graph_plan.md 踩坑 #7"
             ]
+          },
+          {
+            "id": "FM-016",
+            "category": "RMSNorm 计算顺序必须匹配 HF 参考实现",
+            "symptom": "单卡 TP=1 E2E generate() 输出乱码（如'而非，木地板木地板'），但所有组件单测（embedding/QKV/RoPE/norm）diff 均为 0。随机张量测试无法发现此问题",
+            "check": "比对 RMSNorm.forward 输出与 HF Qwen3RMSNorm 在真实 Q/K 投影输出上的差异。若 Q norm diff ≈ 0.0625 或 K norm diff ≈ 1.0，确诊为计算顺序偏差",
+            "fix": "将 RMSNorm.forward 中 (self.weight.float() * x_f).to(dtype=input_dtype) 改为 self.weight * x_f.to(dtype=input_dtype)。HF Qwen3RMSNorm 先 cast bf16 再乘 weight，模型权重已针对此精度路径训练——使用'更精确'的 fp32 乘法路径反而产生更差结果",
+            "source_refs": [
+              "Konwldge/phase_report/DEBUG_E2E_GARBLED_AND_TP4.md 根因 1",
+              "inference-agent-system/engine/models/qwen.py RMSNorm (参考)"
+            ],
+            "_discovered": "2026-06-07 Konwldge Qwen3-8B E2E 测试",
+            "_precision_note": "随机张量单测无法发现精度路径差异——必须用真实模型数据验证"
+          },
+          {
+            "id": "FM-017",
+            "category": "最终 LayerNorm 必须使用完整 hidden state（含 residual 累积）",
+            "symptom": "单卡 TP=1 E2E generate() 输出完全错误（top-1 token 为 ! 且 logit=0.0），但所有单组件测试均通过。RMSNorm 修复后仍然乱码",
+            "check": "检查 QwenForCausalLMTP.forward_prefill/forward_decode 中 36 层循环后的 hs 变量——vLLM-style DecoderLayer 返回 (mlp_out, res) 二元组，hs 仅含最后层 mlp_out，缺失 36 层 residual 累积。应打印 hs.abs().max() 与 HF 对应位置的 hidden_states.abs().max() 对比",
+            "fix": "在 36 层循环后、self.norm(hs) 前加一行: hs = hs + res。HF Qwen3DecoderLayer 返回的 hidden_states 已内含 residual，但 vLLM-style 的 residual 是单独累积的，必须手动合并",
+            "source_refs": [
+              "Konwldge/phase_report/DEBUG_E2E_GARBLED_AND_TP4.md 根因 2",
+              "inference-agent-system/engine/models/qwen.py forward_prefill/decode (参考)"
+            ],
+            "_discovered": "2026-06-07 Konwldge Qwen3-8B E2E 测试（RMSNorm 修复后仍乱码）",
+            "_architecture_note": "vLLM-style residual chain 与 HF-style 返回值语义不同。HF: hidden_states = residual + mlp_output（内联）。vLLM: DecoderLayer → (mlp_out, res) 分离返回。不能直接对比 hs 变量"
+          },
+          {
+            "id": "FM-018",
+            "category": "_row_slice 的 size 参数必须除以 tp_size",
+            "symptom": "TP>1 权重复载时 o_proj shape mismatch: loaded=[4096, 0], model=[4096, 1024]。rank 1/2/3 加载到空张量",
+            "check": "grep 所有 _row_slice 调用，逐一检查第二参数（size）是否 = hidden_size // tp_size（而非 hidden_size）。_col_slice 的调用者天然使用 per-rank 尺寸（q_size/kv_size 已经是 ÷ tp_size 的），但 _row_slice 的调用者容易误传全尺寸",
+            "fix": "将 _row_slice(weight, hidden_size) 改为 _row_slice(weight, hidden_size // tp_size)。_row_slice 在 dim=1 上按 [tp_rank * size : (tp_rank+1) * size] 切片——size 为全尺寸时 rank≥1 切片范围超出张量边界",
+            "source_refs": [
+              "Konwldge/phase_report/DEBUG_E2E_GARBLED_AND_TP4.md 根因 3",
+              "inference-agent-system/engine/models/qwen.py load_weights (参考)"
+            ],
+            "_discovered": "2026-06-07 Konwldge Qwen3-8B TP=4 权重复载",
+            "_affected_component": "RowParallelLinear — o_proj 行并行（dim=1 分片）"
+          },
+          {
+            "id": "FM-019",
+            "category": "CustomAR rank_data 工作区尺寸不足 + GC 释放导致 GPU 内存损坏",
+            "symptom": "TP>1 推理时 CUBLAS_STATUS_EXECUTION_FAILED，崩溃位置在多次运行间不稳定（可能在 gate_up_proj GEMM 或 down_proj GEMM）。CustomAR 初始化成功、模型权重复载正常、形状全部匹配——但 GEMM 内核访问到被破坏的 GPU 内存",
+            "check": "比对 init_custom_ar() 中 rank_data 的大小是否 = max_size（16 MB）而非硬编码的 8*1024*1024。检查 CustomARHandle.__init__ 是否持有 rank_data 引用（self._rank_data = rank_data）。如果 rank_data 局部变量在 init_custom_ar 返回后出作用域且无其他引用 → Python GC 释放 CUDA 内存 → 内核裸指针悬空",
+            "fix": "1) rank_data = torch.empty(max_size, dtype=torch.uint8, device=f'cuda:{local_rank}') — size 改为 max_size（内核期望工作区至少 max_size 字节，8MB 不足导致溢出污染相邻内存）。2) CustomARHandle.__init__ 增加 self._rank_data = rank_data — 持有引用防止 GC（ops.init_custom_ar 内部保存了 rank_data 的裸指针，Python tensor 被 GC 后 CUDA 内存被释放但内核仍通过裸指针访问 → use-after-free）。两个修复必须同时应用",
+            "source_refs": [
+              "Konwldge/phase_report/DEBUG_E2E_GARBLED_AND_TP4.md 根因 4",
+              "inference-agent-system/engine/tp_layers/distributed.py init_custom_ar + CustomAllReduceHandle (参考)"
+            ],
+            "_discovered": "2026-06-07 Konwldge Qwen3-8B TP=4 (CustomAR P2P all_reduce)",
+            "_criticality": "崩溃位置不稳定是最关键的诊断信号——如果形状或 dtype 不匹配，崩溃位置固定。位置不稳定意味着内存损坏（溢出或 use-after-free）"
           }
         ]
       },

@@ -430,6 +430,30 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
 2. 开启 `DEBUG_MODE` 探针与 NaN/Inf 断言。
 3. 定位首个数值崩塌层（shape、scale、dtype、通信语义）。
 
+**Phase 10 E2E 输出乱码专属回溯流程：**
+
+当 `test_phase10_greedy_align.sh` 的 greedy 对齐测试失败（输出乱码/不匹配 baseline），按以下优先级回溯源 Phase：
+
+```
+Phase 10 E2E 乱码
+  ├─ 单卡 TP=1 也乱码？
+  │   ├─ 所有组件单测 PASS 但 Q/K norm 与 HF 参考值有偏差？
+  │   │   └─ → Phase 5: RMSNorm 计算顺序 (FM-016)
+  │   ├─ 组件单测 PASS，top-1 token 异常（如 '!' 且 logit=0）？
+  │   │   └─ → Phase 6: forward 缺失 hs = hs + res (FM-017)
+  │   └─ forward 不报错，模型正常加载？
+  │       └─ → Phase 7: q_norm/k_norm dispatch 遗漏 (Bug 6)
+  ├─ 仅 TP>1 乱码？
+  │   ├─ 权重复载时 shape mismatch [4096,0] vs [4096,1024]？
+  │   │   └─ → Phase 7: _row_slice 未除 tp_size (FM-018)
+  │   └─ forward 时 CUBLAS crash，位置不稳定？
+  │       └─ → Phase 2: CustomAR rank_data 尺寸/GC (FM-019)
+  └─ 短句重复/局部复读（非完全乱码）？
+      └─ → Phase 5: RoPE Neox vs GPT-J 错配 (FM-007)
+```
+
+定位到源 Phase 后，查阅 `inference_blueprint.json > model_layer.failure_mode_library` 对应 FM 条目的 symptom→check→fix，修复后重新通过该 Phase 测试，再回到 Phase 10 验证。
+
 ### 7.2 查阅踩坑知识库
 
 定位到故障算子后，强制回查 `inference_blueprint.json`：
@@ -472,11 +496,39 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
    - 增大 `block_size`（减少块元数据开销）
 3. 不要盲目增大 batch 或 max tokens。
 
-### C. 输出异常/乱码
+### C. 输出异常/乱码（Phase 10 E2E 检测到后按以下矩阵回溯源 Phase）
 
-1. 检查 tokenizer 与 `skip_special_tokens` 使用。
-2. 检查采样参数（`temperature`、`top_p`）。
-3. 核验 prompt 编码和 decode 文本链路是否一致。
+Phase 10 的 `test_phase10_greedy_align.sh` 是首次端到端 `generate()` 验证。当输出乱码或与基线不匹配时，**严禁盲目调 tokenizer 或采样参数**——Phase 10 阶段 temperature=0.0（greedy），乱码根因几乎一定在前序 Phase 的模型计算偏差中。
+
+**第一步：确定故障范围**
+
+1. 单卡 TP=1 也乱码 → 排除 TP 通信问题 → 优先检查 Phase 5/6/7
+2. 仅 TP>1 乱码 → 优先检查 Phase 2 通信 + Phase 7 权重复载的 TP 相关路径
+3. `forward` 不报错但 `generate()` 输出乱码 → **最危险信号**：权重缺失或精度路径偏差（模型静默产生错误 logits）
+
+**第二步：按症状匹配根因（按排查优先级排列）**
+
+| # | 症状特征 | 回退源 Phase | 根因 | FM/Bug 编号 |
+|---|---------|------------|------|-----------|
+| 1 | 单卡乱码，所有组件单测（embedding/QKV/RoPE/norm）diff=0。用真实模型数据对比 HF 参考实现——Q norm diff ≈ 0.0625 或 K norm diff ≈ 1.0 | **Phase 5** | RMSNorm 计算顺序：`(self.weight.float() * x_f).to(bf16)` 应改为 `self.weight * x_f.to(bf16)`。HF 权重已针对"先 cast 后乘"的精度路径训练 | FM-016 |
+| 2 | 单卡乱码（根因 1 修复后仍乱码），top-1 token 为 `!` 且 logit=0.0，所有组件单测 PASS | **Phase 6** | forward_prefill/decode 在 36 层循环后缺失 `hs = hs + res`。vLLM-style DecoderLayer 返回 (mlp_out, res) 分离二元组，res 须手动合并再做最终 norm | FM-017 |
+| 3 | 单卡乱码，forward 不报错，模型正常加载。所有组件单测 PASS（因测试用随机权重而非真实权重） | **Phase 7** | `_dispatch_weight` 遗漏 Qwen3 特有的 `self_attn.q_norm.weight` 和 `self_attn.k_norm.weight`。q_norm/k_norm 保持 torch.ones 初始值，Q/K 被错误 norm 权重污染 → logits 全错但不 crash | Bug 6 (Phase 9) |
+| 4 | TP=4 权重复载时报 `RuntimeError: shape mismatch loaded=[4096, 0], model=[4096, 1024]` | **Phase 7** | `_row_slice` 的 size 参数未除以 `tp_size`。RowParallel o_proj 在 dim=1 分片，`_row_slice(weight, hidden_size // tp_size)` 而非 `hidden_size` | FM-018 |
+| 5 | TP=4 forward 时 `CUBLAS_STATUS_EXECUTION_FAILED`，崩溃位置在多次运行间**不稳定**（第一次 down_proj，第二次 gate_up_proj） | **Phase 2** | CustomAR `rank_data` 尺寸不足（8MB→应为 16MB）+ CustomARHandle 未持有 `rank_data` 引用（Python GC 释放 → 内核裸指针悬空）。**崩溃位置不稳定是关键诊断信号**——形状/dtype 问题的崩溃位置固定 | FM-019 |
+| 6 | 短句重复、局部复读、退化输出（非完全乱码，有一定语义但质量极差） | **Phase 5** | RoPE 风格错配：Qwen3 必须 is_neox=True（前后分半 rotate_half），DeepSeek 用 is_neox=False（GPT-J 奇偶交错） | FM-007 |
+
+**第三步：定位到源 Phase 后的修复流程**
+
+1. 回到对应源 Phase 的代码，按 FM 条目的 `fix` 描述修复
+2. 重新通过该 Phase 的全部 `minimal_test_commands`
+3. 回到 Phase 10 再跑 `test_phase10_greedy_align.sh` — 输出必须与 baseline 字字对齐
+4. 若仍有乱码：回到第一步重新匹配下一个根因（可能同时存在多个根因）
+
+**排除性检查（以下原因在 Phase 10 greedy 场景几乎不可能是根因，但仍需确认）：**
+
+- tokenizer 与 `skip_special_tokens` 使用 — 如果每个 token id 都可以手动 decode 验证
+- 采样参数 `temperature`/`top_p` — `temperature=0.0` greedy 下采样引入偏差的概率极低
+- prompt 编码 — 对比 tokenizer(prompt) 输出与 baseline 的 token ids
 
 ### D. 卡住或多次无法修复
 
