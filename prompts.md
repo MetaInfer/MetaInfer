@@ -18,6 +18,7 @@ cd /path/to/meta-infer
 
 | 触发词 | Phase | 构建内容 |
 |--------|-------|---------|
+| `/phase-all` | 1-11 | **全量一次性构建**（Phase 1-4 → 5 → 6 → 7-8 → 9-10 → 11） |
 | `/phase1-4` | 1-4 | 数值基元 + TP 通信 + TP 线性层 + TP Embedding |
 | `/phase5` | 5 | Attention + KV Cache（最高错误密度） |
 | `/phase6` | 6 | MLP + Decoder Layer |
@@ -28,6 +29,7 @@ cd /path/to/meta-infer
 ## Skill 文件位置
 
 ```
+.claude/skills/phase-all/SKILL.md
 .claude/skills/phase1-4/SKILL.md
 .claude/skills/phase5/SKILL.md
 .claude/skills/phase6/SKILL.md

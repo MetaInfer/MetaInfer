@@ -448,6 +448,7 @@ verification           → 主 Agent 动作
 | `notebooks-cn/` | 知识文档（中文） |
 | `ref_projects/` | 参考工程源码（nano-vllm, vllm, sglang） |
 | `scripts/` | 固定测试合约（28 个，不可修改） |
+| `.claude/skills/phase-all/SKILL.md` | Phase All 任务卡：全量一次性构建（1→11） |
 | `.claude/skills/phase1-4/SKILL.md` | Phase 1-4 任务卡：数值基元 → TP Embedding |
 | `.claude/skills/phase5/SKILL.md` | Phase 5 任务卡：Attention + KV Cache（最高错误密度） |
 | `.claude/skills/phase6/SKILL.md` | Phase 6 任务卡：MLP + Decoder Layer |
@@ -470,6 +471,7 @@ verification           → 主 Agent 动作
 
 | 触发词 | Skill 文件 | 构建范围 |
 |--------|-----------|---------|
+| `/phase-all` | `.claude/skills/phase-all/SKILL.md` | **全量一次性构建**（Phase 1 → 11） |
 | `/phase1-4` | `.claude/skills/phase1-4/SKILL.md` | 数值基元 → TP Embedding（4 Phase 依次） |
 | `/phase5` | `.claude/skills/phase5/SKILL.md` | Attention + KV Cache |
 | `/phase6` | `.claude/skills/phase6/SKILL.md` | MLP + Decoder Layer |
