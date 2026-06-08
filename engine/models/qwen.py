@@ -20,8 +20,15 @@ import os
 import torch
 import torch.nn as nn
 
-from engine.tp_layers.linear import QKVColumnParallelLinear, RowParallelLinear
+from engine.tp_layers.linear import (
+    QKVColumnParallelLinear,
+    RowParallelLinear,
+    MergedColumnParallelLinear,
+)
 from engine.kernels.vllm_wrappers import (
+    rms_norm,
+    fused_add_rms_norm,
+    silu_and_mul,
     rms_norm as _rms_norm_kernel,
     fused_add_rms_norm as _fused_add_rms_norm_kernel,
     rotary_embedding as _rotary_embedding,
@@ -395,3 +402,160 @@ class QwenAttentionTP(nn.Module):
         # 7. Output projection
         out = out.reshape(B, S, self.q_size)
         return self.o_proj(out)
+
+
+# ===========================================================================
+# QwenMLPTP — TP MLP with merged gate+up projection
+# ===========================================================================
+
+class QwenMLPTP(nn.Module):
+    """Tensor-parallel MLP for Qwen3 Dense.
+
+    Merged gate+up projection (MergedColumnParallelLinear) → silu_and_mul → down_proj.
+
+    Per-rank dimensions (TP=4):
+      intermediate_size = 12288 → inter_per_rank = 3072
+      gate_up_out = 2 * 3072 = 6144  (NOT 6400!)
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        tp_size = _get_tp_size()
+        self.intermediate_per_rank = cfg.intermediate_size // tp_size  # 3072
+
+        self.gate_up_proj = MergedColumnParallelLinear(
+            cfg.hidden_size,        # 4096
+            cfg.intermediate_size,  # 12288
+            bias=False,
+            gather_output=False,
+        )
+        self.down_proj = RowParallelLinear(
+            cfg.intermediate_size,  # in_features = 12288 (full)
+            cfg.hidden_size,        # out_features = 4096
+            bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """MLP forward: gate_up_proj → silu_and_mul → down_proj.
+
+        x: [B, T, hidden_size]
+        returns: [B, T, hidden_size]
+        """
+        gate_up = self.gate_up_proj(x)  # [B, T, 2*inter_per_rank] = [B, T, 6144]
+        act = torch.empty(
+            *gate_up.shape[:-1],
+            self.intermediate_per_rank,  # 3072
+            dtype=gate_up.dtype,
+            device=gate_up.device,
+        )
+        silu_and_mul(act, gate_up)
+        return self.down_proj(act)
+
+
+# ===========================================================================
+# QwenDecoderLayerTP — TP decoder layer (prefill + decode paths)
+# ===========================================================================
+
+class QwenDecoderLayerTP(nn.Module):
+    """Tensor-parallel decoder layer for Qwen3 Dense.
+
+    Two paths:
+      forward()        — prefill:  rms_norm / fused_add_rms_norm → Attn → Add+Norm → MLP
+      forward_decode() — decode:   fused_add_rms_norm → Attn → Add+Norm → MLP (single token)
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.self_attn = QwenAttentionTP(cfg)
+        self.mlp = QwenMLPTP(cfg)
+
+    # ------------------------------------------------------------------
+    # Prefill forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        layer_cache,           # unused — KV cache is internal to self_attn
+        max_seq_len: int,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prefill decoder layer forward (B=1 single-seq).
+
+        Residual chain:
+          residual = hidden_states.clone()  (first layer only)
+          hidden_states = rms_norm(residual)
+          → attention → fused_add_rms_norm → mlp → return (mlp_out, residual)
+        """
+        if residual is None:
+            residual = hidden_states.clone()
+            rms_norm(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+            )
+        else:
+            fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+            )
+
+        attn_out = self.self_attn.forward(hidden_states, positions, max_seq_len)
+
+        fused_add_rms_norm(
+            attn_out,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
+
+        mlp_out = self.mlp(attn_out)
+        return mlp_out, residual
+
+    # ------------------------------------------------------------------
+    # Decode forward (single token, no clone)
+    # ------------------------------------------------------------------
+
+    def forward_decode(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        kv_len: int,
+        max_seq_len: int,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode decoder layer forward (single token, eager path: no clone).
+
+        Residual chain:
+          fused_add_rms_norm → attention → fused_add_rms_norm → mlp
+          → return (mlp_out, residual)
+
+        residual is never None in decode — it is carried from prefill.
+        """
+        # residual always provided in decode (carried from prefill stage)
+        fused_add_rms_norm(
+            hidden_states,
+            residual,
+            self.input_layernorm.weight,
+            self.input_layernorm.eps,
+        )
+
+        attn_out = self.self_attn.forward_decode(
+            hidden_states, positions, kv_len, max_seq_len
+        )
+
+        fused_add_rms_norm(
+            attn_out,
+            residual,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
+
+        mlp_out = self.mlp(attn_out)
+        return mlp_out, residual
