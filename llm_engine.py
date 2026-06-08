@@ -191,17 +191,25 @@ class LLMEngine:
         Returns:
             Generated text string (single prompt) or list of strings (batch).
         """
-        # Reset state for fresh generation
-        self._active_gen_seqs.clear()
-        self._waiting.clear()
-        self._running.clear()
-
         # Normalize prompts
         if isinstance(prompts, str):
             prompts = [prompts]
             single_prompt = True
         else:
             single_prompt = False
+
+        # Validate prompts: reject empty strings (would cause FPE in GPU kernels)
+        for p in prompts:
+            if not p or not p.strip():
+                raise ValueError(
+                    f"Empty prompt is not allowed: {p!r}. "
+                    f"Prompt must contain at least one non-whitespace character."
+                )
+
+        # Reset state for fresh generation
+        self._active_gen_seqs.clear()
+        self._waiting.clear()
+        self._running.clear()
 
         # Step 1: Enqueue
         seqs = self._enqueue(prompts, max_new_tokens, temperature, top_p)
@@ -375,6 +383,11 @@ class LLMEngine:
         """
         seqs: List[Sequence] = []
         for i, prompt in enumerate(prompts):
+            if not prompt or not prompt.strip():
+                raise ValueError(
+                    f"Empty prompt is not allowed: {prompt!r}. "
+                    f"Prompt must contain at least one non-whitespace character."
+                )
             token_ids = self.runner.tokenizer.encode(
                 prompt, add_special_tokens=True
             )
