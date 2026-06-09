@@ -148,7 +148,7 @@ class TPModelRunner:
             )  # [B, 1]
 
             kv_len = kv_lens[0]  # B=1 single-seq
-            logits, new_kv_lens = self.model(
+            logits, new_kv_lens = self.model.forward_decode(
                 input_ids,
                 past_key_values=kv_len,
                 position_offset=kv_len,

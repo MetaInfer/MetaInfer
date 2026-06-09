@@ -76,7 +76,7 @@ class RMSNorm(nn.Module):
           all call sites use tuple unpacking.
         """
         if residual is None:
-            out = torch.empty_like(x)
+            out = torch.empty(*x.shape, dtype=x.dtype, device=x.device)
             _rms_norm_kernel(out, x.contiguous(), self.weight, self.eps)
             return out, None
         else:
@@ -167,6 +167,18 @@ class QwenAttentionTP(nn.Module):
         self.register_buffer(
             "_slot_mapping_decode",
             torch.zeros(1, dtype=torch.int64),
+            persistent=False,
+        )
+
+        # --- pre-allocated decode buffers (O3: no empty_like in hot path) ---
+        self.register_buffer(
+            "_q_norm_out",
+            torch.empty(1, self.num_heads, self.head_dim, dtype=torch.bfloat16),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_k_norm_out",
+            torch.empty(1, self.num_kv_heads, self.head_dim, dtype=torch.bfloat16),
             persistent=False,
         )
 
@@ -343,19 +355,21 @@ class QwenAttentionTP(nn.Module):
         q, k, v = self.qkv_proj(hidden_states)
         # q: [1, 1, 1024], k: [1, 1, 256], v: [1, 1, 256]
 
+        # q, k, v are already contiguous — QKVColumnParallelLinear
+        # makes y contiguous before split(), so all views are contiguous.
+
         # 2. Reshape to 4D per-head
         q = q.view(B, S, self.num_heads, self.head_dim)       # [1, 1, 8, 128]
         k = k.view(B, S, self.num_kv_heads, self.head_dim)    # [1, 1, 2, 128]
         v = v.view(B, S, self.num_kv_heads, self.head_dim)    # [1, 1, 2, 128]
 
-        # 3. Q/K norm
-        q, _ = self.q_norm(q)
-        k, _ = self.k_norm(k)
+        # 3. Q/K norm (pre-allocated buffers, input already contiguous from above)
+        q_v = q.reshape(S, self.num_heads, self.head_dim)
+        k_v = k.reshape(S, self.num_kv_heads, self.head_dim)
+        _rms_norm_kernel(self._q_norm_out, q_v, self.q_norm.weight, self.q_norm.eps)
+        _rms_norm_kernel(self._k_norm_out, k_v, self.k_norm.weight, self.k_norm.eps)
 
-        # 4. RoPE — flatten to 2D
-        q_flat = q.reshape(S, self.num_heads, self.head_dim)
-        k_flat = k.reshape(S, self.num_kv_heads, self.head_dim)
-
+        # 4. RoPE — use norm outputs directly
         if self._cos_sin_cache_gpu is None:
             self._cos_sin_cache_gpu = self._cos_sin_cache_cpu.to(
                 hidden_states.device
@@ -363,15 +377,15 @@ class QwenAttentionTP(nn.Module):
 
         _rotary_embedding(
             positions,
-            q_flat,
-            k_flat,
+            self._q_norm_out,
+            self._k_norm_out,
             self.head_dim,
             self._cos_sin_cache_gpu,
             is_neox=True,
         )
 
-        q = q_flat.view(B, S, self.num_heads, self.head_dim)
-        k = k_flat.view(B, S, self.num_kv_heads, self.head_dim)
+        q = self._q_norm_out.view(B, S, self.num_heads, self.head_dim)
+        k = self._k_norm_out.view(B, S, self.num_kv_heads, self.head_dim)
 
         # 5. KV cache write (decode: write 1 token at slot = kv_len)
         self._slot_mapping_decode[0] = self._kv_len_gpu[0]
@@ -438,6 +452,13 @@ class QwenMLPTP(nn.Module):
             bias=False,
         )
 
+        # --- pre-allocated decode buffer (O3: no empty in hot path) ---
+        self.register_buffer(
+            "_silu_out",
+            torch.empty(1, 1, self.intermediate_per_rank, dtype=torch.bfloat16),
+            persistent=False,
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """MLP forward: gate_up_proj → silu_and_mul → down_proj.
 
@@ -445,12 +466,15 @@ class QwenMLPTP(nn.Module):
         returns: [B, T, hidden_size]
         """
         gate_up = self.gate_up_proj(x)  # [B, T, 2*inter_per_rank] = [B, T, 6144]
-        act = torch.empty(
-            *gate_up.shape[:-1],
-            self.intermediate_per_rank,  # 3072
-            dtype=gate_up.dtype,
-            device=gate_up.device,
-        )
+        if gate_up.shape[:-1] == self._silu_out.shape[:-1]:
+            act = self._silu_out
+        else:
+            act = torch.empty(
+                *gate_up.shape[:-1],
+                self.intermediate_per_rank,  # 3072
+                dtype=gate_up.dtype,
+                device=gate_up.device,
+            )
         silu_and_mul(act, gate_up)
         return self.down_proj(act)
 
@@ -893,25 +917,36 @@ class QwenForCausalLMTP(nn.Module):
             logits = self.lm_head(hidden_states)  # [B, S, vocab_size]
             return logits, None
         else:
-            # —— Decode ——
-            kv_len = (
-                past_key_values
-                if isinstance(past_key_values, int)
-                else past_key_values[0]
-            )
-            B, S = input_ids.shape  # B=1, S=1
-            hidden_states = self.embed_tokens(input_ids)  # [1, 1, hidden_size]
-            positions = torch.tensor(
-                [kv_len], dtype=torch.int64, device=input_ids.device
+            return self.forward_decode(
+                input_ids, past_key_values, position_offset, max_seq_len
             )
 
-            residual = None
-            for layer in self.layers:
-                hidden_states, residual = layer.forward_decode(
-                    hidden_states, positions, kv_len, max_seq_len, residual
-                )
+    @torch.inference_mode()
+    def forward_decode(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values,
+        position_offset: int = 0,
+        max_seq_len: int = 40960,
+    ) -> torch.Tensor:
+        kv_len = (
+            past_key_values
+            if isinstance(past_key_values, int)
+            else past_key_values[0]
+        )
+        B, S = input_ids.shape  # B=1, S=1
+        hidden_states = self.embed_tokens(input_ids)  # [1, 1, hidden_size]
+        positions = torch.tensor(
+            [kv_len], dtype=torch.int64, device=input_ids.device
+        )
 
-            hidden_states, _ = self.norm(hidden_states, residual)
-            logits = self.lm_head(hidden_states)  # [1, 1, vocab_size]
-            kv_lens = [int(l.self_attn._kv_len_gpu[0].item()) for l in self.layers]
-            return logits, kv_lens
+        residual = None
+        for layer in self.layers:
+            hidden_states, residual = layer.forward_decode(
+                hidden_states, positions, kv_len, max_seq_len, residual
+            )
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+        logits = self.lm_head(hidden_states)  # [1, 1, vocab_size]
+        kv_lens = [kv_len + 1]  # one decode token added, no GPU sync
+        return logits, kv_lens

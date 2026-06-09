@@ -325,6 +325,10 @@ class QKVColumnParallelLinear(nn.Module):
         if self.gather_output and self.tp_size > 1:
             y = all_gather_last_dim(y)  # [B, T, total_qkv]
 
+        # Ensure contiguous so split() produces contiguous views.
+        # rocBLAS may return non-contiguous output, and split() inherits that.
+        y = y.contiguous()
+
         # Q-K-V split order: Q first, then K, then V (STRICTLY Q-K-V, NOT K-Q-V)
         q, k, v = y.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         return q, k, v

@@ -167,9 +167,10 @@ class Scheduler:
                 seq.output_ids.append(token_id)
                 seq.status = SequenceStatus.DECODE
             else:
-                # Decode step
+                # Decode step: kv_len already updated by ModelRunner
+                # from model._kv_len_gpu returned by forward() / forward_decode().
+                # Must NOT increment here — that would double-count.
                 seq.output_ids.append(token_id)
-                seq.kv_len += 1
 
             # Termination checks
             if token_id == eos_token_id:

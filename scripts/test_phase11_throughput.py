@@ -1,47 +1,134 @@
-# Phase 11 吞吐测试——验证引擎可正常运行并产出正确输出。
-# model_dir: 由 MODEL_DIR 环境变量或命令行参数指定，未提供则交互询问。
-import time, os, sys
-os.environ['META_INFER_LOG_RANK0_ONLY'] = '1'; os.environ['META_INFER_CUDA_GRAPH'] = '0'
+"""
+Phase 11 — Throughput alignment test.
 
-print("=== Phase 11: Throughput Baseline ===")
+Measures end-to-end throughput (tok/s) for single GPU / TP=4 and verifies
+correctness against the Phase 10 greedy-decode baseline.
 
-# model_dir 获取优先级: 命令行参数 > 环境变量 > 交互输入
+Gates (from inference_blueprint.json performance_gate):
+  THROUGHPUT-001: Single GPU throughput >= 3.0 tok/s (baseline ~3.9 tok/s)
+  THROUGHPUT-002: Output matches Phase 10 greedy baseline exactly
+  THROUGHPUT-003: TP=4 throughput reported (when torchrun detected)
+
+Usage:
+  MODEL_DIR=/path/to/model python scripts/test_phase11_throughput.py
+  MODEL_DIR=/path/to/model torchrun --nproc_per_node=4 scripts/test_phase11_throughput.py
+
+Trace Source: physical_trace_tp4_rank0.json [runtime] Phase 10 baseline 3.9 tok/s
+"""
+
+import os
+import sys
+import time
 from pathlib import Path
-if len(sys.argv) > 1:
-    model_dir = Path(sys.argv[1])
-elif os.environ.get('MODEL_DIR'):
-    model_dir = Path(os.environ['MODEL_DIR'])
-else:
-    model_dir = Path(input("Enter model directory path: "))
 
-if not model_dir.exists():
-    print(f"ERROR: model_dir not found: {model_dir}")
-    sys.exit(1)
+# ---------------------------------------------------------------------------
+# Environment setup
+# ---------------------------------------------------------------------------
+_root = os.environ.get(
+    "AGENT_INFER_ROOT",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+sys.path.insert(0, _root)
 
-print(f"model_dir: {model_dir}")
+os.environ.setdefault("META_INFER_LOG_RANK0_ONLY", "1")
+os.environ.setdefault("META_INFER_CUDA_GRAPH", "0")
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")
+os.environ.setdefault("NCCL_DEBUG", "WARN")
 
+import torch
 from llm_engine import LLMEngine
-engine = LLMEngine(model_dir=model_dir, inference_backend='qwen_tp', max_num_seqs=4)
 
-NUM_TOKENS = 32
-t0 = time.time()
-out = engine.generate('苏州园林的特点是', max_new_tokens=NUM_TOKENS, temperature=0.0)
-elapsed = time.time() - t0
-tps = NUM_TOKENS / elapsed
+# ---------------------------------------------------------------------------
+# Test parameters (pinned to Phase 10 greedy-decode baseline)
+# ---------------------------------------------------------------------------
+PROMPT = "苏州园林的特点是"
+EXPECTED = "（ ） A：建筑与园林结合 B：建筑与自然结合 C：建筑与山水结合 D：建筑"
+MAX_TOKENS = 24          # Match the expected output length
+WARMUP_TOKENS = 8        # Absorb one-time buffer allocations
+MIN_THROUGHPUT = 3.0     # tok/s — well below the ~3.9 baseline
+TRACE_SRC = "physical_trace_tp4_rank0.json [runtime] Phase 10 baseline"
 
-# 两种合法输出：截断版（max_new_tokens=24）或完整版（max_new_tokens=32）
-expected_short = '（ ） A：建筑与园林结合 B：建筑与自然结合 C：建筑与山水结合 D：建筑'
-expected_full  = '（ ） A：建筑与园林结合 B：建筑与自然结合 C：建筑与山水结合 D：建筑与植物结合\n答案：B'
-correct = out.strip() == expected_short or out.strip() == expected_full
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+_rank = int(os.environ.get("RANK", 0))
+_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+_is_tp = _world_size > 1
 
-print(f"  Tokens: {NUM_TOKENS}")
-print(f"  Elapsed: {elapsed:.3f}s")
-print(f"  Throughput: {tps:.1f} tok/s")
-print(f"  Correctness: {'PASS' if correct else 'FAIL'}")
-if not correct:
-    print(f"  Output: {out!r}")
-    print(f"  Expected (short): {expected_short!r}")
-    print(f"  Expected (full):  {expected_full!r}")
 
-assert correct, f"THROUGHPUT-001: 输出与预期不符。Output={out!r}"
-print("PHASE11_THROUGHPUT: PASS")
+def _log(msg: str) -> None:
+    if _rank == 0:
+        print(msg, flush=True)
+
+
+def _fail(tag: str, detail: str) -> int:
+    _log(f"[{tag}] FAIL: {detail}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Test runner
+# ---------------------------------------------------------------------------
+def run() -> int:
+    model_dir = os.environ.get("MODEL_DIR")
+    if not model_dir:
+        return _fail("THROUGHPUT-001", "MODEL_DIR not set. export MODEL_DIR=<model weights dir>")
+
+    _log("=== Phase 11: Throughput Alignment Test ===")
+    _log(f"TP mode:  {'TP=' + str(_world_size) if _is_tp else 'single GPU'}")
+    _log(f"Model:    {model_dir}")
+    _log(f"Prompt:   {PROMPT}")
+    _log(f"Expected: {EXPECTED}")
+    _log(f"Max tokens: {MAX_TOKENS}")
+
+    engine = LLMEngine(
+        model_dir=Path(model_dir),
+        inference_backend="qwen_tp",
+        max_num_seqs=4,
+    )
+
+    # ---- Warm-up: absorb one-time buffer allocations / kernel JIT ----
+    _log("[WARMUP] Running warm-up generation (8 tokens)...")
+    _ = engine.generate(PROMPT, max_new_tokens=WARMUP_TOKENS, temperature=0.0)
+    torch.cuda.synchronize()
+    _log("[WARMUP] Done.")
+
+    # ---- Measured run ----
+    _log(f"[MEASURE] Generating {MAX_TOKENS} tokens...")
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    out = engine.generate(PROMPT, max_new_tokens=MAX_TOKENS, temperature=0.0)
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+
+    tps = MAX_TOKENS / elapsed if elapsed > 0 else 0.0
+    _log(f"  Elapsed:    {elapsed:.3f}s")
+    _log(f"  Throughput: {tps:.1f} tok/s")
+
+    # ---- Gate: correctness regression ----
+    if _rank == 0 and out != EXPECTED:
+        return _fail(
+            "THROUGHPUT-002",
+            f"Output mismatch.\n  Got:      {out!r}\n  Expected: {EXPECTED!r}",
+        )
+    _log("[THROUGHPUT-002] PASS: output matches Phase 10 greedy baseline exactly")
+
+    # ---- Gate: throughput floor ----
+    if tps < MIN_THROUGHPUT:
+        return _fail(
+            "THROUGHPUT-001",
+            f"Throughput {tps:.1f} tok/s below minimum {MIN_THROUGHPUT} tok/s",
+        )
+    _log(f"[THROUGHPUT-001] PASS: throughput {tps:.1f} tok/s >= {MIN_THROUGHPUT}")
+
+    # ---- TP=4 note ----
+    if _is_tp:
+        _log(f"[THROUGHPUT-003] TP={_world_size} throughput: {tps:.1f} tok/s")
+
+    _log("\nPHASE11_THROUGHPUT: ALL TESTS PASSED")
+    _log(f"Source: {TRACE_SRC}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())
