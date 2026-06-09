@@ -17,6 +17,26 @@ _custom_ar_handle = None
 _buf_ptrs: list[int] | None = None
 _max_size: int = 16 * 1024 * 1024  # 16 MB
 
+# ---------------------------------------------------------------------------
+# CustomAR safety gate
+# ---------------------------------------------------------------------------
+# WHY disabled: vLLM ops.all_reduce kernel triggers HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION
+# on ROCm 6.3.3 + RCCL 2.22.3 when called after rocBLAS GEMM operations (F.linear).
+# Simple all_reduce on fresh randn tensors works, but any all_reduce following a GEMM
+# crashes with SIGABRT. NCCL fallback is reliable and verified with 73+ all_reduce calls
+# in full 36-layer TP=4 prefill + decode.
+#
+# Evidence: scripts/_debug_tp4_*.py (5 diagnostic scripts, 2026-06-09)
+# Repro:   torchrun --nproc_per_node=4 scripts/_debug_tp4_nccl_vs_customar.py
+#           → PATH A (5 CustomAR calls on randn) PASS
+#           → PATH B (10 NCCL calls) PASS
+#           → PATH C (re-init CustomAR + QKV + o_proj) CRASH (SIGABRT, rank 3)
+# Fix:     scripts/_debug_tp4_nccl_only.py → full model TP=4 NCCL-only → PASS
+#
+# To re-enable when ROCm/CustomAR compatibility is resolved, set:
+#   export META_INFER_CUSTOMAR_ENABLE=1
+_USE_CUSTOMAR = os.environ.get("META_INFER_CUSTOMAR_ENABLE", "0") == "1"
+
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -98,6 +118,11 @@ def init_custom_ar(device: torch.device | int | str | None = None) -> None:
     global _custom_ar_handle, _buf_ptrs, _max_size
 
     if not is_tp_enabled():
+        return
+
+    if not _USE_CUSTOMAR:
+        # CustomAR disabled due to ROCm compatibility issue.
+        # all_reduce_sum will automatically fall back to NCCL.
         return
 
     world_size = dist.get_world_size()
@@ -184,8 +209,8 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
         # custom_op MUST return a new tensor, not an alias of the input
         return x.clone()
 
-    if _custom_ar_handle is not None and _buf_ptrs is not None:
-        # CustomAR P2P path
+    if _USE_CUSTOMAR and _custom_ar_handle is not None and _buf_ptrs is not None:
+        # CustomAR P2P path (gated by _USE_CUSTOMAR — see module-level doc)
         from vllm import _custom_ops as ops  # noqa: F811
 
         out = torch.empty_like(x)

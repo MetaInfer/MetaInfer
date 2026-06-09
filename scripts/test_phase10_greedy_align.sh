@@ -85,6 +85,8 @@ import os, sys
 sys.path.insert(0, "__ROOT_DIR__")
 os.environ['META_INFER_LOG_RANK0_ONLY'] = '1'
 os.environ['META_INFER_CUDA_GRAPH'] = '0'
+os.environ['VLLM_LOGGING_LEVEL'] = 'ERROR'
+os.environ['NCCL_DEBUG'] = 'WARN'
 
 from llm_engine import LLMEngine
 from pathlib import Path
@@ -173,6 +175,8 @@ import os, sys
 sys.path.insert(0, {root_dir!r})
 os.environ['META_INFER_LOG_RANK0_ONLY'] = '1'
 os.environ['META_INFER_CUDA_GRAPH'] = '0'
+os.environ['VLLM_LOGGING_LEVEL'] = 'ERROR'
+os.environ['NCCL_DEBUG'] = 'WARN'
 
 from llm_engine import LLMEngine
 from pathlib import Path
@@ -215,12 +219,9 @@ fi
 
 # The Python script only writes to stdout on rank 0, and only when
 # the output matches expected (otherwise it exits 1). So any stdout
-# is the correct output. Strip trailing newlines for comparison.
-TP_RESULT="${TP_OUTPUT%%$'\n'*}"
-
-# Remove any torchrun banner lines (they go to stderr, but belt-and-suspenders)
-# and trailing whitespace/newlines
-TP_RESULT=$(echo "$TP_RESULT" | grep -v '^W[0-9]\|^\[rank' | head -1)
+# is the correct output.
+# Filter out RCCL/NCCL diagnostic lines, torchrun banners, and empty lines
+TP_RESULT=$(echo "$TP_OUTPUT" | grep -vE 'worker|NCCL|RCCL|HIP version|ROCm version|Hostname|Librccl|^W[0-9]|^\[rank' | grep -v '^\s*$' | head -1)
 
 if [ "${TP_RESULT}" = "${EXPECTED}" ]; then
     echo "Output:   ${TP_RESULT}"

@@ -21,7 +21,7 @@ echo "=== Phase 10: Performance Benchmark (TP=${TP_SIZE} nocompile) ==="
 # Quick single-GPU throughput measurement
 echo "[BENCH-001] Single GPU throughput..."
 RESULT=$(python -c "
-import os,time,sys; os.environ['META_INFER_LOG_RANK0_ONLY']='1'; os.environ['META_INFER_CUDA_GRAPH']='0'
+import os,time,sys; os.environ['META_INFER_LOG_RANK0_ONLY']='1'; os.environ['META_INFER_CUDA_GRAPH']='0'; os.environ['VLLM_LOGGING_LEVEL']='ERROR'; os.environ['NCCL_DEBUG']='WARN'
 from llm_engine import LLMEngine; from pathlib import Path
 engine=LLMEngine(model_dir=Path('${MODEL_DIR}'),inference_backend='qwen_tp',max_num_seqs=4)
 t0=time.time(); out=engine.generate('苏州园林的特点是',max_new_tokens=32,temperature=0.0)

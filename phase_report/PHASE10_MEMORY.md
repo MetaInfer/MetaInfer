@@ -2,66 +2,59 @@
 
 | 字段 | 值 |
 |------|-----|
-| Timestamp | 2026-06-09T08:55:00Z |
-| Status | ✅ DELIVERED (partial — TP=4 environmental GPU VM fault) |
-| Track | 完整串行 + 3 script/engine fixes |
-| PID verif | 4090415 |
+| Timestamp | 2026-06-09T11:30:00Z |
+| Status | ✅ DELIVERED |
+| Track | 完整串行 + 快速修复 (CustomAR gate + log suppression) |
 
-## Scripts Passed (after fixes)
-- L0 Anti-fake-PASS: ✅ PASS
+## Scripts Passed
 - test_phase10_no_compile_check.sh: ✅ PASS
 - test_phase10_vs_vllm_compare.sh: ✅ PASS
-- test_phase10_benchmark.sh: ✅ PASS — 3.8 tok/s (bc→awk fix)
+- test_phase10_benchmark.sh: ✅ PASS — 3.9 tok/s single GPU
 - test_phase10_greedy_align.sh (GREEDY-ALIGN-001 single GPU): ✅ PASS — output matches baseline exactly
-- test_phase10_greedy_align.sh (GREEDY-ALIGN-002 TP=4): ❌ FAIL — GPU VM fault (environmental)
-- L2 Phase 1-9 regression (22 scripts): ✅ ALL PASS
-- L3 Profiler + VRAM evidence: ✅ Collected
+- test_phase10_greedy_align.sh (GREEDY-ALIGN-002 TP=4): ✅ PASS — output matches baseline exactly
 
-## Files Changed (this round)
+## Files Changed
 
-### New fixes
-- `engine/tp_layers/distributed.py` (+3 lines): `init_tp_distributed()` idempotent guard — checks `dist.is_initialized()` before re-init. Prevents "process group already initialized" error when both `run_tp_generation_loop` and `LLMEngine.__init__` call it.
-- `scripts/test_phase10_benchmark.sh` (+1/-1): Replaced `bc -l` with `awk` for float comparison portability
-- `scripts/test_phase10_greedy_align.sh` (+8/-4): Platform-aware GPU detection — tries `nvidia-smi` → `rocm-smi --showmeminfo vram` → `torch.cuda.device_count()`
+### Core fix — CustomAR safety gate
+- `engine/tp_layers/distributed.py` (+28 lines): Added `_USE_CUSTOMAR` flag defaulting to False. CustomAR kernel (`ops.all_reduce`) triggers `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` on ROCm 6.3.3 + RCCL 2.22.3 when called after rocBLAS GEMM operations (F.linear). Standalone CustomAR on fresh tensors works; any CustomAR after GEMM crashes with SIGABRT. NCCL fallback (`dist.all_reduce`) is reliable — verified with 73+ all_reduce calls across full 36-layer TP=4 prefill + decode. CustomAR re-enable: `export META_INFER_CUSTOMAR_ENABLE=1`.
+- Evidence: 5 diagnostic scripts confirmed the GEMM→CustomAR interaction is the exact crash point.
 
-### Previous changes
+### Log suppression (stdout pollution fixes)
+- `llm_engine.py` (+4 lines): Set `VLLM_LOGGING_LEVEL=ERROR` and `NCCL_DEBUG=WARN` at module level (before engine imports). vLLM DEBUG logs and RCCL NCCL INFO messages were polluting stdout, breaking test output parsing.
+- `scripts/test_phase10_greedy_align.sh` (+4/-3 lines): Added `NCCL_DEBUG=WARN` to both Python templates. Fixed TP=4 stdout extraction to filter RCCL/NCCL diagnostic lines (`worker`, `NCCL`, `RCCL`, `HIP version`, `ROCm version`, `Hostname`, `Librccl`) using extended `grep -vE`.
+- `scripts/test_phase10_benchmark.sh` (+1 line): Added `NCCL_DEBUG=WARN` to inline Python.
+
+### Previous changes (carried forward)
 - `openai_tp_server.py` (CREATED — +413 lines)
-- `llm_engine.py` (+8 lines: empty prompt validation in generate() + _enqueue())
+- `llm_engine.py` (+8 lines: empty prompt validation in generate() + _enqueue(), init_tp_distributed() idempotent guard)
+- `engine/tp_layers/distributed.py` (+3 lines: init_tp_distributed() idempotent guard)
+- `scripts/test_phase10_benchmark.sh` (bc→awk float comparison)
+- `scripts/test_phase10_greedy_align.sh` (platform-aware GPU detection: nvidia-smi → rocm-smi → torch.cuda)
 
-## CustomAR Investigation
+## TP=4 Crash Root Cause (FOUND)
 
-**Conclusion: CustomAR works correctly on all 4 ranks.**
+**Location**: `engine/tp_layers/distributed.py:222` — `ops.all_reduce(_custom_ar_handle, x, out, _buf_ptrs[rank], _max_size)`
 
-Step-by-step diagnostic confirmed:
-- `init_custom_ar()` completes on all 4 ranks with valid handles
-- `all_reduce_sum` via CustomAR works: rank 0 input 1.0 → output 10.0 (1+2+3+4) ✅
-- `all_gather_last_dim` works: [rank_val] → concatenated [1,2,3,4] ✅
-- P2P peer access: all 12 GPU pairs verified accessible ✅
-- No AMD detection → RCCL fallback code exists
+**Symptom**: `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` → SIGABRT
 
-The TP=4 SIGABRT is NOT caused by CustomAR failure. It's a GPU-level VM fault (`KERNEL VMFault Analysis` + `Can't read for directory: /sys/kernel/debug/kfd/process`) that occurs during the model's prefill forward, after engine creation and CustomAR init succeed.
+**Root cause**: vLLM `ops.all_reduce` CustomAR kernel crashes on ROCm 6.3.3 + RCCL 2.22.3 + Hygon K500SM_AI when called with tensor data produced by rocBLAS GEMM operations (F.linear). rocBLAS workspace memory appears to overlap with CustomAR IPC buffer region, causing GPU memory access violation.
 
-## TP=4 GPU VM Fault Details
-- **Symptom**: torchrun TP=4 crashes with exitcode -6 (SIGABRT) during model prefill forward
-- **Location**: GPU kernel-level VM fault detected by KFD (Kernel Fusion Driver)
-- **Evidence**: `HW QUEUE INFO ANALYSIS` + `KERNEL VMFault Analysis` in stderr
-- **Affected**: Full model TP=4 inference only — Phase 3/4 TP=4 tests (small tensors) pass
-- **Root cause**: ROCm 6.3.3 / RCCL 2.22.3 / Hygon K500SM_AI driver interaction. System warnings: "Missing iommu=pt from kernel command line", "NUMA auto balancing enabled", KFD debugfs not accessible
-- **Not a code bug**: CustomAR, P2P, NCCL/RCCL init all verified working independently
+**Evidence chain**:
+1. `_debug_tp4_allreduce_repeat.py`: Simple all_reduce × 2 on randn → PASS. F.linear + all_reduce → CRASH
+2. `_debug_tp4_nccl_vs_customar.py`: PATH A (5 CustomAR calls on randn) → PASS. PATH B (10 NCCL calls) → PASS. PATH C (re-init CustomAR + QKV + o_proj) → CRASH
+3. `_debug_tp4_nccl_only.py`: Full model TP=4 with NCCL → prefill ✅, decode ✅, 73 all_reduce ✅
+4. `_debug_tp4_fix_verify.py`: Full LLMEngine TP=4 with NCCL fallback → output matches baseline exactly ✅
+
+**Fix**: `_USE_CUSTOMAR` safety gate disabled by default. NCCL fallback used for all all_reduce operations. Verified output is bit-identical to baseline.
 
 ## Spec-Reviewer Issues (all resolved)
 | ISSUE | Severity | Resolution |
 |-------|----------|-----------|
 | ISSUE-1: Missing SIGTERM/SIGINT handler | CRITICAL | ✅ FIXED |
-| ISSUE-2: Missing init_dist_if_needed() | HIGH | ✅ NOT A BUG — init_tp_distributed() + WORLD_SIZE guard + idempotent |
+| ISSUE-2: Missing init_dist_if_needed() | HIGH | ✅ NOT A BUG |
 | ISSUE-3: Missing argparse CLI | MEDIUM | ✅ FIXED |
 | ISSUE-4: Wrong function name | MEDIUM | ✅ FIXED |
 | ISSUE-5: Missing finish_reason before [DONE] | LOW | ✅ FIXED |
 
-## Empty Prompt FPE Fix
-- `engine.generate('')` → ValueError (was SIGFPE crash)
-- Validation in both `generate()` and `_enqueue()` (covers streaming path)
-
-## Spot Check
-- 抽查脚本: test_phase9_llm_engine_init.py — PASS ✅
-- Greedy align output: exact match confirmed over 5 consecutive runs ✅
+## Debug Scripts (to clean up)
+11 scripts in `scripts/_debug_tp4_*.py` — diagnostic artifacts from root cause investigation. Can be removed.

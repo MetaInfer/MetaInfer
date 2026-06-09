@@ -34,6 +34,13 @@ from typing import List, Optional, Union
 
 import torch
 
+# Suppress vLLM debug logs that pollute stdout during model loading
+if "VLLM_LOGGING_LEVEL" not in os.environ:
+    os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
+# Suppress RCCL/NCCL INFO messages that pollute stdout under torchrun
+if "NCCL_DEBUG" not in os.environ:
+    os.environ["NCCL_DEBUG"] = "WARN"
+
 from engine.framework.sequence import Sequence, SequenceStatus
 from engine.framework.scheduler import Scheduler, ScheduleResult
 from engine.framework.block_manager import BlockManager
