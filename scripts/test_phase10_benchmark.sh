@@ -32,7 +32,7 @@ sys.stdout.write(f'{tps:.1f}')
 echo "  Throughput: ${RESULT} tok/s"
 
 # 验证引擎运行正常且输出非空（具体性能阈值因硬件而异，由 physical trace 基线定义）
-if [ -n "${RESULT}" ] && [ "$(echo "${RESULT} > 0" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+if [ -n "${RESULT}" ] && [ "$(awk "BEGIN {print (${RESULT} > 0)}" 2>/dev/null || echo 0)" = "1" ]; then
     echo "[BENCH-001] PASS: engine ran successfully, throughput ${RESULT} tok/s"
 else
     echo "[BENCH-001] FAIL: engine failed to produce valid throughput" >&2

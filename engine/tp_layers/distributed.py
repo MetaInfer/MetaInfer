@@ -48,12 +48,17 @@ def init_tp_distributed() -> None:
         LOCAL_RANK, RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT
 
     Built-in guard: WORLD_SIZE <= 1 → immediate return (single GPU, debug mode).
+    Idempotent: if dist is already initialized, skip re-init (safe for multi-caller).
     Caller-side must also guard: if _world_size > 1: init_tp_distributed()
     """
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     if world_size <= 1:
         # Single-process: nothing to initialize.
         # dist.init_process_group would hang waiting for NCCL master.
+        return
+
+    if dist.is_available() and dist.is_initialized():
+        # Already initialized (e.g., by torchrun or a parent caller).
         return
 
     local_rank = int(os.environ["LOCAL_RANK"])

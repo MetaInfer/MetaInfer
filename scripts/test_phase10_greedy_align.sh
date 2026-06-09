@@ -53,9 +53,20 @@ _detect_python() {
 _detect_python
 
 # ---- GPU 数量检测 ----
-GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l || echo "0")
-if [ "$GPU_COUNT" -eq 0 ]; then
-    echo "ERROR: 没有可用的 GPU (nvidia-smi 检测失败)" >&2
+_detect_gpu_count() {
+    if command -v nvidia-smi &>/dev/null; then
+        nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l
+    elif command -v rocm-smi &>/dev/null; then
+        # AMD ROCm / Hygon DCU: count unique HCU device indices
+        rocm-smi --showmeminfo vram 2>/dev/null | grep -o 'HCU\[[0-9]*\]' | sort -u | wc -l
+    else
+        # Fallback: try torch.cuda
+        python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0"
+    fi
+}
+GPU_COUNT=$(_detect_gpu_count)
+if [ "$GPU_COUNT" -eq 0 ] 2>/dev/null || [ -z "$GPU_COUNT" ]; then
+    echo "ERROR: 没有可用的 GPU" >&2
     exit 1
 fi
 
