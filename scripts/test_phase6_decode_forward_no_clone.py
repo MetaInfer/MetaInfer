@@ -1,7 +1,7 @@
 # Why: 防止 Eager 模式 forward_decode 热路径中残留 clone() 调用。
 #   Stage C 发现无条件 clone 导致 ~15% 吞吐回退 (aten::copy_ 占比>5%)。
 #   正确: eager 路径 forward_decode 零 clone; CUDA Graph 路径的 clone 在 forward_decode_graph。
-#   Trace: nocompile TP=4 throughput 55.7 tok/s; clone 版本回退到 ~47 tok/s。
+#   Trace: nocompile TP=4; clone 版本存在显著吞吐回退。
 # What failure: forward_decode 内含 hidden_states.clone() 或 residual.clone()
 #   → monkeypatch clone 为 mock → 调用 forward_decode → assert mock 未被调用
 # Superpowers gate: CLAUDE.md rule 2 (No speculative — Stage C clone regression is real)

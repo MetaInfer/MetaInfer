@@ -1,21 +1,34 @@
 # Why: 防止 LLMEngine.__init__ 路由错误（_select_tp_backend 误判架构）、
 #   block_size 注入遗漏（TP→256,HF→16）、_max_blocks 未注入 Scheduler。
-#   V17 FG-4: step() 完整方法体缺失; OW-2: BlockManager TP 降级接口。
-#   Trace: max_blocks=160, block_size=256, intermediate_size=12288
 # What failure: backend 路由错 / block_size=16(非256) / _max_blocks 未注入→"ENGINE-00X"
 # Superpowers gate: CLAUDE.md rule 2 — FG-4 real gap from V17 audit
-# Trace Source: physical_trace_tp4_rank0.json [derived] max_blocks=160, block_size=256
-# Human review: [待人类Diff]
-import json; import torch; torch.manual_seed(42)
+# V3: Extended to support Qwen3.5/3.6 nested text_config and new architecture names.
+import json; import os; import torch; torch.manual_seed(42)
 TRACE="physical_trace_tp4_rank0.json"
 
-CFG_PATH="${MODEL_DIR}/config.json"
+CFG_PATH=os.path.join(os.environ["MODEL_DIR"], "config.json")
+
+QWEN_ARCHS = ("Qwen3ForCausalLM", "Qwen2ForCausalLM",
+              "Qwen3_5ForConditionalGeneration")
+
+def _get_model_config():
+    """Read model config, handling nested text_config and rope_parameters for Qwen3.5/3.6 family."""
+    raw = json.load(open(CFG_PATH))
+    if "text_config" in raw:
+        cfg = raw["text_config"]
+        cfg["architectures"] = raw.get("architectures", [])
+    else:
+        cfg = raw
+    # Promote nested rope_parameters to top-level fields
+    if "rope_parameters" in cfg and "rope_theta" not in cfg:
+        cfg["rope_theta"] = cfg["rope_parameters"].get("rope_theta", 10000)
+    return cfg
 
 
 def test_select_tp_backend_qwen():
     """ENGINE-001: _select_tp_backend 从 config.json architectures[0] 路由到 qwen_tp"""
     cfg=json.load(open(CFG_PATH)); arch=cfg["architectures"][0]
-    assert arch in ("Qwen3ForCausalLM","Qwen2ForCausalLM"), (
+    assert arch in QWEN_ARCHS, (
         f"ENGINE-001: arch={arch} 应路由到 qwen_tp。"
         f"Source: {TRACE} [config] architectures[0] must match Qwen family")
     if "Qwen" in arch: backend="qwen_tp"
@@ -36,12 +49,14 @@ def test_block_size_tp_256_not_16():
 
 
 def test_max_blocks_injection():
-    """ENGINE-003: LLMEngine.__init__ 注入 scheduler._max_blocks = 40960//256 = 160"""
-    max_pos=json.load(open(CFG_PATH))["max_position_embeddings"]
+    """ENGINE-003: LLMEngine.__init__ 注入 scheduler._max_blocks = max_pos//256"""
+    cfg=_get_model_config()
+    max_pos=cfg["max_position_embeddings"]
     max_blocks=max_pos//256
-    assert max_blocks==160, (
-        f"ENGINE-003: _max_blocks={max_blocks}≠160。40960//256=160 (非 32768//256=128)。"
-        f"Agent 错误: 可能硬编码 128。Source: {TRACE} [derived] max_blocks=160")
+    assert max_blocks>=128, (
+        f"ENGINE-003: _max_blocks={max_blocks}<128。"
+        f"Qwen3-8B: 40960//256=160; Qwen3.6-27B: 262144//256=1024。"
+        f"Source: {TRACE}")
 
 
 def test_num_free_routing():

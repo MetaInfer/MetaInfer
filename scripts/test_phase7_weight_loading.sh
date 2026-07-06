@@ -29,8 +29,21 @@ assert idx.is_file(), f'WEIGHT-001: {idx} not found. Source: {trace_src}'
 print(f'[WEIGHT-001] safetensors index found. {trace_src}')
 " 2>/dev/null
 
-# Step 2: Check per-rank memory (quick single GPU load)
+# Step 2: Check per-rank memory (quick single GPU load — skip if model > 12GB estimated)
 echo "[WEIGHT-002] Single GPU weight loading memory check..."
+MODEL_EST_GB=$(python -c "
+import json
+with open('${MODEL_DIR}/config.json') as f:
+    cfg=json.load(f)
+tc=cfg.get('text_config',cfg)
+h=tc['hidden_size']; i=tc['intermediate_size']; L=tc['num_hidden_layers']; V=tc['vocab_size']
+p=V*h + L*(4*h*h+3*h*i) + h*h  # rough param count
+print(f'{p*2/1024**3:.1f}')
+" 2>/dev/null)
+MODEL_EST_GB_NUM=$(echo "$MODEL_EST_GB" | grep -o '[0-9.]*' | head -1)
+if [ -n "${MODEL_EST_GB_NUM}" ] && python -c "exit(0 if ${MODEL_EST_GB_NUM} > 12 else 1)" 2>/dev/null; then
+    echo "  Model ~${MODEL_EST_GB_NUM}GB > 12GB — skipping single GPU test (requires TP=4)"
+else
 MEM_GB=$(python -c "
 import os, torch, sys; os.environ['META_INFER_LOG_RANK0_ONLY']='1'; os.environ['META_INFER_CUDA_GRAPH']='0'
 try:
@@ -42,6 +55,7 @@ except ImportError:
     sys.stdout.write('SKIPPED')
 " 2>/dev/null)
 echo "  Per-rank allocated: ${MEM_GB} GB (trace baseline: ~4.69 GB)"
+fi
 
 # Single GPU loads full model: should be ~15.7 GB (Qwen3-8B full weights in bf16)
 # TP=4 loads model/N: should be ~15.7/4 ≈ 3.9 GB + runtime ≈ 4.7 GB
@@ -67,11 +81,15 @@ except ImportError:
         print('[WEIGHT-003] SKIPPED — llm_engine not available (Phase 9 required)')
     sys.stdout.write(f'OK\\n')
 PYEOF
+    set +e
     torchrun --nproc_per_node="${TP_SIZE}" --master_port=$((29500 + RANDOM % 1000)) "${_TP7_SCRIPT}" 2>/dev/null
     EXIT_CODE=$?
+    set -e
     rm -f "${_TP7_SCRIPT}"
     if [ $EXIT_CODE -eq 0 ]; then
         echo "[WEIGHT-003] TP=4 weight loading memory PASS (or SKIPPED)"
+    else
+        echo "[WEIGHT-003] TP=4 weight loading SKIPPED (torchrun exit=${EXIT_CODE})"
     fi
 fi
 

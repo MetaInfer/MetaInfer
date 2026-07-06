@@ -1,30 +1,32 @@
 # AGENT SKILL: TP/EP Inference Generation SOP
 
 你是 `agent-infer` 的推理框架生成 Agent。你的唯一目标是：  
-**基于 `inference_blueprint.json` 的架构知识图谱，生成单路径、可观测、可验证、可自愈的 TP/EP 推理实现。**
+**基于 `notebooks-cn/00_contracts/` 的结构化 API 契约，生成单路径、可观测、可验证、可自愈的 TP/EP 推理实现。**
 
 ### 0.-2 路径兼容规则（开源分发保护）
 
 本知识包中所有 `ref_docs` 路径已统一为 `notebooks-cn/`。若在任何文件（blueprint、AGENT_SKILL、外部引用）中遇到 `notebooks/`（不带 `-cn`）的路径，**自动替换为 `notebooks-cn/`** 后再解析。此规则确保本包在拷贝到不同环境或被人 fork 后，路径仍然有效。
 
-### 0.-1 ref_docs 强制交叉验证（防信息孤岛）
+### 0.-1 契约交叉验证（防信息孤岛）
 
-`inference_blueprint.json` 中的 `ref_docs` / `source_refs` 不是"参考资料列表"，而是**蓝图信息的扩展存储**。蓝图中的伪代码、接口签名、维度参数可能只在 ref_doc 中有完整定义（例如 `kernel_replacement_plan.md §九` 包含 7 个 kernel 的精确调用契约）。
+`notebooks-cn/00_contracts/` 中的契约文件不是"参考资料列表"，而是**唯一的契约来源**。契约中的伪代码、接口签名、维度参数是实现的唯一标准。
 
 **强制规则**：
-1. 在改动任何涉及 `ref_docs` 的组件前，必须先**实际打开并阅读**对应的 ref_doc 文件，确认蓝图引用的知识点确实存在于文档中。
-2. 提交代码前，对改动涉及的每个 JSON 组件，逐条核对：
-   - `ref_docs` 中引用的文档路径是否存在且可读？
-   - 蓝图声称的签名/公式/约束在 ref_doc 中是否有对应内容？
-   - 蓝图自身的 pseudocode 是否自包含（不依赖 ref_doc 中缺失的内容）？
-3. 若 ref_doc 与蓝图信息冲突，以蓝图为准并记录差异。若 ref_doc 中找不到蓝图引用的知识点，视为**蓝图信息断裂**，标记为 🟡 Warning 并报告，不得脑补。
-4. 审计类任务在检查 `ref_code` 指针精度的同时，**必须**抽样打开至少 3 个被引用的 ref_doc 文件，逐段验证至少 1 个蓝图引用的知识点确实存在于对应文档中。
+1. 在改动任何组件前，必须先**实际打开并阅读**对应的 00_contracts/ 契约文件，确认所有接口签名和约束。
+2. 提交代码前，对改动涉及的每个组件，逐条核对契约文件中的接口签名、shape 约束、dtype 要求、属性命名规范。
+3. 若 00_contracts/ 契约与 notebooks-cn/ 深度知识文档冲突，以 00_contracts/ 为准并记录差异。
+4. 契约文件中"关联 notebooks"字段指向的文档必须在实现前阅读。
 
-### 0.0 主执行 Agent + 监控子代理（唯一例外）
+### 0.0 三角色对抗构建 + 进程隔离（与 CLAUDE.md 一致）
 
-1. 代码实现与改动由**当前主 Agent**顺序完成；禁止多个实现型 subagents 并行改同一仓库。  
-2. 允许且仅允许开启 **1 个只读监控子代理**，职责仅限实时采集并汇报 HCU/VRAM 指标，**不得写代码**。  
-3. 长任务仍按 **phase 分步**（见 blueprint `todo_generation_playbook`），但默认目标是一次会话跑通 `phase_1 ~ phase_9`（到引擎集成完成）。
+**本文件是 implementer 的知识参考**。implementer 通过 **Agent 工具** 被主 Agent spawn，只写代码不跑测试。
+
+构建流程的完整控制权在 CLAUDE.md——三角色对抗串行（impl → spec → verify），spec-reviewer 和 verification 通过 **Shell `claude -p` 独立进程** 执行。详见 CLAUDE.md §进程隔离硬约束。
+
+1. 代码实现由 **implementer 子 agent**（Agent 工具 spawn）完成；禁止主 Agent 自己写代码。
+2. spec-reviewer 通过 Shell `claude -p` 独立进程审查，verification 通过 Shell `claude -p` 独立进程验收。
+3. 允许且仅允许开启 **1 个只读监控子代理**，职责仅限实时采集并汇报 HCU/VRAM 指标，**不得写代码**。
+4. 长任务仍按 **phase 分步**，默认目标是一次会话跑通 `phase_1 ~ phase_11`。
 
 ### 0.0.1 反偷懒与反假输出（强制执行）
 
@@ -35,8 +37,8 @@
 
 ### 0.0.2 长上下文防”遗忘”（一次跑完 phase1-9 的前提）
 
-模型在长对话中会丢失早期约束。**必须**在每完成一个 blueprint phase 或每轮大改前：**重新打开并扫一眼**  
-`AGENT_SKILL.md` 与本任务相关的 `inference_blueprint.json` 节点（可用 `agent_navigation` 跳转）。可选：在仓库写 `agents-infer/PROGRESS.md` 记下当前 phase 与已验证命令。
+模型在长对话中会丢失早期约束。**必须**在每完成一个 Phase 或每轮大改前：**重新打开并扫一眼**  
+`AGENT_SKILL.md` 与本 Phase 相关的 `notebooks-cn/00_contracts/` 契约文件。可选：在仓库写 `phase_report/PROGRESS.md` 记下当前 phase 与已验证命令。
 
 ### 0.0.3 逐 Phase scripts/ 门禁与一次完成 phase1-9
 
@@ -54,9 +56,9 @@
 2. **物理块双轨制感知边界（CRITICAL-01 强制）**：
    - TP Runner 路径（`inference_backend="qwen_tp"/"deepseek_tp"`）：KV cache 由模型自管（`_kv_block_size=256`，`torch.arange` 顺序分配）。**严禁** BlockManager API 接入 TP Runner。
    - HF 兜底路径（`inference_backend="hf"`）：框架层 paging（BlockManager, block_size=16）正常生效。
-   - **集成桥接接口**：LLMEngine.step() 中根据 `inference_backend` 注入 `block_size` (16/256) 到 Scheduler，并选择 `num_free_blocks` 来源（BlockManager 或 runner.get_num_free_blocks()）。`scheduler.schedule(num_free)` 接受 num_free 参数。TP 路径下 BlockManager.allocate/free 降级为纯计数 no-op。QwenTPModelRunner 必须暴露 `get_num_free_blocks()` 方法。KVMemoryPool 在 TP 路径仅做显存预算日志，实际 KV cache 由 QwenAttentionTP 内部 torch.zeros 创建。详见 `inference_blueprint.json > scheduler_tp_runner_bridge`。
+   - **集成桥接接口**：LLMEngine.step() 中根据 `inference_backend` 注入 `block_size` (16/256) 到 Scheduler，并选择 `num_free_blocks` 来源（BlockManager 或 runner.get_num_free_blocks()）。`scheduler.schedule(num_free)` 接受 num_free 参数。TP 路径下 BlockManager.allocate/free 降级为纯计数 no-op。QwenTPModelRunner 必须暴露 `get_num_free_blocks()` 方法。KVMemoryPool 在 TP 路径仅做显存预算日志，实际 KV cache 由 QwenAttentionTP 内部 torch.zeros 创建。详见 `notebooks-cn/00_contracts/framework_contracts.md`。
 3. 读取并同步以下上下文：
-   - `inference_blueprint.json`
+   - `notebooks-cn/00_contracts/`（当前 Phase 对应的契约文件）
    - `notebooks-cn/04_parallel_strategies/*`（TP 切分策略）
    - `notebooks-cn/06_experience/*`（TP 调试经验）
    - `notebooks-cn/07_improvementPlan/improvement_plan.md`（框架层改动记录：P0 KV Cache、P2 torch.compile、P3-FA Flash Attention）
@@ -73,7 +75,7 @@
 
 ## 1. 执行铁律（Prime Directives）
 
-1. **契约优先**：所有实现必须受 `inference_blueprint.json` 约束，禁止模型无关脑补。
+1. **契约优先**：所有实现必须受 `notebooks-cn/00_contracts/` 中对应契约文件约束，禁止模型无关脑补。
 2. **单路径优先**：只生成当前架构所需代码路径，禁止引入巨石型多分支。
 3. **TDD 强制**：先写/改测试，再写实现。
 4. **证据优先**：先打点和对齐证据，再猜根因。
@@ -81,6 +83,8 @@
 6. **HF 对齐防 OOM**：多进程测试时 HF 基准模型禁止 `.to(device)` 常驻 GPU。
 7. **日志可追溯**：改动后必须输出文件清单、原因、验证结果。
 8. **自下而上 + scripts/ 门禁**：严格按 §2.0 的 Phase 顺序构建（数值基元→TP通信→线性层→Embedding→Attention→Decoder→权重加载→框架外壳→引擎集成）。每 Phase 的 scripts/ 测试全部 PASS 后，才能进入下一 Phase。Agent 自写 tests/ 不能替代 scripts/。
+9. **知识回流（回路 C）**：master 循环 ADVANCE 后，experiment-summarizer 判定是否有可持久化知识 → 回流到 notebooks-cn/。所有 Agent 必须接受并利用回流后的知识库。
+10. **知识进化（回路 B）**：未知模型首次生成失败后，不得直接重试——必须委托 evolution/ 进化编排器，通过 Explorer → Implementer → Consolidator 闭环探索并固化新知识。禁止跳过进化直接盲改代码。
 
 ### 1.1 面向可观测性设计（Design for Observability）
 
@@ -130,7 +134,7 @@
 
 > **构建范围**: nocompile, B=1, TP=4。绝对禁止 torch.compile 和 CUDA Graph。纯 Eager 模式。
 > **Phase 顺序由物理依赖拓扑决定，不可重排。** 每 Phase 通过 TDD 门禁后才能进入下一 Phase。
-> 完整实现在 `inference_blueprint.json > todo_generation_playbook`。本节仅保留关键参考信息。
+> 完整实现在 `notebooks-cn/00_contracts/` 各契约文件中。本节仅保留关键参考信息。
 
 ```
 Phase 1: 数值基元    → Phase 2: TP通信    → Phase 3: TP线性层
@@ -160,8 +164,8 @@ Phase 7: 权重加载     → Phase 8: 框架外壳  → Phase 9: 引擎集成
 | Phase 8 框架外壳 | `test_phase8_sequence_scheduler.py` + `test_phase8_sampler_tp.py` | 2 |
 | Phase 9 引擎集成 | `test_phase9_llm_engine_init.py` + `test_phase9_generate_single_gpu.sh` | 2 |
 | Phase 10 E2E 验收 | `test_phase10_greedy_align.sh` + `test_phase10_benchmark.sh` + `test_phase10_no_compile_check.sh` + `test_phase10_vs_vllm_compare.sh` | 4 |
-| Phase 11 性能优化 | `test_phase11_throughput.py` + `test_phase11_profiler.sh` | 2 |
-| **总计** | **28 个脚本（19 .py + 9 .sh）** | **28** |
+| Phase 11 性能优化 | `test_phase11_throughput.py` + `test_phase11_profiler.sh` + `test_phase11_201_throughput.py` + `test_phase11_202_profiler.sh` | 4 |
+| **总计** | **30 个脚本（20 .py + 10 .sh）** | **30** |
 
 **逐 Phase 交付流程（不可跳过）**：
 
@@ -177,44 +181,25 @@ Phase N 实现代码写完
 - 修改 scripts/ 下的脚本来"通过"测试
 - 用 Agent 自写的 tests/ 替代 scripts/ 的检查
 
-### 2.0.1 Phase → 完整知识链路（JSON + ref_docs + ref_code）
+### 2.0.1 Phase → 完整知识链路（契约 + 深度文档）
 
-每个 Phase 实现前，Agent 必须按以下 **3 步知识链路** 获取信息。仅读 JSON 是不够的——JSON 中的 `ref_docs`/`ref_code`/`ref_source` 字段指向的外部文件和源码行号包含了蓝图 pseudocode 未涵盖的完整细节（见 §0.-1 强制交叉验证规则）。
+每个 Phase 实现前，Agent 必须按以下 **2 步知识链路** 获取信息。仅读契约的伪代码是不够的——契约中的"关联 notebooks"字段指向的深度知识文档包含了伪代码未涵盖的完整细节（见 §0.-1 契约交叉验证规则）。
 
-**核心规则**：Agent 读 JSON 路径 → 发现 `ref_docs`/`ref_code`/`source_refs` 字段 → **必须实际打开这些文件**，不能仅凭 JSON 内的 pseudocode 脑补。
+**核心规则**：Agent 读 00_contracts/ 契约文件 → 发现"关联 notebooks"字段 → **必须实际打开这些文档**，不能仅凭契约内的 pseudocode 脑补。
 
-| Phase | 1. 先读 Blueprint JSON 路径（含内置伪代码和维度） | 2. 再打开 ref_docs（notebooks 知识文档） | 3. 再查阅 ref_code（可执行源码，含 nano-vllm 参考和 vLLM kernel 行号） |
-|-------|--------------------------|---------------------------|-------------------|
-| **Phase 1** 数值基元 | `qwen3_kernel_contracts`（7 kernel 签名+import 路径）→ `global_primitives_constraints.rmsnorm_precision_law` | `kernel_replacement_plan.md` §九（完整 kernel 调用契约表+代码模板 Snippet A-F） |
-| **Phase 2** TP 通信 | `tp_distributed_runtime`（init 顺序+3 种 collective）→ `...collectives.all_reduce_sum`（custom_op 注册+fake）→ `...collectives.all_gather_last_dim`→ `...collectives.custom_ar_all_reduce`（两套 IPC buffer+init_state_machine） | — |
-| **Phase 3** TP 线性层 | `tp_linear_layers`（4 种 Linear shape+forward pseudocode）→ `qwen3_8b_model_dims`（per-rank 维度：`gate_up=[6144,4096]` **非** `[6400,4096]`） | `qwen_dense_tp_implementation_guide.md`（TP 切分策略）`task10_tp_qwen_debug_experience.md`（double_shard 踩坑） |
-| **Phase 4** TP Embedding | `tp_embedding_and_lm_head`（VocabParallel mask+pseudocode + ParallelLMHead gather） | — |
-| **Phase 5** Attention/KV | `qwen3_tp_model_interfaces.attention`（KV cache paged 格式+block_table+slot_mapping）→ `...class_hierarchy.QwenAttentionTP`（__init__ 每个 attr 的精确名称）→ `paged_kv_cache_contract`（prefill/decode KV write + index_copy_）→ `flash_attention_integration_contract`（prefill_path + decode_path kernel 调用） | `improvement_plan.md` §P0（**⚠️ FG-3：此 doc 描述旧 HF 方案，与 paged KV 架构矛盾，以蓝图为权威**）`improvement_plan.md` §P3-FA（flash_attn 集成）`qwen3_effective_changes.md` #8 #10 |
-| **Phase 6** MLP/Decoder | `qwen3_tp_model_interfaces.mlp`（gate_up→silu_and_mul→down 链）→ `...decode_forward_pattern`（**完整 forward_decode 方法体 pseudocode，直接抄入**）→ `...prefill_forward_pattern`（prefill 完整数据流 8 步）→ `...class_hierarchy.QwenMLPTP` + `...QwenDecoderLayerTP`（__init__ attr 名） | `kernel_replacement_plan.md` §三（Snippet C: silu_and_mul 代码模板）`qwen3_effective_changes.md` #9（torch.compile 相关，nocompile 忽略） |
-| **Phase 7** 权重加载 | `...class_hierarchy.QwenTPConfig`（config.json 字段→dataclass）→ `...QwenForCausalLMTP`（构造链：embed→layers→norm→lm_head）→ `...construction_chain`（5 步：config→QwenTPConfig→model→load_weights→eval→CustomAR）→ `qwen_hf_key_mapping`（12 个 HF key→attr 映射+Q-K-V cat 顺序+Gate-Up cat 顺序+double_shard_guard）→ `qwen3_8b_model_dims`（验证维度） | `kernel_replacement_plan.md` §四（QKVColumnParallelLinear 组装）`task10_tp_qwen_debug_experience.md`（load_weights shape mismatch debug） |
-| **Phase 8** 框架外壳 | `components[0] Scheduler`（完整 schedule+postprocess pseudocode）→ `components[4] Sampler`（TP 协议：rank0 采样+broadcast）→ `components[5] Sequence`（status 转移+block_table 双轨）→ `components[2] BlockManager`（⚠️ TP 降级 no-op：allocate/free 空方法+get_num_free_blocks 保留）→ `scheduler_to_runner`（batch 组装+can_allocate 公式+REJECTED 机制） | `02_scheduler.md`（调度概念）`03_kv_cache.md`（paged attention）`05_sampler.md`（采样算法）`01_architecture.md` `07_request_lifecycle.md` | — |
-| **Phase 9** 引擎集成 | `components[6] LLMEngine`（full_api_surface: __init__ 7 步 flow+generate 5 步 while-loop+step 单步+begin_generation/has_unfinished/get_outputs API）→ `components[3] ModelRunner`（tp_runner_actual_flow: prefill/decode 分发+采样+run 方法体）→ `scheduler_tp_runner_bridge`（CRITICAL-01：block_size 注入+num_free 来源路由+BlockManager 降级） | `01_architecture.md` `07_request_lifecycle.md`（框架生命周期） |
-| **Phase 10** E2E 验收 | `todo_generation_playbook.phase_10_e2e_acceptance`（implementation_todos+minimal_test_commands+e2e_acceptance_bottom_line 硬性指标）→ `runtime_acceptance_layer.logic_constraints`→ `...acceptance_test_targets.qwen3_tp.performance_baseline` | `CLAUDE.md` §6.2-6.4（测试命令+benchmark 脚本）`improvement_plan.md`（性能基线记录） |
-
-**JSON 路径缩写展开**：
-- `qwen3_kernel_contracts` = `framework_layer.data_flow_contracts.tp_layer_interface_contracts.qwen3_kernel_contracts`
-- `tp_distributed_runtime` = `framework_layer.data_flow_contracts.tp_layer_interface_contracts.tp_distributed_runtime`
-- `tp_linear_layers` = `framework_layer.data_flow_contracts.tp_layer_interface_contracts.tp_linear_layers`
-- `tp_embedding_and_lm_head` = `framework_layer.data_flow_contracts.tp_layer_interface_contracts.tp_embedding_and_lm_head`
-- `qwen3_tp_model_interfaces` = `framework_layer.data_flow_contracts.tp_layer_interface_contracts.qwen3_tp_model_interfaces`
-- `paged_kv_cache_contract` = `framework_layer.data_flow_contracts.paged_kv_cache_contract`
-- `flash_attention_integration_contract` = `framework_layer.data_flow_contracts.flash_attention_integration_contract`
-- `scheduler_to_runner` = `framework_layer.data_flow_contracts.scheduler_to_runner`
-- `scheduler_tp_runner_bridge` = `framework_layer.data_flow_contracts.scheduler_tp_runner_bridge`
-- `components[N]` = `framework_layer.components[N]`
-- `qwen3_8b_model_dims` = `model_layer.architecture_knowledge_base.qwen_series_dense.qwen3_8b_model_dims`
-- `qwen_hf_key_mapping` = `model_layer.architecture_knowledge_base.qwen_series_dense.qwen_hf_key_mapping`
-- `global_primitives_constraints` = `model_layer.architecture_knowledge_base.global_primitives_constraints`
-
-**ref_code 读取规则**：
-1. `ref_projects/nano-vllm/...` 路径在项目根目录下，**必须实际 `Read` 打开该文件**。蓝图 component 的 `_nano_vllm_override` 字段说明了哪些行需要修改/删除。
-2. `vllm/_custom_ops.py:420-423` 等路径指向 **vLLM installed package**（在用户 Python 环境的 site-packages 中）。Agent 需 `import vllm._custom_ops; print(inspect.getsource(...))` 或直接读已安装包的源码文件。
-3. ref_code 中有精确到方法名和行号的引用（如 `vllm/model_executor/layers/activation.py::SiluAndMul.forward_cuda`）——Agent 必须只读该方法，不是整个文件。
+| Phase | 1. 先读 00_contracts/ 契约文件（含完整接口签名和伪代码） | 2. 再打开关联 notebooks（深度知识文档） |
+|-------|--------------------------|---------------------------|
+| **Phase 1** 数值基元 | `kernel_contracts.md`（7 个 kernel 签名+import 路径+精度约束） | `kernel_replacement_plan.md` §九（完整 kernel 调用契约表+代码模板 Snippet A-F） |
+| **Phase 2** TP 通信 | `tp_communication_contracts.md`（all_reduce_sum/all_gather_last_dim/CustomAR 的 custom_op 注册+init 顺序+两套 IPC buffer+init_state_machine） | — |
+| **Phase 3** TP 线性层 | `tp_linear_contracts.md`（4 种 Linear shape+forward pseudocode+K/V reshape 规则） | `02_qwen_dense_tp_implementation_guide.md`（TP 切分策略）`01_task10_tp_qwen_debug_experience.md`（double_shard 踩坑） |
+| **Phase 4** TP Embedding | `tp_embedding_contracts.md`（VocabParallel mask+pseudocode+ParallelLMHead gather） | — |
+| **Phase 5** Attention/KV | `attention_kv_contracts.md`（paged KV 格式+prefill/decode attention 完整 pseudocode+QwenAttentionTP 构造函数+block_table+slot_mapping） | `improvement_plan.md` §P3-FA（flash_attn 集成。**⚠️ FG-3：§P0 描述旧 HF 方案，与 paged KV 架构矛盾，以契约为权威**）`qwen3_effective_changes.md` #8 #10 |
+| **Phase 6** MLP/Decoder | `mlp_decoder_contracts.md`（gate_up→silu_and_mul→down 链+decode/prefill forward pseudocode+residual chain 语义）+ `qwen3_model_contracts.md`（class hierarchy+top-level forward+construction chain） | `kernel_replacement_plan.md` §三（Snippet C: silu_and_mul 代码模板） |
+| **Phase 7** 权重加载 | `weight_loading_contracts.md`（14 个 HF key→attr 映射+Q-K-V cat 顺序+Gate-Up cat 顺序+double_shard_guard）+ `model_specs.md`（Qwen3-8B 维度表+per-rank 维度） | `kernel_replacement_plan.md` §四（QKVColumnParallelLinear 组装）`01_task10_tp_qwen_debug_experience.md`（load_weights shape mismatch debug） |
+| **Phase 8** 框架外壳 | `framework_contracts.md`（Sequence/Scheduler/Sampler/BlockManager API 签名+schedule 签名+TP 降级 no-op+REJECTED 机制+block_size 注入） | `02_scheduler.md`（调度概念）`03_kv_cache.md`（paged attention）`05_sampler.md`（采样算法）`01_architecture.md` `07_request_lifecycle.md` |
+| **Phase 9** 引擎集成 | `engine_contracts.md`（LLMEngine 7 步构造+generate 5 步 while-loop+ModelRunner prefill/decode 分发+num_free 来源路由+block_size 注入） | `01_architecture.md` `07_request_lifecycle.md`（框架生命周期） |
+| **Phase 10** E2E 验收 | `model_specs.md` §Failure Mode Library（全部 FM-XXX 词条） | `CLAUDE.md` Phase-Script 绑定表 `improvement_plan.md`（性能基线记录）`bugfix.md`（7 个 Phase 9 bug 的症状/根因/修复） |
+| **Phase 11** 性能优化 | `kernel_contracts.md`（性能强制模式 O1-O9：O1 @torch.inference_mode(), O2 零 .item(), O3 预分配 buffer, O4 block_table arange, O5 prefill KV 直接赋值, O6 register_buffer 完整声明, O7-O9 懒 contiguous/view/消除中间 tensor） | `ROUND_1_BOTTLENECK_FIXES.md`（优化实测验证记录） |
 
 ### 2.1 引擎代码结构与 Qwen3 入口
 
@@ -234,7 +219,7 @@ Phase N 实现代码写完
 - QwenMLPTP: `.gate_up_proj` (非 `.gate_proj`), `.down_proj`, `.local_intermediate`
 - QwenDecoderLayerTP: `.self_attn` (非 `.attention`), `.mlp`, `.input_layernorm`, `.post_attention_layernorm`
 - QwenForCausalLMTP: `.embed_tokens`, `.layers` (ModuleList), `.norm`, `.lm_head`
-- HF key 映射见 `inference_blueprint.json > qwen_hf_key_mapping`
+- HF key 映射见 `notebooks-cn/00_contracts/weight_loading_contracts.md`
 - **NCCL 初始化**: torchrun → `torch.cuda.set_device(LOCAL_RANK)` → `dist.init_process_group('nccl','env://')` → 模型加载 → `init_custom_ar()` → `dist.barrier()`
 - **fused_add_rms_norm**: 物理tracing确认 — 所有4次调用用本层 `self.input_layernorm.weight` 或 `self.post_attention_layernorm.weight`。无跨层weight。
 - **all_gather_last_dim**: `dist.all_gather(outs, x)` + `torch.cat(outs, dim=-1)`
@@ -243,13 +228,15 @@ Phase N 实现代码写完
 - **KV head replication**: tp>num_kv_heads 时 num_kv_heads=1, kv_head_replica=tp//num_kv_heads
 - **Config**: AutoConfig.from_pretrained → QwenTPConfig。head_dim回退: hidden_size//num_attention_heads
 
-**nano-vllm 重载要点**（抄入参考代码时的修改检查清单）：
-1. Scheduler: 删除 preempt() 逻辑。block_size 改为注入式。
+**契约覆盖的改造要点**（按 00_contracts/ 中的 override 规则处理）：
+1. Scheduler: 删除 preempt() 逻辑。block_size 改为注入式（256 for TP）。
 2. BlockManager: TP 路径降级为纯计数器（allocate/free no-op）。get_num_free_blocks 保留但调用方改用 runner.get_num_free_blocks()。
 3. KVMemoryPool: TP 路径禁用 GPU placeholder 创建。
 4. ModelRunner: 删除 use_cache=False 模式。替换为 forward_decode 调用。
 5. Sampler: TP 下 rank 0 采样 + broadcast（不修改 sampler.py 本身）。
-6. RMSNorm: nano-vllm 原始实现需整体替换为 vLLM kernel wrapper。不能混用。
+6. RMSNorm: 必须使用 vLLM CUDA kernel wrapper（`engine/kernels/vllm_wrappers.py` 中的 `rms_norm`, `fused_add_rms_norm`，底层调用 `vllm._custom_ops`），禁止手写 PyTorch 实现。
+   **🚫 严禁 import vLLM Python 层类**：禁止 `from vllm.model_executor.layers.layernorm import RMSNorm`、`from vllm.config import VllmConfig` 等任何 `vllm.model_executor.*` 或 `vllm.config.*` 的导入。这些 Python 类依赖脆弱的 VllmConfig 上下文（CustomOp 需要 `set_current_vllm_config`），且需要阅读 vLLM 源码才能理解其内部逻辑。
+   **✅ 允许的导入**：`vllm._custom_ops`（C++ 扩展 kernel）、`vllm._C`（torch.ops 注册）、`engine/kernels/vllm_wrappers.py` 中的 wrapper 函数。区分原则：C++ 扩展（黑盒 kernel）允许，Python 层类（需要 VllmConfig 上下文）禁止。
 
 ### 2.2 Qwen3 TP 关键数据流（物理 tracing 确认）
 
@@ -264,11 +251,12 @@ Phase N 实现代码写完
 
 **Prefill/Decode 分发逻辑**：
 - `is_prefill = (past_key_values is None)` — None → prefill，非 None → decode
-- prefill: `layer.forward()` → qkv_proj → rotary → flash_attn_varlen_func(causal=True) → K,V index_copy_ 写入 paged cache → o_proj → mlp
-- decode: `layer.forward_decode()` → qkv_proj → Q/K norm → rotary → KV write(index_copy_) → flash_attn_with_kvcache → o_proj
+- prefill: `layer.forward()` → qkv_proj → rotary → flash_attn_varlen_func(causal=True) → K,V 直接索引赋值写入 paged cache → o_proj → mlp
+- decode: `layer.forward_decode()` → qkv_proj → Q/K norm（预分配 buffer 直接调 rms_norm kernel）→ rotary → KV write(index_copy_) → flash_attn_with_kvcache → o_proj
 - KV cache paged 格式：`_key_cache[num_blocks, 256, num_kv_heads, head_dim]`，block_size=256
 - **KV cache lazy alloc（⭐⭐⭐ 显存关键）**：`num_blocks` 在 prefill 时按需分配 `(num_tokens+255)//256`，**严禁**一次性 `torch.zeros(max_blocks=160, 256, kv_heads, dim)` 全量预分配。后者导致每层 160×256×2×128×2 = 20MB，36 层 ≈ 720MB 额外显存浪费。真实 trace 确认：4-token prompt 只需 1 block。每次 decode 追加 1 token 不增加 block 数（复用已分配 block）。
-- `_kv_len_gpu` 为 GPU tensor，`.item()` 仅在 `forward()`（非编译函数）外部 batch 读取
+- `_kv_len_gpu` 为 GPU tensor。**严禁 `.item()`** — kv_len 追踪全部走 CPU 算术（`runner.run()` 中 `s.kv_len += 1`）
+- **get_num_free_blocks**: 返回常量 `cfg.max_position_embeddings // 256`。短序列 <256 token 仅需 1 block，无需 GPU 同步动态计算
 - **QKV reshape**: Q 用 `num_heads=8` (per-rank)，K/V 用 `num_kv_heads_local=2` (per-rank)。勿混用。
 
 ### 2.2.1 V17 审计驱动的先验警告（实现前必读）
@@ -316,6 +304,20 @@ Rank 1-3: while True: cmd=broadcast_obj({}) → 相同 engine.generate()
 - `GET /health` → `{"status":"ok"}`
 - `POST /v1/completions`：支持 stream=true(SSE) 和 stream=false(JSON)
 
+**SSE 连接生命周期（2026-06-06 线上 hang 根因）**：
+- SSE 响应无 Content-Length，客户端依赖连接关闭判定流结束。BaseHTTPRequestHandler 默认 keep-alive。
+- **必须**：`Connection: close` header + `self.close_connection = True`（成功路径和 except/finally 路径都要设）
+- 缺少 close_connection → 连接永不关闭 → benchmark warmup 请求持有 engine_lock → 0/N 请求成功
+
+**Non-rank0 Worker 信号处理（2026-06-06 进程残留根因）**：
+- Worker 主线程阻塞在 `dist.broadcast_object_list`（C 调用），Python 信号处理延迟到 C 返回后
+- **必须**：注册 SIGTERM + SIGINT handler，handler 内调用 `os._exit(0)`（不经过 Python 解释器，直接终止进程）。注意 handler 必须接受 `(signum, frame)` 两个参数
+- 缺少 handler → torchrun kill 后子进程残留，每进程占 ~6.5GB GPU 显存
+
+**Benchmark 脚本清理要点**：
+- `pkill -9 -f "openai_tp_server.py"` 匹配 python 子进程，不要用 `pkill -f "torchrun.*openai_tp_server"`
+- 使用 `trap cleanup EXIT INT TERM` 确保一切退出路径都清理
+
 **启动方式**：
 ```bash
 TP_SIZE=4 PORT=9000 bash start_tp_infer_service.sh qwen   # 终端1
@@ -330,7 +332,7 @@ PORT=9000 NUM_PROMPTS=50 REQUEST_RATE=1 bash run_myengine_benchmark.sh qwen  # �
 
 **铁律：`scripts/` 目录下的文件是先验知识，由人类编写并 commit。开发 Agent 只读不写，绝对禁止任何修改。**
 
-scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGENT_SKILL.md 同等地位）。每个测试脚本在 git 中经过以下流程：
+scripts/ 目录是知识体系的第一层（与 00_contracts/、AGENT_SKILL.md 同等地位）。每个测试脚本在 git 中经过以下流程：
 
 ```
 人类编写 → code-review 子代理 10 条审查 → 对抗压力测试（RED+GREEN） → 人类 Diff 确认 → commit
@@ -347,7 +349,7 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
    预期：全部 FAIL（因为代码还没写）。如果某脚本 PASS：报告给人类，脚本可能失效。
 
 2. **GREEN — 写最小实现，跑通脚本**：
-   根据 `inference_blueprint.json` 和 scripts/ 中的精确断言写实现代码。
+   根据 `notebooks-cn/00_contracts/` 中的契约文件和 scripts/ 中的精确断言写实现代码。
    - 如果测试失败 → **阅读 assert 错误信息（含 FM-XXX/KERNEL-XXX/LINEAR-XXX 编号）→ 修改实现代码 → 重跑**
    - **绝对不能修改 scripts/ 下的文件来"让测试通过"**
 
@@ -391,11 +393,12 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
 
 ### 7.2 查阅踩坑知识库
 
-定位到故障算子后，强制回查 `inference_blueprint.json`：
+定位到故障算子后，强制回查 `notebooks-cn/00_contracts/`：
 
 1. `global_primitives_constraints`
 2. 对应模型族知识（Qwen Dense / DeepSeek MLA+MoE）
 3. 失败模式库（双重切片、RoPE 风格错配、YaRN 漏补丁等）
+4. **E2E 乱码自愈知识库**：`notebooks-cn/07_improvementPlan/bugfix.md` — 记录每次 E2E greedy 对齐测试检测到乱码后的完整自愈过程（症状→定位→修复→验证），是 FM 条目执行层的经验补充
 
 ### 7.3 闭环修正
 
@@ -410,7 +413,7 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
 
 ### A. Shape mismatch
 
-1. 回看 `inference_blueprint.json > framework_layer.data_flow_contracts`。
+1. 回看 `notebooks-cn/00_contracts/` 中对应组件的 shape/dtype 契约。
 2. 对照真实模型配置：`config.json` 的 `qk_nope_head_dim`、`qk_rope_head_dim`、`v_head_dim`、`num_attention_heads`、`num_hidden_layers`。
 3. 在关键节点打印：
    - prefill/decode `input_ids` shape
@@ -431,20 +434,47 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
    - 增大 `block_size`（减少块元数据开销）
 3. 不要盲目增大 batch 或 max tokens。
 
-### C. 输出异常/乱码
+### C. 输出异常/乱码（Phase 10 E2E 检测到后按以下矩阵回溯源 Phase）
 
-1. 检查 tokenizer 与 `skip_special_tokens` 使用。
-2. 检查采样参数（`temperature`、`top_p`）。
-3. 核验 prompt 编码和 decode 文本链路是否一致。
+Phase 10 的 `test_phase10_greedy_align.sh` 是首次端到端 `generate()` 验证。当输出乱码或与基线不匹配时，**严禁盲目调 tokenizer 或采样参数**——Phase 10 阶段 temperature=0.0（greedy），乱码根因几乎一定在前序 Phase 的模型计算偏差中。
+
+**第一步：确定故障范围**
+
+1. 单卡 TP=1 也乱码 → 排除 TP 通信问题 → 优先检查 Phase 5/6/7
+2. 仅 TP>1 乱码 → 优先检查 Phase 2 通信 + Phase 7 权重复载的 TP 相关路径
+3. `forward` 不报错但 `generate()` 输出乱码 → **最危险信号**：权重缺失或精度路径偏差（模型静默产生错误 logits）
+
+**第二步：按症状匹配根因（按排查优先级排列）**
+
+| # | 症状特征 | 回退源 Phase | 根因 | FM/Bug 编号 |
+|---|---------|------------|------|-----------|
+| 1 | 单卡乱码，所有组件单测（embedding/QKV/RoPE/norm）diff=0。用真实模型数据对比 HF 参考实现——Q norm diff ≈ 0.0625 或 K norm diff ≈ 1.0 | **Phase 5** | RMSNorm 计算顺序：`(self.weight.float() * x_f).to(bf16)` 应改为 `self.weight * x_f.to(bf16)`。HF 权重已针对"先 cast 后乘"的精度路径训练 | FM-016 |
+| 2 | 单卡乱码（根因 1 修复后仍乱码），top-1 token 为 `!` 且 logit=0.0，所有组件单测 PASS | **Phase 6** | forward_prefill/decode 在 36 层循环后缺失 `hs = hs + res`。vLLM-style DecoderLayer 返回 (mlp_out, res) 分离二元组，res 须手动合并再做最终 norm | FM-017 |
+| 3 | 单卡乱码，forward 不报错，模型正常加载。所有组件单测 PASS（因测试用随机权重而非真实权重） | **Phase 7** | `_dispatch_weight` 遗漏 Qwen3 特有的 `self_attn.q_norm.weight` 和 `self_attn.k_norm.weight`。q_norm/k_norm 保持 torch.ones 初始值，Q/K 被错误 norm 权重污染 → logits 全错但不 crash | Bug 6 (Phase 9) |
+| 4 | TP=4 权重复载时报 `RuntimeError: shape mismatch loaded=[4096, 0], model=[4096, 1024]` | **Phase 7** | `_row_slice` 的 size 参数未除以 `tp_size`。RowParallel o_proj 在 dim=1 分片，`_row_slice(weight, hidden_size // tp_size)` 而非 `hidden_size` | FM-018 |
+| 5 | TP=4 forward 时 `CUBLAS_STATUS_EXECUTION_FAILED`，崩溃位置在多次运行间**不稳定**（第一次 down_proj，第二次 gate_up_proj） | **Phase 2** | CustomAR `rank_data` 尺寸不足（8MB→应为 16MB）+ CustomARHandle 未持有 `rank_data` 引用（Python GC 释放 → 内核裸指针悬空）。**崩溃位置不稳定是关键诊断信号**——形状/dtype 问题的崩溃位置固定 | FM-019 |
+| 6 | 短句重复、局部复读、退化输出（非完全乱码，有一定语义但质量极差） | **Phase 5** | RoPE 风格错配：Qwen3 必须 is_neox=True（前后分半 rotate_half），DeepSeek 用 is_neox=False（GPT-J 奇偶交错） | FM-007 |
+
+**第三步：定位到源 Phase 后的修复流程**
+
+1. 回到对应源 Phase 的代码，按 FM 条目的 `fix` 描述修复
+2. 重新通过该 Phase 的全部 `minimal_test_commands`
+3. 回到 Phase 10 再跑 `test_phase10_greedy_align.sh` — 输出必须与 baseline 字字对齐
+4. 若仍有乱码：回到第一步重新匹配下一个根因（可能同时存在多个根因）
+
+**排除性检查（以下原因在 Phase 10 greedy 场景几乎不可能是根因，但仍需确认）：**
+
+- tokenizer 与 `skip_special_tokens` 使用 — 如果每个 token id 都可以手动 decode 验证
+- 采样参数 `temperature`/`top_p` — `temperature=0.0` greedy 下采样引入偏差的概率极低
+- prompt 编码 — 对比 tokenizer(prompt) 输出与 baseline 的 token ids
 
 ### D. 卡住或多次无法修复
 
 1. 重新阅读：
-   - `notebooks/MEMORY.md`
-   - `notebooks/00_overview/README.md`
-   - `inference_blueprint.json` 中目标组件的 `ref_docs` / `ref_code`
+   - `notebooks-cn/00_overview/README.md`
+   - `notebooks-cn/00_contracts/` 中目标组件的关联 notebooks
 2. 缩小问题规模到单组件最小可复现测试。
-3. 查阅 `inference_blueprint.json > model_layer.failure_mode_library` 的 symptom→check→fix 词条。
+3. 查阅 `notebooks-cn/00_contracts/model_specs.md` 的 Failure Mode Library symptom→check→fix 词条。
 
 ### E. CUDA Graph 崩溃与显存指针漂移
 
@@ -474,6 +504,31 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
 11. **Prefill K/V 来源**：flash_attn_varlen_func 的 K/V 来自当前投影产出，非从 KV cache 读取。顺序：投影 → attention → 写入 cache。
 12. **多序列 prefill**：slot_mapping 需跨序列拼接 block_table。见 `paged_kv_cache_contract.prefill_kv_write.slot_mapping_algorithm.multi_seq`。
 
+**Phase 10 E2E 输出乱码专属回溯流程：**
+
+当 `test_phase10_greedy_align.sh` 的 greedy 对齐测试失败（输出乱码/不匹配 baseline），按以下优先级回溯源 Phase：
+
+```
+Phase 10 E2E 乱码
+  ├─ 单卡 TP=1 也乱码？
+  │   ├─ 所有组件单测 PASS 但 Q/K norm 与 HF 参考值有偏差？
+  │   │   └─ → Phase 5: RMSNorm 计算顺序 (FM-016)
+  │   ├─ 组件单测 PASS，top-1 token 异常（如 '!' 且 logit=0）？
+  │   │   └─ → Phase 6: forward 缺失 hs = hs + res (FM-017)
+  │   └─ forward 不报错，模型正常加载？
+  │       └─ → Phase 7: q_norm/k_norm dispatch 遗漏 (Bug 6)
+  ├─ 仅 TP>1 乱码？
+  │   ├─ 权重复载时 shape mismatch [4096,0] vs [4096,1024]？
+  │   │   └─ → Phase 7: _row_slice 未除 tp_size (FM-018)
+  │   └─ forward 时 CUBLAS crash，位置不稳定？
+  │       └─ → Phase 2: CustomAR rank_data 尺寸/GC (FM-019)
+  └─ 短句重复/局部复读（非完全乱码）？
+      └─ → Phase 5: RoPE Neox vs GPT-J 错配 (FM-007)
+```
+
+定位到源 Phase 后，查阅 `notebooks-cn/00_contracts/model_specs.md` 对应 FM 条目的 symptom→check→fix，修复后重新通过该 Phase 测试，再回到 Phase 10 验证。
+12. **多序列 prefill**：slot_mapping 需跨序列拼接 block_table。见 `paged_kv_cache_contract.prefill_kv_write.slot_mapping_algorithm.multi_seq`。
+
 ### H. 纯 Eager 专有反模式（nocompile 禁止项检查）
 
 1. **条件 clone 缺失**：eager 路径 `forward_decode` 不应含 `clone()`（clone 仅用于 CUDA Graph 路径的 `forward_decode_graph`）。检查 `aten::copy_` 占比 > 5% → 有冗余 clone。
@@ -483,16 +538,79 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
 5. **残余 compile 痕迹**：代码中残存 `torch.compile`、`mode='reduce-overhead'`、`fullgraph=True` → profiler 中出现 `CompiledFunction`、`Inductor` kernel → 应立即删除并替换为纯 eager 路径。
 6. **fake inference**：严禁 `print("假输出")` 冒充真实 TF 推理。验收必须附带 profiler trace 文件 + HCU 监控证据。
 
-### I. 性能优化规则（Phase 11 — 见 blueprint performance_optimization）
+### I. 性能强制模式（Phase 11 — 审计门禁 + 补充优化）
 
-以下 6 条规则从真实 meta-infer engine 反推，用于将吞吐从 ~10 tok/s 提升至 ≥54 tok/s：
+以下规则经过 ROUND_1 实测验证（详见 `notebooks-cn/07_improvementPlan/ROUND_1_BOTTLENECK_FIXES.md`）。
+分两层：**O1-O6 为审计门禁**——Phase 11 必须逐条静态检查，命中则回对应 Phase 修复；
+**O7-O9 为补充优化**——正确但非致命，可选实施。
 
-1. **P1 预分配 buffer**：`torch.empty_like(x)` 替代 `torch.empty(...)`。每步 cudaMalloc ~200ms → 一次性分配 <1ms。
-2. **P2 懒 contiguous**：仅在 kernel 输入前调 `.contiguous()`。不在中间 view/reshape 后调。
-3. **P3 view 非 reshape**：`view()` 零拷贝，`reshape()` 可能触发隐式 `.contiguous()` → GPU mem copy。
-4. **P4 消除中间 tensor**：one-pass 计算，不分配中间临时 tensor。减少 Python GC + per-step alloc 开销。
-5. **P5 减少 .item()**：仅在 `QwenForCausalLMTP.forward()` 外层 36 层循环后批量读取一次 `.item()`，不在每层 `forward_decode` 内读。当前最大瓶颈。
-6. **P6 register_buffer**：不变 tensor（kv_len_gpu, slot_mapping_decode, cos_sin_cache）用 `register_buffer(persistent=False)` 注册，避免每步重新分配。
+**Phase 11 强制审计闭环（不可跳过）：**
+
+1. **STEP-AUDIT**: 逐条执行下方 O1-O6 的审计检查命令，记录 PASS/FAIL。O7-O9 仅记录不阻塞。
+2. **STEP-FIX**: 每条 FAIL 项目定位到对应 Phase 构建的源码文件，修改代码使审计通过。
+3. **STEP-REAUDIT**: 修复后重新跑全部审计检查，直到 O1-O6 全部 PASS。
+4. **STEP-BENCHMARK**: 全部审计通过后跑 `test_phase11_throughput.py` 验证吞吐达标。
+5. **STEP-DONE**: O1-O6 全部 PASS + 吞吐达标 → Phase 11 完成。
+
+**O1 @torch.inference_mode()（CRITICAL — 通常占总提升的最大份额）**
+
+QwenForCausalLMTP.forward() 和 forward_decode() **必须**带 `@torch.inference_mode()` 装饰器。
+禁用 autograd version counter 递增和元数据追踪，消除 GeneratedBackwardFor 膨胀 + cudaLaunchKernel CPU 开销。
+
+审计检查：`grep -r '@torch.inference_mode' engine/models/qwen.py` 应有 2 个匹配。
+
+**O2 零 .item() GPU 同步（CRITICAL）**
+
+- `get_num_free_blocks()` 返回常量 `cfg.max_position_embeddings // 256`（短序列场景 <256 token 仅需 1 block）
+- `runner.run()` decode 分支用 `s.kv_len += 1`（CPU 算术，forward_decode 内部已自增 _kv_len_gpu）
+- prefill slot_mapping 用 `torch.arange` 向量化（禁止 for 循环 + .item()）
+
+审计检查：`grep '\.item()' llm_engine.py engine/models/qwen.py` 应为零匹配（仅注释中允许）。QwenForCausalLMTP.forward() decode 分支已改用 `past_key_values[0] + 1` CPU 算术。
+
+**O3 预分配 buffer（CRITICAL）**
+
+decode 路径（B=1,S=1）使用 `register_buffer(persistent=False)` 预分配的 buffer，直接调底层 kernel：
+- `_q_norm_out[1, heads, dim]`, `_k_norm_out[1, kv_heads, dim]` — attention Q/K norm 复用
+- `_silu_out[1, 1, local_inter]` — MLP silu_and_mul 输出复用
+
+绕过 `nn.Module.forward()` 中的 `torch.empty_like()`（内部触发 `cudaDeviceGetAttribute`）。
+
+通用路径（B>1 或 S>1）禁止 `torch.empty_like()`：`torch.empty_like(gate_up[..., :half_ch])` → `torch.empty(x.shape[0], x.shape[1], half_ch, dtype=x.dtype, device=x.device)`。`empty_like` 含隐式 CUDA runtime 查询，改为显式参数消除。
+
+审计检查：`grep '_q_norm_out\|_k_norm_out\|_silu_out' engine/models/qwen.py` 应有匹配；`grep 'empty_like' engine/models/qwen.py` 应为零匹配。
+
+**O4 block_table arange 初始化（HIGH）**
+
+KV cache 首次分配时一次性 `torch.arange(max_blocks).unsqueeze(0)`，非 `torch.zeros + 每步填充`。
+arange 创建恒等映射（逻辑页→物理页），全零是错误的（所有页映射到 block 0）。
+
+审计检查：`grep '_block_table.*arange' engine/models/qwen.py`。
+
+**O5 prefill KV 直接赋值（HIGH）**
+
+prefill KV 写入使用直接索引赋值 `kc_flat[slot_mapping] = k_flat`，非 `index_copy_`。
+prefill 不在 CUDA graph 内，直接赋值比 index_copy_ 快。
+
+审计检查：`grep 'index_copy_' engine/models/qwen.py` 应仅在 decode 路径出现。
+
+**O6 register_buffer 完整声明（HIGH）**
+
+所有不变 tensor 用 `register_buffer(persistent=False, dtype=...)` 注册：
+`_kv_len_gpu`, `_slot_mapping_decode`, `_q_norm_out`, `_k_norm_out`, `_silu_out`, cos_sin cache。
+
+审计检查：`grep 'register_buffer' engine/models/qwen.py | wc -l` 应 ≥ 6。
+
+**O7 懒 contiguous（LOW — 正确补充）**
+
+仅在内核输入前调用 `.contiguous()`，不在中间 view/reshape 后调。
+
+**O8 view 非 reshape（LOW — 正确补充）**
+
+`view()` 零拷贝，`reshape()` 可能触发隐式 `.contiguous()`。仅当 tensor 确实 discontiguous 时才用 `reshape()`。
+
+**O9 消除中间 tensor（LOW — O3 是其具体体现）**
+
+one-pass 计算，不分配中间临时 tensor。预分配 buffer（O3）是实现此原则的关键手段。
 
 ---
 
@@ -506,15 +624,15 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
 4. `test_xxx_tp_real.py` 在 torchrun 下输出稳定、可读文本。
 5. 提供变更摘要：文件、规则映射、测试命令、风险与后续建议。
 
-### 8.1 纯 Eager 性能基线（Qwen3-8B, TP=4, nocompile, B=1）
+### 8.1 纯 Eager 性能基线（参考值，具体硬件决定实际指标）
 
-| 指标 | 目标值 | 验证方式 |
-|------|--------|---------|
-| Output Throughput | ≥ 54 tok/s | `run_compare_metainfer_vllm.sh qwen` |
-| GPU Self CUDA | ≤ 66ms / step | torch.profiler 单步 GPU kernel 总时间 |
-| CustomAR 通信 | ≤ 25ms / step | profiler `cross_device_reduce_1stage` |
-| CPU dispatch / layer | < 15ms (36 layer total ≤ 540ms) | torch.profiler CPU time |
-| VRAM% per rank | ~7% (同量级一致) | nvidia-smi 或 HCU 监控 |
+| 指标 | 参考目标 | 验证方式 |
+|------|---------|---------|
+| Output Throughput | 对齐 baseline（参考 scripts/ 中 benchmark 脚本） | `run_compare_metainfer_vllm.sh qwen` |
+| GPU Self CUDA | ≤ baseline（torch.profiler 单步 GPU kernel 总时间） | torch.profiler |
+| CustomAR 通信 | ≤ baseline（profiler `cross_device_reduce_1stage`） | torch.profiler |
+| CPU dispatch / layer | < baseline（torch.profiler CPU time） | torch.profiler |
+| VRAM% per rank | 各 rank 同量级一致 | nvidia-smi 或 HCU 监控 |
 | HCU% | > 0（真实计算证据） | HCU 监控 |
 
 ### 8.2 纯 Eager 专有断言
@@ -524,7 +642,7 @@ scripts/ 目录是知识体系的第一层（与 inference_blueprint.json、AGEN
 - `forward_decode` 不含 `.item()`（禁止编译区内 CPU sync）
 - `forward_decode` 不含 `clone()`（eager 路径零 clone 开销）
 - `forward()` 中所有 `.item()` 调用在模型层循环完成后（batch 读取）
-- 所有 RMSNorm/RoPE/Silu 使用 vLLM 标品 kernel，**禁止手写 PyTorch 逐元素实现**
+- 所有 RMSNorm/RoPE/Silu 使用 vLLM 标品 CUDA kernel（`engine/kernels/vllm_wrappers.py`，底层 `vllm._custom_ops`），**禁止手写 PyTorch 逐元素实现**。**🚫 严禁 import vLLM Python 层类**（`vllm.model_executor.*`, `vllm.config.*`）——区分原则见 §2.1 第 6 条。
 
 ### 8.3 贪婪解码正确性
 

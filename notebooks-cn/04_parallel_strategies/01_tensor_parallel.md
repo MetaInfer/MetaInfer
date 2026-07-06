@@ -268,4 +268,4 @@ inputs = deserialize(shared_mem.buf)
 
 ---
 
-*译文对应英文原文：`notebooks/04_parallel_strategies/01_tensor_parallel.md`。*
+*译文对应英文原文：`notebooks-cn/04_parallel_strategies/01_tensor_parallel.md`。*

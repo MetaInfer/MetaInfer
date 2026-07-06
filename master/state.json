@@ -1,0 +1,9 @@
+{
+  "baseline_iter_id": null,
+  "iteration_count": 0,
+  "baseline_kpi": null,
+  "history": [],
+  "failed_directions": [],
+  "consecutive_rollbacks": 0,
+  "diagnosis_notes": "全新开始。第一轮迭代将建立基线（全量构建）。后续轮次采用增量修改模式。"
+}

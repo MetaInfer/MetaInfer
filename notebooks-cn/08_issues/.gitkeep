@@ -1,0 +1,6 @@
+# 08_issues — 运行时创建
+
+本目录由 issue-analyzer 角色在进化或调优失败时写入结构化 Issue 报告。
+文件命名格式: `issue_<TIMESTAMP>_<CATEGORY>.md`
+
+空目录占位。实际 Issue 文件由 Agent 运行时产生，不在知识包中预置。

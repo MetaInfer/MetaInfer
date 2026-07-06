@@ -38,38 +38,25 @@
 
 - **张量并行（Tensor Parallelism）** — 列/行切分、all-reduce 模式、权重分片
 
-### 非核心特性（`05_non_core_features/`）
+### 推理服务（`05_inference_service/`）
 
-生产级框架中常见、但可按部署需求**独立增删**的能力，分为两类：
+生产级推理服务的部署与运维相关文档。
 
-**可剥离的复杂度**（极简框架可完全省略）：
+### 调试经验（`06_experience/`）
 
-- **多模型支持** — 模型注册表、动态派发
-- **多种量化方式** — AWQ、GPTQ、FP8 等
-- **平台抽象** — 多硬件（CUDA、ROCm、XPU、TPU）
+TP/EP 推理框架调试过程中的实战经验总结。
 
-**生产可选特性**（真实部署中很重要，各文档含集成指引）：
+### 优化方案（`07_improvementPlan/`）
 
-- **PD 分离** — Prefill 与 Decode 分离，便于独立扩缩容
-- **KVCache Connector** — 跨节点 KV 缓存传输接口（NCCL、RDMA、Mooncake、NIXL）
-- **后处理** — 增量 detokenization、停止串检测、流式输出、结果格式化
-- **投机解码** — EAGLE、草稿模型、MTP/NextN 以降低延迟
-- **约束解码** — JSON Schema、正则、语法约束生成（XGrammar、Outlines）
-
-### 实现模式（`06_implementation_patterns/`）
-
-各项目中的代码级模式与反模式。
-
-- **代码模式** — 经实践验证、效果良好的实现方式
-- **反模式** — 生成代码时应避免的复杂度陷阱
+性能优化方案、Bug 修复记录、Kernel 替换计划等。
 
 ## 如何使用本知识库
 
 1. **生成推理框架**：从 `01_framework_design/` 入手，理解核心架构；生成的框架都应包含这些组件。
 2. **编写模型相关代码**：针对目标模型架构查阅 `02_model_specifics/`。
 3. **追求性能**：参考 `03_operators/` 与 `04_parallel_strategies/` 做 GPU 侧优化实现。
-4. **增加特性**：查看 `05_non_core_features/`。每个「生产可选特性」文档会说明在何处加钩子、改哪些组件、以及配置项；可按用户需求接入到已生成的框架中。
-5. **保证代码质量**：遵循 `06_implementation_patterns/`，生成清晰、可维护的代码。
+4. **部署推理服务**：查看 `05_inference_service/` 了解推理服务化部署方案。
+5. **排障与优化**：参考 `06_experience/` 和 `07_improvementPlan/` 获取调试经验和优化方案。
 
 ## 源码参考项目
 
