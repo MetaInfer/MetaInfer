@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Why: 新生成框架 vs vLLM TP=4 Qwen3 三方对比基准（no-CUDA-Graph / CUDA-Graph）。
-#   Trace: meta-infer nocompile 55.7 tok/s, vLLM CUDA Graph 166.8 tok/s, vLLM no-graph ~52 tok/s
+#   Trace: meta-infer nocompile / vLLM CUDA Graph / vLLM no-graph 三种模式性能对比。
 #   参考: ref_projects/vllm/examples/offline_inference/simple_profiling.py
-# What failure: 新框架吞吐 < 54 tok/s / vLLM 未正常启动 → exit 1 "VS-VLLM-00X"
+# What failure: 新框架运行异常 / vLLM 未正常启动 → exit 1 "VS-VLLM-00X"
 # Superpowers gate: CLAUDE.md rule 5 (executable skill)
-# Trace Source: CLAUDE.md §4 (55.7 tok/s), physical_trace_tp4_rank0.json baseline
+# Trace Source: physical_trace_tp4_rank0.json 性能基线
 # Human review: [待人类Diff]
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
-TRACE_SRC="Source: CLAUDE.md §4 + physical_trace_tp4_rank0.json"
+TRACE_SRC="Source: physical_trace_tp4_rank0.json + vLLM reference profiling"
 
 TP_SIZE="${TP_SIZE:-4}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
@@ -22,15 +22,12 @@ VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.15}"
 echo "=== Phase 10: vs vLLM Comparison ==="
 echo "TP_SIZE=${TP_SIZE} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
-# Contract: Target throughputs (from CLAUDE.md §4 physical baselines)
-META_INFER_TARGET=54    # nocompile ≥ 54 tok/s
-VLLM_NOGRAPH_REF=52     # vLLM CUDA Graph disabled ~52 tok/s
-VLLM_GRAPH_REF=166      # vLLM CUDA Graph enabled ~166.8 tok/s
-
-echo "[VS-VLLM-001] Target baselines:"
-echo "  Meta-infer (nocompile): ≥ ${META_INFER_TARGET} tok/s (${TRACE_SRC})"
-echo "  vLLM (no CUDA Graph):   ~ ${VLLM_NOGRAPH_REF} tok/s (reference)"
-echo "  vLLM (CUDA Graph):      ~ ${VLLM_GRAPH_REF} tok/s (ceiling)"
+# Contract: Target baselines — 具体数值因硬件而异，此处只验证对比流程可运行。
+# 性能阈值以 physical trace 基线为准，不在通用知识包中硬编码。
+echo "[VS-VLLM-001] Target baselines (${TRACE_SRC}):"
+echo "  Meta-infer (nocompile): 对齐 physical trace 基线"
+echo "  vLLM (no CUDA Graph):   vLLM reference profiling"
+echo "  vLLM (CUDA Graph):      vLLM reference profiling"
 
 # Check if benchmark tools are available
 BENCH_SCRIPT="${ROOT_DIR}/ref_projects/vllm/benchmarks/benchmark_serving_structured_output.py"

@@ -244,4 +244,4 @@ class HybridBackend(BaseAttnBackend):
 
 ---
 
-*译文对应英文原文：`notebooks/03_operators/01_attention_ops.md`。*
+*译文对应英文原文：`notebooks-cn/03_operators/01_attention_ops.md`。*

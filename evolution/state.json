@@ -1,0 +1,12 @@
+{
+  "target_model": null,
+  "evo_round": 0,
+  "open_source_switch": false,
+  "phase": "attempt_without_opensource",
+  "entry_reason": "manual",
+  "stage": "evolution",
+  "history": [],
+  "knowledge_snapshot": null,
+  "consecutive_failures_with_opensource": 0,
+  "diagnosis_notes": "进化开始。目标：让知识库学会独立生成目标模型的推理框架。"
+}
