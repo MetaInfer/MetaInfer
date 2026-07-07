@@ -13,7 +13,7 @@
 
 - **流程图即真理**：`PROJECT_FLOW_MERMAID.md` 的每一个决策节点、每一条边，就是你唯一的执行路径
 - **你不写代码、不跑测试**：所有领域能力下放给 7 个子 agent 角色（`.claude/roles/`）
-- **子 agent 进程隔离**：每次通过 `claude -p` 独立进程启动，无父进程记忆
+- **子 agent 进程隔离**：每次通过 CLI（`${CLAUDE_CLI} -p`，自动检测 ccb/claude-code-best/claude）独立进程启动，无父进程记忆
 - **编排器也是子 agent**：`master/MASTER.md` 和 `evolution/EVOLUTION.md` 是被你 spawn 的子流程图，它们内部再 spawn 更细粒度的子 agent
 
 任何情况下，如果下一步该做什么不明确 → 回到 PROJECT_FLOW_MERMAID.md 找当前节点。
@@ -175,6 +175,18 @@ inference-agent-system/         ← 本包（工程根目录）
    export MODEL_DIR="__MODEL_DIR__"
    export PATH="${PYTHON_PATH}:$PATH"
    export PYTHONPATH="${AGENT_INFER_ROOT}:$PYTHONPATH"
+
+   # --- CLI 自动检测（优先级: ccb > claude-code-best > claude） ---
+   if command -v ccb &>/dev/null; then
+       export CLAUDE_CLI="ccb"
+   elif command -v claude-code-best &>/dev/null; then
+       export CLAUDE_CLI="claude-code-best"
+   elif command -v claude &>/dev/null; then
+       export CLAUDE_CLI="claude"
+   else
+       echo "[WARN] 未找到 ccb / claude-code-best / claude CLI，子进程隔离不可用" >&2
+       export CLAUDE_CLI=""
+   fi
    ENVEOF
    sed -i "s|__PYTHON_PATH__|${PYTHON_PATH}|g" .env_agent_infer
    sed -i "s|__MODEL_DIR__|${MODEL_DIR}|g" .env_agent_infer
@@ -220,7 +232,7 @@ inference-agent-system/         ← 本包（工程根目录）
 
    未覆盖时，**不尝试构建，直接启动进化编排器**：
    ```bash
-   source .env_agent_infer && claude -p "
+   source .env_agent_infer && ${CLAUDE_CLI} -p "
    ⛔ 模型未覆盖，启动知识进化路径。
 
    读取 evolution/EVOLUTION.md 了解你的角色边界。
@@ -229,7 +241,7 @@ inference-agent-system/         ← 本包（工程根目录）
    已知信息:
    - 知识库覆盖 Qwen3-8B Dense，但不对目标模型
    - evolution/state.json 已配置 target_model
-   - knowledge/vllm (v0.19.1) 和 knowledge/sglang 有 Qwen3 系列实现可参考
+   - knowledge/vllm（缓存的开源参考代码）和 knowledge/sglang 有 Qwen3 系列实现可参考
 
    由于覆盖检测已明确判定 KB 不足，跳过无开源尝试阶段。
    从 attempt_with_opensource 阶段开始（SWITCH=ON, explorer_mode=full）。
@@ -239,7 +251,9 @@ inference-agent-system/         ← 本包（工程根目录）
    ```
    进化成功后，存活的 engine/ 代码作为基线，回到本流程 Step 7（平台检测）继续。
 
-7. **平台自动检测**（替代 ref_projects 的平台硬编码）：
+7. **平台自动检测 + 环境能力探测**（替代 ref_projects 的平台硬编码）：
+
+   **Step 7a — GPU 型号检测**：
    ```bash
    "${PYTHON_PATH}/python" -c "
    import torch
@@ -247,10 +261,57 @@ inference-agent-system/         ← 本包（工程根目录）
    print(f'Capability: {torch.cuda.get_device_capability(0)}')
    "
    ```
-   根据检测结果路由：
-   - NVIDIA: CustomAR 使用 IPC handle + NCCL all_reduce
-   - AMD (ROCm): CustomAR 不可用，fallback RCCL all_reduce
-   - DCU (Iluvatar): CustomAR 不可用，使用 torch.cuda.comm 或 fallback
+
+   **Step 7b — 关键 kernel 能力探测（CRITICAL，必须在任何构建前完成）**：
+   ```bash
+   "${PYTHON_PATH}/python" -c "
+   import torch
+
+   # 1. vLLM C++ 扩展可用性
+   try:
+       import vllm._custom_ops
+       print('vllm._custom_ops: AVAILABLE')
+   except Exception as e:
+       print(f'vllm._custom_ops: UNAVAILABLE ({e})')
+
+   # 2. flash_attn 可用性
+   try:
+       import flash_attn
+       print('flash_attn: AVAILABLE')
+   except Exception as e:
+       print(f'flash_attn: UNAVAILABLE ({e})')
+
+   # 3. F.scaled_dot_product_attention 安全性（部分 GPU 上会 segfault）
+   try:
+       q = k = v = torch.randn(1, 1, 64, 64, device='cuda', dtype=torch.float16)
+       out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+       print('F.scaled_dot_product_attention: SAFE')
+   except Exception as e:
+       print(f'F.scaled_dot_product_attention: UNSAFE ({e})')
+   "
+   ```
+
+   **Step 7c — 将探测结果持久化**（供所有后续 Phase 的 implementer 读取）：
+   ```bash
+   cat > ./phase_report/ENV_CAPABILITY.md << 'CAPEOF'
+   # Environment Capability Report
+   - Timestamp: $(date -Iseconds)
+   - GPU: <from 7a>
+   - vllm._custom_ops: <from 7b>
+   - flash_attn: <from 7b>
+   - F.scaled_dot_product_attention: <from 7b>
+   CAPEOF
+   ```
+
+   **Step 7d — 根据探测结果路由**：
+   ```
+   NVIDIA + vllm._custom_ops AVAILABLE → vLLM C++ kernel 路径，CustomAR 可用
+   NVIDIA + vllm._custom_ops UNAVAILABLE → 纯 PyTorch fallback（标记 PLATFORM_FALLBACK），CustomAR 不可用
+   AMD (ROCm) → RCCL fallback，CustomAR 不可用
+   DCU → HIP 适配 kernel，vLLM C++ 扩展不可直接使用
+   Any + flash_attn UNAVAILABLE → 手动 attention 实现（matmul+softmax）
+   Any + F.scaled_dot_product_attention UNSAFE → 禁用该 API，使用手动 matmul+softmax
+   ```
 8. **MEMORY 回溯**：检查 `./phase_report/` 下是否存在前序 Phase 的 `PHASE<N>_MEMORY.md` 文件。若存在 → 读取最近完成的 Phase MEMORY，快速重建上下文（已完成的 Phase、通过的脚本、关键文件改动）。这对长对话恢复至关重要。
 
 ## 分布式生命周期强制检查
@@ -270,8 +331,8 @@ inference-agent-system/         ← 本包（工程根目录）
 主 Agent（CLAUDE.md）= 纯流程引擎
   ✅ 读流程图 → 检查条件 → 路由 → spawn 子 agent → 收集子 agent 结果 → 下一步
   ❌ 不写代码 → 由 implementer 子 agent 通过 Agent 工具 spawn 执行
-  ❌ 不读代码做审查 → 由 spec-reviewer 子 agent 通过 Shell claude -p 独立进程执行
-  ❌ 不跑测试 → 由 verification 子 agent 通过 Shell claude -p 独立进程执行
+  ❌ 不读代码做审查 → 由 spec-reviewer 子 agent 通过 Shell ${CLAUDE_CLI} -p 独立进程执行
+  ❌ 不跑测试 → 由 verification 子 agent 通过 Shell ${CLAUDE_CLI} -p 独立进程执行
   ❌ 不修改、降级、或"解释"子 agent 的审查结论
 ```
 
@@ -280,22 +341,22 @@ inference-agent-system/         ← 本包（工程根目录）
 | 角色 | 挂载方式 | 隔离程度 | 为什么必须这样挂载 |
 |------|---------|---------|------------------|
 | **implementer** | **Agent 工具** (`subagent_type: general-purpose`) | 独立上下文（clean context，共享 harness 配置） | 需要完整工具链（读契约、读 notebooks、写代码文件）。主 Agent 自己不写代码 |
-| **spec-reviewer** | **Shell `claude -p`** | **独立进程（fork + 新 PID + 全新上下文加载，无任何父进程记忆）** | 物理隔离——审查者无法知道 implementer 读了哪些文件、用了什么模型、思考过程如何。它只能读代码文件和契约 |
-| **verification** | **Shell `claude -p`** | **独立进程（fork + 新 PID + 全新上下文加载，无任何父进程记忆）** | 物理隔离——只跑命令看结果，不能看 implementer 或 spec-reviewer 的输出。杜绝"测试都过了就放行"的降级冲动 |
+| **spec-reviewer** | **Shell `${CLAUDE_CLI} -p`** | **独立进程（fork + 新 PID + 全新上下文加载，无任何父进程记忆）** | 物理隔离——审查者无法知道 implementer 读了哪些文件、用了什么模型、思考过程如何。它只能读代码文件和契约 |
+| **verification** | **Shell `${CLAUDE_CLI} -p`** | **独立进程（fork + 新 PID + 全新上下文加载，无任何父进程记忆）** | 物理隔离——只跑命令看结果，不能看 implementer 或 spec-reviewer 的输出。杜绝"测试都过了就放行"的降级冲动 |
 
 ### 硬约束规则
 
 ```
 ⛔ 规则 1: 三角色必须由三个独立子 agent/进程分别执行，主 Agent 不扮演其中任何角色
 ⛔ 规则 2: implementer = Agent 工具 spawn，主 Agent 自己一行代码都不写
-⛔ 规则 3: spec-reviewer = Shell claude -p 独立进程，主 Agent 自己不读代码做审查
-⛔ 规则 4: verification = Shell claude -p 独立进程，主 Agent 自己不跑测试做验收
+⛔ 规则 3: spec-reviewer = Shell ${CLAUDE_CLI} -p 独立进程，主 Agent 自己不读代码做审查
+⛔ 规则 4: verification = Shell ${CLAUDE_CLI} -p 独立进程，主 Agent 自己不跑测试做验收
 ⛔ 规则 5: evolution/EVOLUTION.md 编排器 spawn 的所有角色（Explorer、Implementer、
            Verification、Knowledge Consolidator、Issue Analyzer）也必须通过
-           Shell claude -p 独立进程执行
+           Shell ${CLAUDE_CLI} -p 独立进程执行
 ⛔ 规则 6: PID 交叉验证强制 —— 每 spawn 一个子 agent 必须记录 PID，
            汇总时确认 PID(impl) ≠ PID(spec) ≠ PID(verif) ≠ PID(main)
-⛔ 规则 7: 环境不支持 Shell claude -p 时 → 主 Agent 报告人类并暂停，
+⛔ 规则 7: 环境不支持 Shell ${CLAUDE_CLI} -p 时 → 主 Agent 报告人类并暂停，
            严禁以降级方式（主 Agent 直接执行）绕过
 ```
 
@@ -307,7 +368,7 @@ Agent 工具 spawn:
   子 Agent 拥有: 独立上下文（clean context），共享 harness 配置
   适用: implementer（需要完整工具链来读文件和写代码）
 
-Shell claude -p 独立进程:
+Shell ${CLAUDE_CLI} -p 独立进程:
   主 Agent ──fork──→ 独立 OS 进程（新 PID）
   子进程拥有: 全新上下文加载，零父进程记忆，零对话历史
   适用: spec-reviewer、verification、所有编排器子 agent
@@ -319,12 +380,12 @@ Shell claude -p 独立进程:
 | 禁区 | 为什么是禁区 | 正确做法 |
 |------|------------|---------|
 | **自己写代码** | 流程引擎不是实现者，写的代码没有经过独立审查 | 用 Agent 工具 spawn implementer |
-| **自己读代码做审查** | 已经看过契约，有 confirmation bias | 用 Shell `claude -p` spawn spec-reviewer |
-| **自己跑 scripts/ 测试** | 没有 L0-L3 完整验收流程 | 用 Shell `claude -p` spawn verification |
+| **自己读代码做审查** | 已经看过契约，有 confirmation bias | 用 Shell `${CLAUDE_CLI} -p` spawn spec-reviewer |
+| **自己跑 scripts/ 测试** | 没有 L0-L3 完整验收流程 | 用 Shell `${CLAUDE_CLI} -p` spawn verification |
 | **将 spec-reviewer 的 ❌FAIL 降级** | 主 Agent 不是裁判，没资格判断 FAIL 是否可忽略 | 原样传递 FAIL 报告给 implementer |
 | **跳过 spec-reviewer 直接 verification** | spec 不过就没有跑测试的意义 | 严格串行：spec ✅ → verify |
-| **用 Agent 工具 spawn spec-reviewer 或 verification** | Agent 工具共享 harness，不是真正独立 | 必须 Shell `claude -p` |
-| **用 Shell claude -p spawn implementer** | implementer 需要写文件能力 | 必须 Agent 工具 |
+| **用 Agent 工具 spawn spec-reviewer 或 verification** | Agent 工具共享 harness，不是真正独立 | 必须 Shell `${CLAUDE_CLI} -p` |
+| **用 Shell ${CLAUDE_CLI} -p spawn implementer** | implementer 需要写文件能力 | 必须 Agent 工具 |
 
 ## 对抗子代理协作流（3 角色）
 
@@ -424,8 +485,8 @@ Shell claude -p 独立进程:
 | 角色 | Prompt 文件 | 挂载方式 | 母 Agent | 职责 | 跑测试？ | 宣判 PASS？ |
 |------|-----------|---------|---------|------|---------|-----------|
 | implementer | `.claude/roles/implementer-inference.md` | **Agent 工具** (`general-purpose`) | 主 Agent (CLAUDE.md) | 读契约+AGENT_SKILL → 写代码 → 自读diff → 提交 | ❌ | ❌ |
-| spec-reviewer | `.claude/roles/spec-reviewer-inference.md` | **Shell `claude -p`**（独立进程） | 主 Agent (CLAUDE.md) | 不信任实现者 → 独立逐行读代码 → 对照契约文件每条核验 | ❌ | ❌ |
-| verification | `.claude/roles/verification-inference.md` | **Shell `claude -p`**（独立进程） | 主 Agent (CLAUDE.md) | **唯一测试执行者**：L0 防假PASS + L0.5 self_check + L0.6 agent自检 + L1 scripts/ + L2 跨Phase回归 + L3 profiler/HCU | ✅ | ✅ |
+| spec-reviewer | `.claude/roles/spec-reviewer-inference.md` | **Shell `${CLAUDE_CLI} -p`**（独立进程） | 主 Agent (CLAUDE.md) | 不信任实现者 → 独立逐行读代码 → 对照契约文件每条核验 | ❌ | ❌ |
+| verification | `.claude/roles/verification-inference.md` | **Shell `${CLAUDE_CLI} -p`**（独立进程） | 主 Agent (CLAUDE.md) | **唯一测试执行者**：L0 防假PASS + L0.5 self_check + L0.6 agent自检 + L1 scripts/ + L2 跨Phase回归 + L3 profiler/HCU | ✅ | ✅ |
 
 ### ⚠️ 子代理必须物理隔离——禁止同一 Agent 扮演三个角色
 
@@ -436,14 +497,14 @@ Shell claude -p 独立进程:
 | 审查角色 | 挂载方式 | 为什么 |
 |---------|---------|--------|
 | **implementer** | Agent 工具（`subagent_type: general-purpose`） | 需要完整工具链——读契约、读 notebooks、写代码文件 |
-| **spec-reviewer** | **Shell `claude -p --allowedTools`** | 需要真正的进程隔离——新 PID、无父进程记忆、不可访问主Agent上下文 |
-| **verification** | **Shell `claude -p --allowedTools`** | 需要真正的进程隔离——只跑命令看结果，不看任何其他子代理的输出 |
+| **spec-reviewer** | **Shell `${CLAUDE_CLI} -p --allowedTools`** | 需要真正的进程隔离——新 PID、无父进程记忆、不可访问主Agent上下文 |
+| **verification** | **Shell `${CLAUDE_CLI} -p --allowedTools`** | 需要真正的进程隔离——只跑命令看结果，不看任何其他子代理的输出 |
 
-Shell `claude -p` 和 Agent 工具的区别：
+Shell `${CLAUDE_CLI} -p` 和 Agent 工具的区别：
 
 ```
 Agent 工具：主 Agent ──spawn──→ 子 Agent（共享 harness 配置，clean context 但有 sysprompt 残留）
-Shell claude -p -：主 Agent ──fork──→ 独立进程（新 PID、全新上下文加载、无任何父进程记忆）
+Shell ${CLAUDE_CLI} -p -：主 Agent ──fork──→ 独立进程（新 PID、全新上下文加载、无任何父进程记忆）
 ```
 
 Shell 方式下，审查子代理物理上无法知道 implementer 读了哪些文件、用了什么模型、思考过程如何——它只能读你传给它的脚本文件路径和门禁 checklist。这才是真正的"对峙"。
@@ -480,12 +541,12 @@ Agent(
 
 implementer 返回后，主 Agent **必须记录 implementer 的 PID**（从 Agent 工具返回值中提取），供步骤 4 交叉验证。
 
-**步骤 2**：implementer 返回后，主 Agent 用 **Shell `claude -p` 独立进程** 启动 spec-reviewer（主 Agent 自己不读代码做审查）：
+**步骤 2**：implementer 返回后，主 Agent 用 **Shell `${CLAUDE_CLI} -p` 独立进程** 启动 spec-reviewer（主 Agent 自己不读代码做审查）：
 
 ```bash
-source .env_agent_infer && claude -p "
+source .env_agent_infer && ${CLAUDE_CLI} -p "
 读取 .claude/roles/spec-reviewer-inference.md 了解你的角色边界。
-你的母 Agent：主 Agent (CLAUDE.md)，你通过 Shell claude -p 被其 fork 为独立进程。
+你的母 Agent：主 Agent (CLAUDE.md)，你通过 Shell ${CLAUDE_CLI} -p 被其 fork 为独立进程。
 你没有子 agent——你不 spawn 任何人，你只审查代码。
 
 审查对象：./engine/ 下的代码文件。
@@ -501,14 +562,17 @@ source .env_agent_infer && claude -p "
 
 spec-reviewer 返回后，主 Agent **必须记录 spec-reviewer 的 PID**（从报告文件头部提取）。
 - ✅ PASS → 进入步骤 3（启动 verification）
-- ❌ FAIL → **直接打回 implementer**，verification 不启动。主 Agent 不得以"测试还没跑"为由绕过此门禁
+- ❌ FAIL → **直接打回 implementer**（附带 spec-reviewer 报告全文中的具体 FAIL 条目作为驳回反馈），verification 不启动。主 Agent 不得以"测试还没跑"为由绕过此门禁
 
-**步骤 3**：spec-reviewer ✅ 后，主 Agent 用 **Shell `claude -p` 独立进程** 启动 verification（主 Agent 自己不跑测试做验收）：
+**步骤 3**：spec-reviewer ✅ 后，主 Agent 用 **Shell `${CLAUDE_CLI} -p` 独立进程** 启动 verification（主 Agent 自己不跑测试做验收）。
+
+⛔ **此步骤必须使用 Bash 工具执行 Shell 命令。禁止使用 Agent 工具 spawn verification。**
+⛔ **如果当前环境不支持 Shell `${CLAUDE_CLI} -p`（claude CLI 不可用），报告人类并暂停，禁止以降级方式绕过。**
 
 ```bash
-source .env_agent_infer && claude -p "
+source .env_agent_infer && ${CLAUDE_CLI} -p "
 读取 .claude/roles/verification-inference.md 了解你的角色边界。
-你的母 Agent：主 Agent (CLAUDE.md)，你通过 Shell claude -p 被其 fork 为独立进程。
+你的母 Agent：主 Agent (CLAUDE.md)，你通过 Shell ${CLAUDE_CLI} -p 被其 fork 为独立进程。
 你没有子 agent——你不 spawn 任何人，你只跑测试做验收。
 
 验收对象：./engine/ 下的代码文件。
@@ -663,6 +727,26 @@ verification           → 主 Agent 动作
 **不存在"部分通过""有条件交付""MINOR 可忽略"等中间状态。** spec-reviewer 或 verification 的 ❌ 就是 ❌，主 Agent 无权降级。
 如有 implementer 连续 2 次被驳回（任一轨道）→ 主 Agent 停下来，向人类报告阻塞点与驳回报告全文。
 
+### 驳回重发协议（硬编码，不可修改）
+
+当 spec-reviewer 或 verification 返回 ❌ FAIL 时，主 Agent 重新 spawn implementer 的 prompt **必须**遵守以下格式：
+
+**驳回重发 prompt 模板**：
+```
+[驳回反馈 — 来自 spec-reviewer/verification 的原始 FAIL 报告原文]
+[具体修复目标 — 需要改哪个文件的哪个函数/类，修复什么问题]
+[原始任务上下文 — 仅作为背景参考，折叠在最后]
+
+注意：你被重新调起是因为上一轮提交被驳回。你的任务是修复上述具体问题，
+不是重新实现整个 Phase。不要重新读取所有契约文件——只读与修复目标直接相关的文件。
+```
+
+**禁止事项**：
+- **禁止**重新发送原始任务描述作为 prompt 开头（这会导致 agent 重读所有契约、重新发现已有代码，纯浪费）
+- **禁止**不携带驳回反馈就 spawn implementer（没有反馈 = agent 不知道要改什么 = 微改后重新提交）
+- **禁止**在驳回反馈中使用模糊表述（如"代码有问题""逻辑不对"），必须引用 spec-reviewer/verification 报告中的具体条目（Contract Section + file:line + Expected/Actual）
+- **禁止**对同一 agent 重复发送相同任务描述（发现 2 教训：Phase 2 同一任务被发了 4 次，前 3 次全部浪费）
+
 ### 反模式警告
 
 以下行为违反对抗结构，会导致子代理审查失效：
@@ -670,7 +754,7 @@ verification           → 主 Agent 动作
 | 反模式 | 为什么危险 |
 |--------|-----------|
 | 同一个 Agent 先写代码再切换角色审查自己的代码 | confirmation bias——会为自己刚才的决策辩护 |
-| 用 Agent 工具而非 Shell `claude -p` 挂载 spec-reviewer/verification | Agent 工具共享 harness，子代理能读到父进程的系统提示和项目配置，不是真正独立 |
+| 用 Agent 工具而非 Shell `${CLAUDE_CLI} -p` 挂载 spec-reviewer/verification | Agent 工具共享 harness，子代理能读到父进程的系统提示和项目配置，不是真正独立 |
 | spec-reviewer 读了 implementer 的报告后再审查 | 报告中的自述会影响审查者的独立判断 |
 | verification 只跑部分脚本（"其他的应该没问题"） | 脚本选择偏见——跳过最可能失败的脚本 |
 | verification 跳过 L0.6 agent 自检 | 无法发现测试覆盖盲区——代码是 no-op 但测试 PASS |

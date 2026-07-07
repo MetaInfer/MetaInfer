@@ -1,13 +1,17 @@
 # 模型规格与失败模式库
 
-> 蓝图来源: `model_layer.architecture_knowledge_base.qwen_series_dense.qwen3_8b_model_dims` + `model_layer.architecture_knowledge_base.global_primitives_constraints` + `model_layer.architecture_knowledge_base.failure_mode_library`
 > 关联 notebooks: `07_improvementPlan/bugfix.md`, `06_experience/*`
 
 ---
 
-## Qwen3-8B 模型维度
+## 已验证模型参考
 
-### 全量值 (来自 config.json，必须动态读取)
+> **⚠️ 重要：以下维度表是特定模型的已验证示例值，不是规范。所有维度必须从 `config.json` 动态读取。**
+> 这些表格展示的是"某次构建中 config.json 的实际内容"——它们是验证参考，用于确认给定模型配置下 per-rank 维度的正确计算方式。
+
+### Qwen3-8B (已验证示例)
+
+#### 全量值 (来自该模型 config.json)
 
 | 参数 | 值 |
 |------|-----|
@@ -22,19 +26,17 @@
 | rope_theta | 1000000.0 |
 | rms_norm_eps | 1e-06 |
 
-### TP=4 Per-Rank 维度
+#### TP=4 Per-Rank 维度 (示例：计算方式)
 
-| 参数 | 值 |
-|------|-----|
-| hidden per rank | 1024 |
-| intermediate per rank | 3072 |
-| attn_heads per rank | 8 |
-| kv_heads per rank | 2 |
-| qkv_weight per rank | [1536, 4096] |
-| gate_up_weight per rank | [6144, 4096] |
-| max_blocks (40960/256) | 160 |
-
-**⚠️ 禁止硬编码** — 所有维度值必须从 `config.json` 动态读取。
+| 参数 | 计算方式 | 示例值 (Qwen3-8B, TP=4) |
+|------|---------|----------------------|
+| hidden per rank | hidden_size / tp_size | 1024 |
+| intermediate per rank | intermediate_size / tp_size | 3072 |
+| attn_heads per rank | num_attention_heads / tp_size | 8 |
+| kv_heads per rank | num_key_value_heads / tp_size | 2 |
+| qkv_weight per rank | [q_size+2*kv_size, hidden_size] | [1536, 4096] |
+| gate_up_weight per rank | [2*intermediate/tp, hidden_size] | [6144, 4096] |
+| max_blocks | max_position_embeddings / block_size | 160 (40960/256) |
 
 ---
 
@@ -68,14 +70,15 @@
 
 ## Platform Detection (平台自动检测)
 
-启动时必须执行:
+启动时必须执行（此检测结果被所有平台相关契约文件交叉引用）:
 1. `torch.cuda.get_device_name(0)` → GPU 品牌 (NVIDIA/AMD/Iluvatar)
 2. `torch.cuda.get_device_capability(0)` → SM/Compute Unit 版本
-3. NCCL/RCCL 版本: `torch.distributed.get_backend_version()`
+3. 通信后端版本: `torch.distributed.get_backend_version()`
 4. 根据结果路由:
    - **NVIDIA**: CustomAR 使用 IPC handle + NCCL all_reduce
    - **AMD (ROCm)**: CustomAR 不可用，fallback RCCL all_reduce
    - **DCU (Iluvatar)**: CustomAR 不可用，使用 torch.cuda.comm 或 fallback
+5. 各平台相关契约（kernel/communication/engine）应引用此检测结果，而非硬编码平台假设
 
 ---
 
@@ -161,7 +164,7 @@ Phase 10 E2E 乱码
 
 ---
 
-## Qwen3.6-27B (Qwen3.5 Hybrid Architecture)
+## Qwen3.6-27B (已验证示例 — Qwen3.5 Hybrid Architecture)
 
 <!-- source: evolution/evo-001, timestamp=2026-07-03 -->
 

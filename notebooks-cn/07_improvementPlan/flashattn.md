@@ -35,7 +35,7 @@ meta-infer/engine 的 attention 层全部使用 PyTorch 原生 `F.scaled_dot_pro
 ### 1.3 环境约束
 
 - **GPU**: A800 (SM80, Ampere) → 仅支持 **FA2**（FA3 需 SM90 Hopper，FA4 需 SM9.x+）
-- **已安装**: conda env "meta"，flash-attn 2.8.3，PyTorch 2.9.1+cu128，CUDA 12.8
+- **已安装**: conda env "meta"，flash-attn 2.8.3，PyTorch 2.9.1+cu128，CUDA 12.8（测试环境的参考快照，不同环境可能使用不同版本）
 - **参考**: vllm 在 A800 上的 attention 优先级为 `[FLASH_ATTN, FLASHINFER, TRITON_ATTN]`，flash-attn 排第一
 
 ## 2. 集成方案
@@ -354,7 +354,7 @@ assert diff < 1e-2, f"Flash-attn output diff too large: {diff}"
 ### 6.2 端到端测试
 
 ```bash
-conda activate meta
+conda activate ${CONDA_ENV}
 
 # DeepSeek-V2-Lite-Chat
 torchrun --nproc_per_node=4 openai_tp_server.py --backend tp --model deepseek-v2-lite

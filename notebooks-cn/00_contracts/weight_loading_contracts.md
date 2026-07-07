@@ -1,6 +1,5 @@
 # 权重加载 — API 契约
 
-> 蓝图来源: `model_layer.architecture_knowledge_base.qwen_series_dense.qwen_hf_key_mapping`
 > 关联 notebooks: `07_improvementPlan/task10_tp_qwen_debug_experience.md`
 
 ## 概述

@@ -1,6 +1,5 @@
 # Qwen3 模型完整层级 — API 契约
 
-> 蓝图来源: `framework_layer.data_flow_contracts.tp_layer_interface_contracts.qwen3_tp_model_interfaces`
 > 关联 notebooks: `04_parallel_strategies/qwen_dense_tp_implementation_guide.md`
 
 ## 概述
@@ -18,16 +17,18 @@ Qwen3-8B 的 TP=4 完整类层级 — 从 Config 到 Top-Level Model。
 @dataclass
 class QwenTPConfig:
     model_dir: Path
-    hidden_size: int = 4096
-    intermediate_size: int = 12288
-    num_hidden_layers: int = 36
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 8
-    head_dim: int = 128
-    vocab_size: int = 151936
-    rms_norm_eps: float = 1e-06
-    rope_theta: float = 1000000.0
-    max_position_embeddings: int = 40960
+    # ⚠️ 以下默认值为 Qwen3-8B 示例，不是规范。所有值应从 config.json 动态读取
+    # Factory 方法 _load_qwen_tp_config() 会覆盖这些默认值
+    hidden_size: int = 4096        # 示例值，实际从 config.json 读取
+    intermediate_size: int = 12288  # 示例值
+    num_hidden_layers: int = 36     # 示例值
+    num_attention_heads: int = 32   # 示例值
+    num_key_value_heads: int = 8    # 示例值
+    head_dim: int = 128             # 示例值
+    vocab_size: int = 151936        # 示例值
+    rms_norm_eps: float = 1e-06     # 示例值
+    rope_theta: float = 1000000.0   # 示例值
+    max_position_embeddings: int = 40960  # 示例值
     tie_word_embeddings: bool = False
 ```
 
@@ -99,7 +100,8 @@ self.lm_head = ParallelLMHead(hidden_size, vocab_size, gather_output=True)
 ## Top-Level Forward (模型入口)
 
 ```python
-def forward(self, input_ids, past_key_values=None, position_offset=0, max_seq_len=528):
+def forward(self, input_ids, past_key_values=None, position_offset=0, max_seq_len=None):
+    # max_seq_len: 若未指定，从 self.cfg.max_position_embeddings 推导
     hidden_states = self.embed_tokens(input_ids)  # [B, S, hidden_size]
     seq_len = input_ids.shape[1]
     positions = torch.arange(position_offset, position_offset + seq_len, device=input_ids.device, dtype=torch.long)
@@ -136,6 +138,8 @@ def forward(self, input_ids, past_key_values=None, position_offset=0, max_seq_le
 4. model.eval()
 5. init_custom_ar(device=device)                     # after model on GPU, before first forward
 ```
+
+> **⚠️ forward/weight 耦合约束**：步骤 2（模型构造）中定义的所有 `nn.Parameter`/`nn.Module` 属性（特别是 QKV projection、q_norm/k_norm、gate_up_proj），其命名和 weight shape 必须在步骤 3（load_weights）中与 HF 权重 key 兼容。不能在 Phase 5/6 写完 forward 逻辑后再在 Phase 7 调整属性定义——两者必须同步设计。交叉引用：`weight_loading_contracts.md` §HF Key Mapping、`AGENT_SKILL.md` §1 规则 11。
 
 ---
 

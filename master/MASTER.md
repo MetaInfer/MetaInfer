@@ -5,7 +5,7 @@
 你是 **MetaInfer 主 Agent**，运行在 `metainferv3/master/` 目录下。
 你**绝不**修改代码，**绝不**运行测试。你只做四件事：诊断 → 决策 → 调度 → 比较。
 
-你的子 agent 工作在 metainferv3 项目根目录，通过 `claude -p` 进程隔离启动。子 agent **无状态**——它只能看到你给的策略文件，无法访问历史 KPI、决策日志或往轮迭代结果。
+你的子 agent 工作在 metainferv3 项目根目录，通过 `${CLAUDE_CLI} -p` 进程隔离启动。子 agent **无状态**——它只能看到你给的策略文件，无法访问历史 KPI、决策日志或往轮迭代结果。
 
 ## 硬约束
 
@@ -165,7 +165,7 @@ bash master/scripts/call-sub-agent.sh <ITER_ID> master/strategies/strategy-<ITER
 2. 保留知识文档（`notebooks-cn/`、`scripts/`、`.claude/`、`AGENT_SKILL.md`、`CLAUDE.md`、`master/`、`iterations/`）
 3. 加载 `.env_agent_infer` 环境
 4. 将策略文件拷入 `iterations/`
-5. 通过 `claude -p` 启动子 agent（进程隔离，无父进程记忆）
+5. 通过 `${CLAUDE_CLI} -p` 启动子 agent（进程隔离，无父进程记忆）
 6. 子 agent 读知识文档 + 策略 → 通过 `/phase-all` 六阶段 + 三角色 SOP 从零生成全部代码
 7. 将结果收集到 `master/results/<ITER_ID>/`
 8. 成功时保存代码快照到 `master/results/<ITER_ID>/code/`
@@ -174,7 +174,7 @@ bash master/scripts/call-sub-agent.sh <ITER_ID> master/strategies/strategy-<ITER
 1. 保留引擎代码（不清理 `engine/`、`llm_engine.py`）
 2. 检查引擎代码存在 → 不存在则报错退出
 3. 加载环境 + 拷贝策略文件
-4. 通过 `claude -p` 启动子 agent（进程隔离）
+4. 通过 `${CLAUDE_CLI} -p` 启动子 agent（进程隔离）
 5. 子 agent 读已有代码 + 策略 changes[] → 通过 `/phase-modify` 增量应用变更
 6. 只运行受影响 Phase 的 scripts/ 门禁测试
 7. 将结果收集到 `master/results/<ITER_ID>/`
@@ -246,7 +246,7 @@ ROLLBACK 模式先从上一轮成功快照恢复代码，然后以增量方式�
 仅当 ROLLBACK 原因是 KPI 降幅 > 10% 或 greedy_match 从 true→false 时启动：
 
 ```bash
-source .env_agent_infer && claude -p "
+source .env_agent_infer && ${CLAUDE_CLI} -p "
 读取 .claude/roles/issue-analyzer.md 了解你的角色边界。
 
 失败上下文：
@@ -357,7 +357,7 @@ if previous_verdict == "ROLLBACK" and fixed_root_cause():
 **若 knowledge_signals 非空**：启动 experiment-summarizer：
 
 ```bash
-source .env_agent_infer && claude -p "
+source .env_agent_infer && ${CLAUDE_CLI} -p "
 读取 .claude/roles/experiment-summarizer.md 了解你的角色边界。
 
 本轮迭代上下文：
@@ -396,7 +396,7 @@ summarizer 返回后，主 Agent 检查 `knowledge_delta.json`：
 当初始化阶段检测到目标模型不在当前知识库覆盖范围内时（或用户手动执行 `/evolve <model>`），不进入 master 循环，而是委托给进化编排器：
 
 ```bash
-source .env_agent_infer && claude -p "
+source .env_agent_infer && ${CLAUDE_CLI} -p "
 读取 evolution/EVOLUTION.md 了解进化编排器行为。
 目标模型: <用户指定的模型>
 进化工作区: evolution/

@@ -119,7 +119,7 @@ flowchart TD
         S1["Step1: 加载状态<br/>state.json"]
         S2["Step2: 诊断<br/>KPI分析 + 瓶颈定位"]
         S3["Step3: 写策略<br/>strategy-XXX.json"]
-        S4["Step4: 启动子Agent<br/>claude -p 进程隔离"]
+        S4["Step4: 启动子Agent<br/>${CLAUDE_CLI} -p 进程隔离"]
         
         subgraph SUBAGENT["子Agent内部（全新进程，无记忆）"]
             READ["读策略 + 知识库"]
@@ -164,7 +164,7 @@ flowchart TD
     subgraph CIRCUIT_C["Step9.5: 回路C触发"]
         SIGNAL_CHECK{"检查知识信号<br/>━━━━━━━━<br/>① throughput_delta > 5%？<br/>② 新策略模式？<br/>③ 跨≥3轮连续ADVANCE？<br/>④ 刚修复ROLLBACK根因？"}
         SIGNAL_COUNT{"信号 ≥ 2？"}
-        LAUNCH_C["启动 experiment-summarizer<br/>claude -p 进程隔离<br/>→ 写 knowledge_delta.json<br/>→ 追加 notebooks-cn/"]
+        LAUNCH_C["启动 experiment-summarizer<br/>${CLAUDE_CLI} -p 进程隔离<br/>→ 写 knowledge_delta.json<br/>→ 追加 notebooks-cn/"]
         SKIP_C["NO_NEW_KNOWLEDGE<br/>跳过，继续循环"]
     end
     
@@ -269,7 +269,7 @@ flowchart TD
     
     COUNT -->|"否"| SKIP["NO_NEW_KNOWLEDGE<br/>跳过，继续循环"]
     
-    COUNT -->|"是"| SUMMARIZER["启动 Experiment Summarizer<br/>claude -p 进程隔离"]
+    COUNT -->|"是"| SUMMARIZER["启动 Experiment Summarizer<br/>${CLAUDE_CLI} -p 进程隔离"]
     
     subgraph SUMMARIZER_INTERNAL["Experiment Summarizer 内部逻辑"]
         INPUT["输入:<br/>strategies/strategy-ID.json<br/>results/ID/benchmarks.jsonl<br/>results/ID/diagnostics_summary.json<br/>decision-log.jsonl<br/>notebooks-cn/现有知识"]
@@ -313,7 +313,7 @@ flowchart TD
 
 ## 六、三角色对抗协作流（双轨制 + 进程隔离标注）
 
-**标注约定**：`-->>` 虚线 = Agent 工具 spawn，`==>` 粗线 = Shell `claude -p` 独立进程。
+**标注约定**：`-->>` 虚线 = Agent 工具 spawn，`==>` 粗线 = Shell `${CLAUDE_CLI} -p` 独立进程。
 
 ```mermaid
 flowchart TD
@@ -327,8 +327,8 @@ flowchart TD
     
     subgraph FULL_TRACK["完整串行路径（首次大段构建，强制）"]
         F_IMPL["implementer<br/>[Agent工具 spawn]<br/>写代码 + 自读diff<br/>→ SUBMITTED<br/>⛔不跑测试，不宣判PASS"]
-        F_SPEC["spec-reviewer<br/>[Shell claude -p 独立进程]<br/>对照契约逐条审查<br/>独立读代码<br/>⛔不跑测试<br/>→ PASS / FAIL"]
-        F_VERIF["verification<br/>[Shell claude -p 独立进程]<br/>唯一测试执行者<br/>L0防假PASS + L0.5自检<br/>L0.6 agent自检<br/>L1 scripts/ + L2跨Phase<br/>L3 profiler<br/>→ PASS / FAIL"]
+        F_SPEC["spec-reviewer<br/>[Shell ${CLAUDE_CLI} -p 独立进程]<br/>对照契约逐条审查<br/>独立读代码<br/>⛔不跑测试<br/>→ PASS / FAIL"]
+        F_VERIF["verification<br/>[Shell ${CLAUDE_CLI} -p 独立进程]<br/>唯一测试执行者<br/>L0防假PASS + L0.5自检<br/>L0.6 agent自检<br/>L1 scripts/ + L2跨Phase<br/>L3 profiler<br/>→ PASS / FAIL"]
         
         F_IMPL -->|"[Agent] spawn"| F_SPEC
         F_SPEC -->|"✅ PASS"| F_VERIF
@@ -339,9 +339,9 @@ flowchart TD
     
     subgraph FAST_TRACK["快速修复路径（驳回后小修）"]
         FAST_IMPL["implementer<br/>[Agent工具 spawn]<br/>读FAIL报告 + 定位根因<br/>修改几行代码<br/>→ SUBMITTED<br/>⛔不跑测试"]
-        FAST_VERIF["verification<br/>[Shell claude -p 独立进程]<br/>跑scripts/返回测试结果<br/>→ PASS / FAIL"]
+        FAST_VERIF["verification<br/>[Shell ${CLAUDE_CLI} -p 独立进程]<br/>跑scripts/返回测试结果<br/>→ PASS / FAIL"]
         
-        FAST_IMPL -->|"[Shell] claude -p"| FAST_VERIF
+        FAST_IMPL -->|"[Shell] ${CLAUDE_CLI} -p"| FAST_VERIF
         FAST_VERIF -->|"✅ PASS"| DELIVER
         FAST_VERIF -->|"❌ FAIL"| FAST_RETRY{"连续2次FAIL？"}
         FAST_RETRY -->|"否"| FAST_IMPL
@@ -376,7 +376,7 @@ sequenceDiagram
     
     Note over Main,Env: Step 1: 环境配置
     Main->>Env: 检测 MODEL_DIR → Qwen3-8B
-    Main->>User: AskUserQuestion → 用户提供 /data/model/Qwen3.6-27B
+    Main->>User: AskUserQuestion → 用户提供 ${MODEL_DIR} (如 Qwen3.6-27B 路径)
     Main->>Env: 更新 .env_agent_infer
     Main->>Config: 验证 config.json 可读 ✅
     

@@ -1,5 +1,7 @@
 # DeepSeekV2 在 vLLM 中的适配知识（TP 视角）
 
+> **注意**: 本文引用的 vLLM 源码路径基于特定版本快照，不同 vLLM 版本的文件路径和代码行号可能不同。本项目使用 `knowledge/vllm/` 作为参考代码缓存，路径均相对于该缓存目录。
+
 本文将 `vllm/model_executor/models/deepseek_v2.py` 中相对 HF 直接加载的核心改造整理为 4 大类，并给出：
 
 - 知识点说明
@@ -27,12 +29,12 @@
 ## 1.2 参考源码路径
 
 - 模型使用侧：
-  - `vllm-v0.15.1-dev/vllm/model_executor/models/deepseek_v2.py`
+  - `knowledge/vllm/vllm/model_executor/models/deepseek_v2.py`
 - 层定义侧：
-  - `vllm-v0.15.1-dev/vllm/model_executor/layers/linear.py`
-  - `vllm-v0.15.1-dev/vllm/model_executor/layers/vocab_parallel_embedding.py`
+  - `knowledge/vllm/vllm/model_executor/layers/linear.py`
+  - `knowledge/vllm/vllm/model_executor/layers/vocab_parallel_embedding.py`
 - 参数加载协议：
-  - `vllm-v0.15.1-dev/vllm/model_executor/parameter.py`
+  - `knowledge/vllm/vllm/model_executor/parameter.py`
 
 ## 1.3 关键代码（TP）
 
@@ -75,9 +77,9 @@ if self.reduce_results and self.tp_size > 1:
 
 ## 2.2 参考源码路径
 
-- `vllm-v0.15.1-dev/vllm/model_executor/models/deepseek_v2.py`
+- `knowledge/vllm/vllm/model_executor/models/deepseek_v2.py`
 - 关联接口：
-  - `vllm-v0.15.1-dev/vllm/v1/kv_cache_interface.py`
+  - `knowledge/vllm/vllm/v1/kv_cache_interface.py`
 
 ## 2.3 关键代码（TP + KV）
 
@@ -123,11 +125,11 @@ output, _ = self.o_proj(attn_output)
 
 ## 3.2 参考源码路径
 
-- `vllm-v0.15.1-dev/vllm/model_executor/models/deepseek_v2.py`
+- `knowledge/vllm/vllm/model_executor/models/deepseek_v2.py`
 - 关联 MoE 层：
-  - `vllm-v0.15.1-dev/vllm/model_executor/layers/fused_moe/`
+  - `knowledge/vllm/vllm/model_executor/layers/fused_moe/`
 - 分布式组接口：
-  - `vllm-v0.15.1-dev/vllm/distributed/parallel_state.py`
+  - `knowledge/vllm/vllm/distributed/parallel_state.py`
 
 ## 3.3 关键代码（TP/EP + MoE）
 
@@ -174,13 +176,13 @@ expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
 ## 4.2 参考源码路径
 
 - 模型特化加载逻辑：
-  - `vllm-v0.15.1-dev/vllm/model_executor/models/deepseek_v2.py`（`load_weights`）
+  - `knowledge/vllm/vllm/model_executor/models/deepseek_v2.py`（`load_weights`）
 - 通用 loader：
-  - `vllm-v0.15.1-dev/vllm/model_executor/model_loader/default_loader.py`
-  - `vllm-v0.15.1-dev/vllm/model_executor/model_loader/sharded_state_loader.py`
-  - `vllm-v0.15.1-dev/vllm/model_executor/model_loader/weight_utils.py`
+  - `knowledge/vllm/vllm/model_executor/model_loader/default_loader.py`
+  - `knowledge/vllm/vllm/model_executor/model_loader/sharded_state_loader.py`
+  - `knowledge/vllm/vllm/model_executor/model_loader/weight_utils.py`
 - 参数侧分片行为：
-  - `vllm-v0.15.1-dev/vllm/model_executor/parameter.py`
+  - `knowledge/vllm/vllm/model_executor/parameter.py`
 
 ## 4.3 关键代码（映射+分片）
 

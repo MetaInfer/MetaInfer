@@ -4,7 +4,7 @@
 
 ## 1. 问题现象
 
-- 原始 `torchrun --nproc_per_node=4 -m pytest tests/test_deepseek_tp_real.py -q -s` 输出中：
+- 原始 `torchrun --nproc_per_node=${TP_SIZE} -m pytest tests/test_deepseek_tp_real.py -q -s` 输出中：
   - `output[0]` 有短句重复。
   - `output[1..4]` 大量换行或退化文本。
 - 表面上像两类问题：
@@ -58,7 +58,7 @@
 
 ## 4. 验证命令与结果
 
-命令（建议显式 master port，避免 29500 冲突）：
+命令（建议显式 master port，避免 29500 冲突（PyTorch 默认 master port，可通过 MASTER_PORT 环境变量覆盖））：
 
 ```bash
 DEEPSEEK_TP_HF_DEBUG=1 torchrun --master_port 29631 --nproc_per_node=4 -m pytest tests/test_deepseek_tp_real.py -q -s
@@ -189,7 +189,7 @@ DEEPSEEK_TP_HF_DEBUG=1 torchrun --master_port 29631 --nproc_per_node=4 -m pytest
 ### 8.3 纯 TP 验证命令（勿设 `DEEPSEEK_TP_HF_DEBUG`）
 
 ```bash
-torchrun --master_port 29641 --nproc_per_node=4 -m pytest tests/test_deepseek_tp_real.py -q -s
+torchrun --master_port ${MASTER_PORT} --nproc_per_node=${TP_SIZE} -m pytest tests/test_deepseek_tp_real.py -q -s
 ```
 
 （`--master_port` 可按环境避免 29500 占用的端口；与具体端口无关。）

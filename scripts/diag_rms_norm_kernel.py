@@ -2,7 +2,7 @@
 """Test whether vLLM fused_add_rms_norm kernel runs correctly on this platform."""
 import os, sys, torch
 
-model_dir = os.environ.get('MODEL_DIR', '/data/models')
+model_dir = os.environ.get('MODEL_DIR', '.')  # fallback to cwd, user should set MODEL_DIR
 device = 'cuda:0'
 
 # Test 1: Does the vLLM kernel run at all?

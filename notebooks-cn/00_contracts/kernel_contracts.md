@@ -1,11 +1,18 @@
 # Kernel Wrappers — API 契约
 
-> 蓝图来源: `framework_layer.data_flow_contracts.tp_layer_interface_contracts.qwen3_kernel_contracts`
 > 关联 notebooks: `07_improvementPlan/kernel_replacement_plan.md` §九, `07_improvementPlan/qwen3_effective_changes.md`
 
 ## 概述
 
-7 个 vLLM 黑盒 kernel wrapper — 全部从 vLLM installed package 源码提取纯净包装，禁止修改内部逻辑。
+7 个数值基元 kernel wrapper — 接口签名与数学语义的权威定义。
+
+**kernel 选择规则**（分层决策）：
+1. **契约层定义接口语义**：输入/输出 shape、dtype、精度要求、数学公式。不绑定具体 kernel 来源。
+2. **实现层按平台路由**：`engine/kernels/vllm_wrappers.py` 根据 `model_specs.md` §Platform Detection 的检测结果选择 kernel 后端：
+   - NVIDIA GPU → vLLM C++ 扩展 kernel（`vllm._custom_ops` / `vllm._C`）
+   - AMD GPU (ROCm) → vLLM HIP 移植版（如可用），否则 RCCL fallback
+   - 海光 DCU → 平台适配 kernel（CUDA 兼容层 + 自研 HIP kernel），vLLM C++ 扩展在 DCU 上不可直接使用
+3. **通用规则**：生产环境必须使用当前平台可用的最优优化 kernel。纯 PyTorch 逐元素实现仅在确认所有优化 kernel 均不可用时作为最后手段，且必须记录为已知性能差距（~6x 性能损失），同时在 `phase_report/` 中标记 `PLATFORM_FALLBACK`。
 对应 kernel_replacement_plan.md Stage 1-7。
 
 源实现文件: `engine/kernels/vllm_wrappers.py`, `engine/models/qwen.py`, `engine/tp_layers/linear.py`
@@ -17,7 +24,7 @@
 ### 1. rms_norm
 
 - **签名**: `def rms_norm(out: Tensor[*, H], input: Tensor[*, H], weight: Tensor[H], epsilon: float) -> None`
-- **来源**: `vllm/_custom_ops.py:420-423`
+- **语义**: 对 input 沿最后一维计算 RMSNorm，结果写入预分配的 out。kernel 内部使用 fp32 计算精度。
 - **约束**: out 预分配 (`empty_like`); input 必须 contiguous; out/input/weight 同 dtype (bf16)
 - **用法**: `RMSNorm.forward(x) → rms_norm(out, x.contiguous(), weight, eps)`
 - **精度**: kernel 内部 fp32 计算，调用方只需确保 out 预分配、input contiguous
@@ -40,7 +47,8 @@ fused_add_rms_norm(attn_out, res, self.post_attention_layernorm.weight, eps)
 ### 3. silu_and_mul
 
 - **签名**: `torch.ops._C.silu_and_mul(out!: Tensor[*, d], input: Tensor[*, 2*d]) -> None`
-- **来源**: `vllm/model_executor/layers/activation.py::SiluAndMul.forward_cuda`
+- **语义**: 对 input 的前半部分应用 SiLU 激活，与后半部分逐元素相乘。out = SiLU(input[..., :d]) * input[..., d:]。
+- **参考实现**: vLLM C++ 扩展 (`SiluAndMul` fused kernel)
 - **约束**: out 预分配 `[B, S, intermediate/tp]`; input 为 MergedColumnParallelLinear 输出 `[B, S, 2*intermediate/tp]` (前 gate 后 up)
 - **用法**:
 ```python
@@ -49,12 +57,13 @@ out = torch.empty(B, S, intermediate//tp, dtype=x.dtype, device=x.device)
 silu_and_mul(out, gate_up)
 return down_proj(out)
 ```
-- **注意**: 需 `import vllm._C` 触发注册
+- **注意**: 需要触发 kernel 注册（通过 `engine/kernels/vllm_wrappers.py` 中的 import 完成）
 
 ### 4. rotary_embedding
 
 - **签名**: `def rotary_embedding(positions: Tensor[N] int64, query!: Tensor[N, H, D], key!: Tensor[N, Kv, D] | None, head_size: int, cos_sin_cache: Tensor[M, D], is_neox: bool) -> None`
-- **来源**: `vllm/_custom_ops.py:400-410`
+- **语义**: 对 query 和 key 应用旋转位置编码（RoPE），in-place 修改。is_neox=True 表示 NeoX-style（前后分半 rotate_half），False 表示 GPT-J-style（奇偶交错）。
+- **参考实现**: vLLM C++ 扩展 (`rotary_embedding` kernel)
 - **约束**:
   - q/k in-place 修改
   - 输入为 2D `[num_tokens, heads, head_dim]` (非 4D)
@@ -115,4 +124,4 @@ kc_flat.index_copy_(0, self._slot_mapping_decode, k_write)
 - **FM-004**: CosSinCache 格式 — shape `[max_pos, head_size]` 非 `[2*head_size]`
 - **FM-007**: RoPE Neox vs GPT-J — Qwen3 必须 `is_neox=True`
 - **FM-008**: paged KV block_size — 必须 ≥256 (flash_attn 硬性要求)
-- **KERNEL-001**: 禁止手写 PyTorch RMSNorm — 必须使用 vLLM CUDA kernel
+- **KERNEL-001**: 生产环境使用当前平台可用的最优优化 kernel。NVIDIA 平台即 vLLM C++ 扩展，DCU 平台即 HIP 适配 kernel。纯 PyTorch 实现仅在所有优化 kernel 均不可用时作为最后手段，且必须在 `phase_report/` 中标记 `PLATFORM_FALLBACK`

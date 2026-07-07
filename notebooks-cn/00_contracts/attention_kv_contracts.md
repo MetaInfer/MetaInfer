@@ -1,6 +1,5 @@
 # Attention & KV Cache — API 契约
 
-> 蓝图来源: `framework_layer.data_flow_contracts.paged_kv_cache_contract` + `framework_layer.data_flow_contracts.flash_attention_integration_contract`
 > 关联 notebooks: `07_improvementPlan/improvement_plan.md` §P3-FA
 
 ## 概述
@@ -34,7 +33,7 @@ if self._key_cache is None:
 
 ### block_size 硬约束
 
-`_kv_block_size = 256` — flash_attn_with_kvcache 最低要求。不能使用 16。
+`_kv_block_size = 256` — flash_attn_with_kvcache 的硬性最低要求（此值来自 flash_attn 库的约束，不同 flash_attn 版本可能有不同要求）。不能使用 16。
 
 ---
 

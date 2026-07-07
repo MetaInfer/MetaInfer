@@ -204,7 +204,7 @@
   │  │ 加载状态  │   │ 诊断     │   │ 写策略    │   │ 启动子    │        │
   │  │          │   │          │   │          │   │ Agent    │        │
   │  │ state    │   │ KPI分析  │   │ strategy │   │          │        │
-  │  │ .json    │   │ 瓶颈定位 │   │ -XXX.json│   │ claude -p│        │
+  │  │ .json    │   │ 瓶颈定位 │   │ -XXX.json│   │ ${CLAUDE_CLI} -p│        │
   │  └──────────┘   └──────────┘   └──────────┘   └─────┬────┘        │
   │                                                      │              │
   │     ┌────────────────────────────────────────────────┘              │
@@ -272,7 +272,7 @@
   │  │                                            │                      │
   │  │  信号 ≥ 2 ？                                │                      │
   │  │  ├── 是 → 启动 experiment-summarizer       │                      │
-  │  │  │        (claude -p 进程隔离)              │                      │
+  │  │  │        (${CLAUDE_CLI} -p 进程隔离)              │                      │
   │  │  │        → 写 knowledge_delta.json        │                      │
   │  │  │        → 追加 notebooks-cn/ 对应文件    │                      │
   │  │  │        → 知识库更新 ✅                   │                      │
@@ -443,7 +443,7 @@
                   ▼
   ┌────────────────────────────────────────────────────────────────┐
   │               Experiment Summarizer                             │
-  │               (claude -p 进程隔离)                               │
+  │               (${CLAUDE_CLI} -p 进程隔离)                               │
   │                                                                 │
   │  输入:                                                          │
   │  ├── master/strategies/strategy-<ID>.json                       │
@@ -488,7 +488,7 @@
 
 ## 六、三角色对抗协作流（Phase 构建细节）
 
-**关键标注**：每条 spawn 边标注挂载方式。`[Agent]` = Agent 工具 spawn，`[Shell]` = Shell `claude -p` 独立进程。
+**关键标注**：每条 spawn 边标注挂载方式。`[Agent]` = Agent 工具 spawn，`[Shell]` = Shell `${CLAUDE_CLI} -p` 独立进程。
 
 ```
                     ┌─────────────────────┐
@@ -515,7 +515,7 @@
      │ → SUBMITTED│                    │
      └─────┬──────┘                    │
            │                           │
-           │ [Shell] claude -p         │
+           │ [Shell] ${CLAUDE_CLI} -p         │
            ▼                           │
      ┌────────────┐      ❌ FAIL       │
      │spec-reviewer│ ──────────→ 打回   │
@@ -523,12 +523,12 @@
      │ 对照契约审查 │                  │
      └─────┬──────┘                    │
            │ ✅ PASS                   │
-           │ [Shell] claude -p         │
+           │ [Shell] ${CLAUDE_CLI} -p         │
            ▼                           │
      ┌────────────┐                    │
      │verification│ ← Shell 独立进程   │
      │ 双重验证:   │◄───────────────────┘
-     │ L0/L0.5/L0.6│  [Shell] claude -p
+     │ L0/L0.5/L0.6│  [Shell] ${CLAUDE_CLI} -p
      │ L1 scripts  │     ❌ FAIL → 打回
      │ L2 跨Phase  │    (连续2次→升级完整串行)
      │ L3 profiler │
@@ -550,7 +550,7 @@
   Step 0  用户: "/phase-all" (目标模型 Qwen3.6 27B)
   ─────────────────────────────────────────────────
   Step 1  主 Agent: 检测到 MODEL_DIR 指向 Qwen3-8B
-          主 Agent: AskUserQuestion → 用户提供 /data/model/Qwen3.6-27B
+          主 Agent: AskUserQuestion → 用户提供 ${MODEL_DIR} (如 Qwen3.6-27B 路径)
           主 Agent: 自动更新 .env_agent_infer → 验证 config.json 可读 ✅
   ─────────────────────────────────────────────────
   Step 2  主 Agent: 读 config.json

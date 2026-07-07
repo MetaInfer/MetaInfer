@@ -1,17 +1,20 @@
 # MetaInfer v3 — 多机 Worktree 部署指南
 
+> **⚠️ 端口说明**：本文档是部署模板。所有路径（`/data/`, `/opt/`, `/shared/`）和模型名（`Qwen3.6-27B`）均为示例，实际部署时替换为对应环境变量：`${PROJECT_ROOT}`, `${MODEL_DIR}`, `${PYTHON_PATH}`, `${TARGET_MODEL}`。
+> 部署前请先用 `AskUserQuestion` 确认用户的实际路径。
+
 ## 一、架构概述
 
 ```
-/shared/metainferv3.git/          ← bare repo（共享存储或 NFS）
+${SHARED_REPO}/metainferv3.git/   ← bare repo（共享存储或 NFS）
     │
-    ├── 学习机器 1 ── git clone → /data/metainferv3-learn-1/
-    ├── 学习机器 2 ── git clone → /data/metainferv3-learn-2/
-    ├── 学习机器 3 ── git clone → /data/metainferv3-learn-3/
-    │   └── 三机同时学 Qwen3.6 27B，谁先 L0-L3 通过谁赢
+    ├── 学习机器 1 ── git clone → ${PROJECT_ROOT}-learn-1/
+    ├── 学习机器 2 ── git clone → ${PROJECT_ROOT}-learn-2/
+    ├── 学习机器 3 ── git clone → ${PROJECT_ROOT}-learn-3/
+    │   └── 三机同时学同一模型，谁先 L0-L3 通过谁赢
     │
-    ├── 调优机器 A ── git clone → /data/metainferv3-tune-A/
-    └── 调优机器 B ── git clone → /data/metainferv3-tune-B/
+    ├── 调优机器 A ── git clone → ${PROJECT_ROOT}-tune-A/
+    └── 调优机器 B ── git clone → ${PROJECT_ROOT}-tune-B/
         └── git pull 拿到学习机写入的知识 → 无限循环优化
 ```
 
@@ -27,7 +30,7 @@
 在共享存储上执行（只做一次）：
 
 ```bash
-cd /data/whl-test/metainferv3
+cd ${PROJECT_ROOT}
 
 # 若尚未初始化
 git init
@@ -38,8 +41,8 @@ git add .claude/skills/ .claude/roles/
 git add .gitignore PROJECT_FLOW.md PROJECT_FLOW_MERMAID.md PROJECT_FLOW_README.md DEPLOYMENT.md
 git commit -m "v3 baseline: 3-loop architecture + 7 agent roles + parallel learning"
 
-# 克隆为 bare repo
-git clone --bare /data/whl-test/metainferv3 /shared/metainferv3.git
+# 克隆为 bare repo（SHARED_REPO 为共享存储路径，如 /shared 或 NFS 挂载点）
+git clone --bare . ${SHARED_REPO}/metainferv3.git
 ```
 
 > **注意**：`evolution/state.json`、`evolution/strategies/`、`evolution/results/`、`master/state.json`、`master/strategies/`、`master/results/` 都在 `.gitignore` 中——它们是每台机器的本地状态，不共享。
@@ -68,14 +71,14 @@ git clone --bare /data/whl-test/metainferv3 /shared/metainferv3.git
 ```bash
 # ─── 步骤 1: 从 bare repo 克隆 ───
 MACHINE_ID=1   # 每台机器改这个：1 / 2 / 3
-git clone /shared/metainferv3.git /data/metainferv3-learn-${MACHINE_ID}
-cd /data/metainferv3-learn-${MACHINE_ID}
+git clone ${SHARED_REPO}/metainferv3.git ${PROJECT_ROOT}-learn-${MACHINE_ID}
+cd ${PROJECT_ROOT}-learn-${MACHINE_ID}
 
 # ─── 步骤 2: 配置本机环境 ───
 cat > .env_agent_infer << 'ENVEOF'
-export AGENT_INFER_ROOT="/data/metainferv3-learn-MACHINE_ID_PLACEHOLDER"
-export PYTHON_PATH="/opt/conda/envs/meta/bin"
-export MODEL_DIR="/data/models/Qwen3.6-27B"
+export AGENT_INFER_ROOT="${PROJECT_ROOT}-learn-MACHINE_ID_PLACEHOLDER"
+export PYTHON_PATH="${PYTHON_PATH:-/opt/conda/envs/meta/bin}"  # 替换为实际 conda/venv 路径
+export MODEL_DIR="${MODEL_DIR:-/path/to/model}"  # 替换为实际模型路径
 export PATH="${PYTHON_PATH}:$PATH"
 export PYTHONPATH="${AGENT_INFER_ROOT}:$PYTHONPATH"
 ENVEOF
@@ -114,10 +117,10 @@ git status
 每台机器上执行（三台可以同时启动）：
 
 ```bash
-cd /data/metainferv3-learn-1   # 机器 2 用 learn-2，机器 3 用 learn-3
+cd ${PROJECT_ROOT}-learn-1   # 机器 2 用 learn-2，机器 3 用 learn-3
 source .env_agent_infer
 
-claude -p "
+${CLAUDE_CLI} -p "
 你是 MetaInfer 主 Agent，按 CLAUDE.md 和 PROJECT_FLOW_MERMAID.md 的流程图执行。
 
 当前是学习机器，目标模型 Qwen3.6 27B。
@@ -135,7 +138,7 @@ evolution/state.json 已配置 entry_reason=coverage_fail → 跳过无开源尝
 
 ```bash
 # 胜利检测脚本
-cd /data/metainferv3-learn-${MACHINE_ID}
+cd ${PROJECT_ROOT}-learn-${MACHINE_ID}
 
 # 检查远程是否已有其他机器的胜利提交
 git fetch origin 2>/dev/null
@@ -155,7 +158,7 @@ fi
 **如果本机本轮通过了 L0-L3（进化成功）**：
 
 ```bash
-cd /data/metainferv3-learn-${MACHINE_ID}
+cd ${PROJECT_ROOT}-learn-${MACHINE_ID}
 
 # 先 pull 避免冲突
 git pull --rebase origin main 2>/dev/null || true
@@ -248,14 +251,14 @@ echo "════════════════════════�
 ```bash
 # ─── 调优机器初始化 ───
 MACHINE_ID=A
-git clone /shared/metainferv3.git /data/metainferv3-tune-${MACHINE_ID}
-cd /data/metainferv3-tune-${MACHINE_ID}
+git clone ${SHARED_REPO}/metainferv3.git ${PROJECT_ROOT}-tune-${MACHINE_ID}
+cd ${PROJECT_ROOT}-tune-${MACHINE_ID}
 
 # 环境配置
 cat > .env_agent_infer << 'ENVEOF'
-export AGENT_INFER_ROOT="/data/metainferv3-tune-MACHINE_ID_PLACEHOLDER"
-export PYTHON_PATH="/opt/conda/envs/meta/bin"
-export MODEL_DIR="/data/models/Qwen3.6-27B"
+export AGENT_INFER_ROOT="${PROJECT_ROOT}-tune-MACHINE_ID_PLACEHOLDER"
+export PYTHON_PATH="${PYTHON_PATH:-/opt/conda/envs/meta/bin}"  # 替换为实际 conda/venv 路径
+export MODEL_DIR="${MODEL_DIR:-/path/to/model}"  # 替换为实际模型路径
 export PATH="${PYTHON_PATH}:$PATH"
 export PYTHONPATH="${AGENT_INFER_ROOT}:$PYTHONPATH"
 ENVEOF
@@ -281,7 +284,7 @@ EOF
 
 # 启动调优
 source .env_agent_infer
-claude -p "
+${CLAUDE_CLI} -p "
 你是 MetaInfer 主 Agent。
 目标模型 Qwen3.6 27B。CLAUDE.md Step 6 判定 KB 已覆盖 → 进入 master/MASTER.md 调优循环。
 无限迭代，用户退出才停。
@@ -316,7 +319,7 @@ claude -p "
 
 ### 学习机器（并行竞速）
 
-- [ ] bare repo 在 `/shared/metainferv3.git` 可被所有机器访问
+- [ ] bare repo 在 `${SHARED_REPO}/metainferv3.git` 可被所有机器访问
 - [ ] 每台机器 `git clone` 成功
 - [ ] `.env_agent_infer` 中 MACHINE_ID 正确（1/2/3 不重复）
 - [ ] `MODEL_DIR` 指向本机模型路径，`PYTHON_PATH` 指向本机 conda 环境
@@ -337,7 +340,7 @@ claude -p "
 
 ```bash
 # ═══════ 初始化 bare repo（一台共享机，只做一次） ═══════
-cd /data/whl-test/metainferv3
+cd ${PROJECT_ROOT}
 git init
 git add notebooks-cn/ .claude/ scripts/ AGENT_SKILL.md CLAUDE.md
 git add evolution/EVOLUTION.md evolution/scripts/call-evo-agent.sh
@@ -345,19 +348,19 @@ git add master/MASTER.md master/scripts/call-sub-agent.sh
 git add .claude/skills/ .claude/roles/
 git add .gitignore PROJECT_FLOW*.md DEPLOYMENT.md
 git commit -m "v3 baseline"
-git clone --bare . /shared/metainferv3.git
+git clone --bare . ${SHARED_REPO}/metainferv3.git
 
 # ═══════ 每台学习机器 ═══════
 MACHINE_ID=1  # 修改为 1/2/3
-git clone /shared/metainferv3.git /data/metainferv3-learn-${MACHINE_ID}
-cd /data/metainferv3-learn-${MACHINE_ID}
+git clone ${SHARED_REPO}/metainferv3.git ${PROJECT_ROOT}-learn-${MACHINE_ID}
+cd ${PROJECT_ROOT}-learn-${MACHINE_ID}
 # 编辑 .env_agent_infer（MODEL_DIR, PYTHON_PATH）
 ln -s /path/to/your/ref_projects/vllm knowledge/vllm
 ln -s /path/to/your/ref_projects/sglang knowledge/sglang
 mkdir -p evolution/strategies evolution/results
 # 写入 evolution/state.json（target_model=Qwen3.6-27B, entry_reason=coverage_fail）
 source .env_agent_infer
-claude -p "你是 MetaInfer 主 Agent。目标 Qwen3.6 27B。按 CLAUDE.md 流程图执行。"
+${CLAUDE_CLI} -p "你是 MetaInfer 主 Agent。目标 Qwen3.6 27B。按 CLAUDE.md 流程图执行。"
 
 # ═══════ 胜利检测（每轮进化后执行） ═══════
 git fetch origin
@@ -369,8 +372,8 @@ git commit -m "evolution: Qwen3.6 27B 进化成功 (machine ${MACHINE_ID})"
 git push origin main
 
 # ═══════ 调优机器 ═══════
-cd /data/metainferv3-tune
+cd ${PROJECT_ROOT}-tune
 git pull  # 拿到学习机写入的知识
 source .env_agent_infer
-claude -p "你是 MetaInfer 主 Agent。目标 Qwen3.6 27B。进入 master 循环。"
+${CLAUDE_CLI} -p "你是 MetaInfer 主 Agent。目标 Qwen3.6 27B。进入 master 循环。"
 ```

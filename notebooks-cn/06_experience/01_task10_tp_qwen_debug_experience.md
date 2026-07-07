@@ -86,7 +86,7 @@
 
 ## 5. 本轮验证结论
 
-- `torchrun --nproc_per_node=4 -m pytest tests/test_qwen_tp_real.py -v -s` 在 Dense Qwen3 上可通过（历史上曾报 `2 passed`；以当前用例与模型路径为准）。
+- `torchrun --nproc_per_node=${TP_SIZE} -m pytest tests/test_qwen_tp_real.py -v -s` 在 Dense Qwen3 上可通过（历史上曾报 `2 passed`；以当前用例与模型路径为准）。
 - 说明：
   - TP 分片加载链路可用；
   - 关键探针（权重 shape/device、logits device/shape、每 rank 显存）正常输出；

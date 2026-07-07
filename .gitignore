@@ -1,37 +1,23 @@
-# Python
+.env_agent_infer
+phase_report/
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-*.egg
-dist/
-build/
-.eggs/
+*.pyc
+knowledge/
+iterations/
 
-# Virtual environments
-.venv/
-venv/
-env/
+# 生成产物（每轮从零重建，不持久化）
+engine/
+llm_engine.py
+openai_tp_server.py
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
+# 进化状态（每台机器独立，不共享）
+evolution/state.json
+evolution/decision-log.jsonl
+evolution/strategies/
+evolution/results/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Tools
-.ruff_cache/
-.mypy_cache/
-.pytest_cache/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# uv
-uv.lock
+# 调优状态（每台机器独立，不共享）
+master/state.json
+master/decision-log.jsonl
+master/strategies/
+master/results/

@@ -1,6 +1,5 @@
 # TP Embedding & LM Head — API 契约
 
-> 蓝图来源: `framework_layer.data_flow_contracts.tp_layer_interface_contracts.tp_embedding_and_lm_head`
 > 关联 notebooks: —
 
 ## 概述

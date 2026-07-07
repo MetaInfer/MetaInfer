@@ -21,10 +21,10 @@
 
 **本文件是 implementer 的知识参考**。implementer 通过 **Agent 工具** 被主 Agent spawn，只写代码不跑测试。
 
-构建流程的完整控制权在 CLAUDE.md——三角色对抗串行（impl → spec → verify），spec-reviewer 和 verification 通过 **Shell `claude -p` 独立进程** 执行。详见 CLAUDE.md §进程隔离硬约束。
+构建流程的完整控制权在 CLAUDE.md——三角色对抗串行（impl → spec → verify），spec-reviewer 和 verification 通过 **Shell `${CLAUDE_CLI} -p` 独立进程** 执行。详见 CLAUDE.md §进程隔离硬约束。
 
 1. 代码实现由 **implementer 子 agent**（Agent 工具 spawn）完成；禁止主 Agent 自己写代码。
-2. spec-reviewer 通过 Shell `claude -p` 独立进程审查，verification 通过 Shell `claude -p` 独立进程验收。
+2. spec-reviewer 通过 Shell `${CLAUDE_CLI} -p` 独立进程审查，verification 通过 Shell `${CLAUDE_CLI} -p` 独立进程验收。
 3. 允许且仅允许开启 **1 个只读监控子代理**，职责仅限实时采集并汇报 HCU/VRAM 指标，**不得写代码**。
 4. 长任务仍按 **phase 分步**，默认目标是一次会话跑通 `phase_1 ~ phase_11`。
 
@@ -85,6 +85,10 @@
 8. **自下而上 + scripts/ 门禁**：严格按 §2.0 的 Phase 顺序构建（数值基元→TP通信→线性层→Embedding→Attention→Decoder→权重加载→框架外壳→引擎集成）。每 Phase 的 scripts/ 测试全部 PASS 后，才能进入下一 Phase。Agent 自写 tests/ 不能替代 scripts/。
 9. **知识回流（回路 C）**：master 循环 ADVANCE 后，experiment-summarizer 判定是否有可持久化知识 → 回流到 notebooks-cn/。所有 Agent 必须接受并利用回流后的知识库。
 10. **知识进化（回路 B）**：未知模型首次生成失败后，不得直接重试——必须委托 evolution/ 进化编排器，通过 Explorer → Implementer → Consolidator 闭环探索并固化新知识。禁止跳过进化直接盲改代码。
+11. **forward 逻辑与 weight loading 耦合设计（CRITICAL — Phase 5/6 强制）**：在实现 attention 和 MLP 的 forward 逻辑时，必须同步考虑后续 Phase 7 weight loading 的 shape 兼容性：
+    - 所有 `nn.Parameter`/`nn.Module` 的属性命名和 shape 必须与 HF 权重 key 兼容（对照 `notebooks-cn/00_contracts/weight_loading_contracts.md` §HF Key Mapping）
+    - `ModuleList` vs 单个 `Module` 的选择取决于 HF 权重是 per-head 独立参数还是所有 head 共享——在写 forward 逻辑前，先用 `safetensors.safe_open` 检查对应权重的实际 shape
+    - **禁止**"先写 forward 逻辑，以后 weight loading 再 adapt"——这会导致 Phase 7 发现不兼容后被迫重写 forward（DETOUR_ANALYSIS.md 发现 5: q_norm/k_norm 跨 3 Phase 反复修改）
 
 ### 1.1 面向可观测性设计（Design for Observability）
 
@@ -117,14 +121,14 @@
 在执行真实 TP 推理（Qwen3/DeepSeek-V2）期间，主 Agent 必须配合“只读监控子代理”输出如下证据：
 
 1. **HCU 监控范围**  
-   - 持续监控 `HCU 0,1,2,3` 的 HCU% 与 VRAM%（若机器实际设备数少于 5，需先打印可见设备清单并说明差异）。  
-2. **4 卡 TP 一致性**  
-   - `torchrun --nproc_per_node=4` 期间，参与 TP 的 4 张卡 VRAM% 需出现同量级且近似一致的区间。  
-3. **目标区间（经验阈值）**  
-   - Qwen3-8B 在 TP=4 推理时，每卡 VRAM% 约 `7%`（MODEL_DIR 指向 Qwen3-8B 目录）。  
-   - DeepSeek-V2-Lite-Chat 在 TP=4 推理时，每卡 VRAM% 约 `14%`（MODEL_DIR 指向 DeepSeek-V2-Lite-Chat 目录）。  
+   - 持续监控所有参与 TP 的 GPU 设备的 HCU% 与 VRAM%（启动时需先打印可见设备清单确认设备编号）。  
+2. **TP 多卡一致性**  
+   - `torchrun --nproc_per_node=${TP_SIZE}` 期间，参与 TP 的所有卡 VRAM% 需出现同量级且近似一致的区间。  
+3. **目标区间（经验参考值，具体取决于 GPU 显存容量和模型大小）**  
+   - 每卡 VRAM% ≈ 模型权重（bf16）/ TP_SIZE + KV cache + 运行时开销，占 GPU 总显存的比例。  
+   - 参考示例：Qwen3-8B TP=4 在 80GB GPU 上约 7%/卡；DeepSeek-V2-Lite-Chat TP=4 约 14%/卡。  
 4. **真实并行计算证据**  
-   - 测试窗口内需出现 HCU% `> 0` 的时刻，且至少覆盖 4 张 TP 卡。  
+   - 测试窗口内需出现 HCU% `> 0` 的时刻，且覆盖所有参与 TP 的卡。  
 5. **反作弊约束**  
    - 若仅有硬编码文本输出、无 HCU/VRAM 证据链，视为“假推理”，验收失败。
 
@@ -320,8 +324,8 @@ Rank 1-3: while True: cmd=broadcast_obj({}) → 相同 engine.generate()
 
 **启动方式**：
 ```bash
-TP_SIZE=4 PORT=9000 bash start_tp_infer_service.sh qwen   # 终端1
-PORT=9000 NUM_PROMPTS=50 REQUEST_RATE=1 bash run_myengine_benchmark.sh qwen  # 终端2 压测
+TP_SIZE=4 PORT=${PORT:-9000} bash start_tp_infer_service.sh qwen   # 终端1
+PORT=${PORT:-9000} NUM_PROMPTS=50 REQUEST_RATE=1 bash run_myengine_benchmark.sh qwen  # 终端2 压测
 ```
 
 ---
@@ -374,7 +378,7 @@ scripts/ 目录是知识体系的第一层（与 00_contracts/、AGENT_SKILL.md 
    - 不同 rank 下一致性
 3. **纯 Eager 模式**：一次任务必须完整覆盖 `phase_1_numeric_primitives` 到 `phase_10_e2e_acceptance`，不得只完成前两阶段就结束。
 4. `phase_10` 验收除文本正确性外，必须附带：
-   - 监控证据：4 卡 VRAM% 同量级 + HCU% 出现大于 0
+   - 监控证据：所有参与 TP 的卡 VRAM% 同量级 + HCU% 出现大于 0
    - 单层 CPU dispatch profiling（目标 < 15ms/layer）
    - Profiler 确认无 `torch.compile` / `CUDA Graph` 痕迹
    - **严禁** fake inference（硬编码输出冒充真实推理）

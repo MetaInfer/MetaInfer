@@ -1,6 +1,5 @@
 # 引擎集成 — API 契约
 
-> 蓝图来源: `framework_layer.components[6-7]` + `framework_layer.data_flow_contracts.scheduler_tp_runner_bridge`
 > 关联 notebooks: `01_framework_design/01_architecture.md`, `01_framework_design/07_request_lifecycle.md`
 
 ## 概述
@@ -15,13 +14,13 @@ LLMEngine (7 步构造 + 5 步 generate while-loop) + ModelRunner (prefill/decod
 ```python
 class LLMEngine:
     def __init__(self, model_dir, inference_backend="qwen_tp", max_num_seqs=256, block_size=256, temperature=0.0):
-        # Step 1: torch.cuda.set_device
+        # Step 1: device setup (portable pattern: device = torch.device(f'cuda:{local_rank}'))
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
         
         # Step 2: init dist if needed
         if not dist.is_initialized() and "RANK" in os.environ:
-            dist.init_process_group(backend="nccl")
+            dist.init_process_group(backend="nccl")  # NVIDIA→NCCL, AMD→RCCL (自动检测)
         
         # Step 3: Load model
         cfg = QwenTPConfig.from_model_dir(model_dir, tp_size, tp_rank)
@@ -31,8 +30,8 @@ class LLMEngine:
         model.eval()
         self.runner = ModelRunner(model)
         
-        # Step 4: EOS token
-        self.eos_token_id = 151643  # Qwen3 EOS
+        # Step 4: EOS token — 从 tokenizer 配置读取，禁止硬编码
+        self.eos_token_id = self.tokenizer.eos_token_id
         
         # Step 5: Estimate KV blocks
         self.num_kv_blocks = self._estimate_kv_blocks(cfg)
@@ -47,7 +46,7 @@ class LLMEngine:
 ### _estimate_kv_blocks 公式
 
 ```python
-total_mem = torch.cuda.get_device_properties(rank).total_memory
+total_mem = torch.cuda.get_device_properties(rank).total_memory  # NVIDIA: CUDA, AMD: ROCm (兼容层), DCU: 需适配
 allocated = torch.cuda.memory_allocated(rank)
 free_mem = total_mem - allocated - 2 * 1024**3  # reserve 2GB
 
