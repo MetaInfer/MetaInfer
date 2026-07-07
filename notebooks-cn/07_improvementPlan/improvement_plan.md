@@ -7,7 +7,7 @@
 | 项目 | 配置 |
 |------|------|
 | 模型 | DeepSeek-V2-Lite-Chat (~16B MoE) / Qwen3-8B |
-| GPU | NVIDIA A800 80GB PCIe, TP=4 (GPU 4,5,6,7) |
+| GPU | NVIDIA A800 80GB PCIe, TP=4 (GPU 4,5,6,7)（本机实测数据） |
 | 服务端 | `torchrun --nproc_per_node=4 openai_tp_server.py --backend tp` |
 | 压测脚本 | `run_compare_metainfer_vllm.sh dsv2` (SKIP_VLLM=1) |
 | 参数 | ROUNDS=25, STEPS=32, REQUEST_RATE=4, MAX_CONCURRENCY=1 |
@@ -37,7 +37,7 @@ output[4]=' 做面包的步骤可以分为以下几个主要部分：准备材�
 
 ### 1.3 性能基准 (Baseline)
 
-**DeepSeek-V2-Lite-Chat, TP=4, GPU 4,5,6,7**:
+**DeepSeek-V2-Lite-Chat, TP=4, GPU 4,5,6,7（本机实测数据）**:
 
 | 指标 | meta-infer (TP=4) | vLLM (典型值) | 差距倍数 |
 |------|-----------|-------------|---------|
@@ -60,7 +60,7 @@ output[4]=' 做面包的步骤可以分为以下几个主要部分：准备材�
 
 - batch_size 始终为 1
 - 每个请求 ~20s 生成 32 tokens
-- GPU 4 利用率 0%, GPU 5 利用率 100%（TP 负载不均）
+- GPU 4 利用率 0%, GPU 5 利用率 100%（TP 负载不均）（本机实测数据）
 - 日志双份输出（两个 rank 各打一份）
 
 ---
@@ -247,7 +247,7 @@ def schedule(self):
 - DeepSeek TP=4: PASSED（输出语义与基准一致，措辞因浮点累积有微小差异）
 - Qwen TP=4: PASSED（输出与基准高度一致）
 
-**性能验证** (DeepSeek-V2-Lite-Chat, TP=4, GPU 4,5,6,7):
+**性能验证** (DeepSeek-V2-Lite-Chat, TP=4, GPU 4,5,6,7, 本机实测数据):
 
 | 指标 | 基准 | P0 | 提升 |
 |------|------|-----|------|
@@ -356,7 +356,7 @@ def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 - **问题 2**: 之前 attention 使用动态切片 `k[:, :kv_len]`，形状每步变化，无法 CUDA Graph capture
 - **解决**: decode 路径改为全 buffer + attn_mask，保持固定形状
 
-**性能验证** (DeepSeek-V2-Lite-Chat, TP=4, GPU 4,5,6,7):
+**性能验证** (DeepSeek-V2-Lite-Chat, TP=4, GPU 4,5,6,7, 本机实测数据):
 
 | 指标 | P0+P5 | P2 | 提升 |
 |------|-------|-----|------|
@@ -504,7 +504,7 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 - DeepSeek TP=4 PASSED（输出与基准语义一致，微小措辞差异为浮点累积）
 - Qwen TP=4 PASSED（输出与基准完全一致）
 
-**性能验证**: 由于 GPU 4-7 上有其他进程竞争（~28GB/卡），无法获得公平的性能对比数据。P3 改动对 DeepSeek 是纯清理（移除死代码），对 Qwen 省去了 `repeat_interleave` 拷贝，理论上 decode 每步节省 ~0.1ms。
+**性能验证**: 由于 GPU 4-7 上有其他进程竞争（~28GB/卡）（本机实测数据），无法获得公平的性能对比数据。P3 改动对 DeepSeek 是纯清理（移除死代码），对 Qwen 省去了 `repeat_interleave` 拷贝，理论上 decode 每步节省 ~0.1ms。
 
 **参考代码路径**:
 - PyTorch SDPA 文档: `torch.nn.functional.scaled_dot_product_attention`
@@ -553,22 +553,22 @@ def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 - **解决**: 删除重复的 `out = out.permute(...).contiguous().view(...)` 行
 
 **正确性验证**:
-- Qwen3-8B TP=4 (meta conda env): PASSED
-- DeepSeek-V2-Lite TP=4 (meta conda env): PASSED
+- Qwen3-8B TP=4: PASSED
+- DeepSeek-V2-Lite TP=4: PASSED
 
 **性能验证**（DeepSeek-V2-Lite, TP=4, ROUNDS=10, STEPS=8）:
 
 | 版本 | GPU | 空闲显存 | 吞吐 (tok/s) | 变化 |
 |------|-----|---------|-------------|------|
-| P2 基线 | GPU 4-7 | 30GB | 9.12 | 基准 |
-| P3-FA 方案 A (切片) | GPU 4-7 | 30GB | 7.29 | -20% |
-| P2 基线 | GPU 0-3 | 20GB | 0.82 | 基准 |
-| P3-FA 方案 C (V-pad) | GPU 0-3 | 20GB | 0.70 | -15% |
+| P2 基线 | GPU 4-7（本机实测数据） | 30GB | 9.12 | 基准 |
+| P3-FA 方案 A (切片) | GPU 4-7（本机实测数据） | 30GB | 7.29 | -20% |
+| P2 基线 | GPU 0-3（本机实测数据） | 20GB | 0.82 | 基准 |
+| P3-FA 方案 C (V-pad) | GPU 0-3（本机实测数据） | 20GB | 0.70 | -15% |
 
 **结论**: P3-FA 正确性验证通过，但性能在当前 GPU 环境下有 15-20% 回退。需要 GPU 有 30GB+ 空闲时重新测试 V-padding 方案。
 
 **参考**:
-- flash_attn 2.8.3 最大 headdim=256（FA2 限制）
+- flash_attn 2.8.3 最大 headdim=256（FA2 限制，版本特定约束）
 - vLLM 在 A800 上对 MLA 使用 FA2 标准模式（拼接 rope/nope），但 DeepSeek-V2 全量版 QK headdim=576 > 256，需 FA3/FlashMLA
 - DeepSeek-V2-Lite 的 QK headdim=192 < 256，可用 FA2，但 K/V headdim 不同（192 vs 128）需 V-padding
 - vLLM 参考: `cu_seqlens_k` 标记有效边界，值变化但 shape 固定 `[2]`，不触发 torch.compile 重编译
@@ -623,7 +623,7 @@ QK = q_nope_proj @ c_kv^T + q_pe_rope @ k_pe_raw^T  ← 错误!
 QK = q_nope_proj @ c_kv^T + q_pe_rope @ k_pe_rope^T  ← 正确
 ```
 
-**性能验证** (DeepSeek-V2-Lite, TP=4, GPU 0-3, ROUNDS=5, STEPS=8):
+**性能验证** (DeepSeek-V2-Lite, TP=4, GPU 0-3, ROUNDS=5, STEPS=8, 本机实测数据):
 
 | 版本 | 吞吐 (tok/s) | 变化 |
 |------|-------------|------|
@@ -655,7 +655,7 @@ QK = q_nope_proj @ c_kv^T + q_pe_rope @ k_pe_rope^T  ← 正确
 | MergedColumnParallelLinear + Triton `silu_and_mul` kernel | -43.7% (7.08 tok/s) | Triton launch overhead 在 decode 小 tensor (bsz=1,seqlen=1) 上 >> PyTorch 原生 elementwise |
 | MergedColumnParallelLinear + PyTorch `F.silu * mul` | +1.4% (12.76 tok/s) | 1 次 GEMM 替代 2 次，无 Triton overhead |
 
-**性能验证** (Qwen3-8B, TP=4, GPU 0-3, ROUNDS=5, STEPS=8):
+**性能验证** (Qwen3-8B, TP=4, GPU 0-3, ROUNDS=5, STEPS=8, 本机实测数据):
 
 | 版本 | 吞吐 (tok/s) | 变化 |
 |------|-------------|------|

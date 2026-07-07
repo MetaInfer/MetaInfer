@@ -3,7 +3,7 @@
 > **版本**: v6 — custom op 精简版（torch.compile + CUDAGraphWrapper + torch.library.custom_op）  
 > **当前状态**: 阶段零/一/二 已完成 ✅，阶段三 方案已锁定待实施  
 > **目标**: Qwen3-8B TP=4 CPU dispatch 548ms → <50ms，吞吐 53.9 → 100+ tok/s  
-> **唯一真源**: `/tmp/prof_vllm_cudagraph_tp4/` rank-0 JSON trace (2,595,861 events, 48 `cudaGraphLaunch`)  
+> **唯一真源**: `/tmp/prof_vllm_cudagraph_tp4/` rank-0 JSON trace (2,595,861 events, 48 `cudaGraphLaunch`)（历史 profiling 数据，复现时需重新采集）  
 > **铁律**: 正文中每一处设计决策必须有 Trace 物理事实或 vLLM 源码行号支撑。严禁脑补。
 
 ---
@@ -86,7 +86,7 @@ Pytorch 编译器（torch.compile）在追踪要编译的函数时，会检查�
 
 ### 0.3 物理 Trace 事实速查
 
-> 来源: `/tmp/prof_vllm_cudagraph_tp4/` rank-0 JSON (2,595,861 events, 48 `cudaGraphLaunch`)
+> 来源: `/tmp/prof_vllm_cudagraph_tp4/` rank-0 JSON (2,595,861 events, 48 `cudaGraphLaunch`)（历史 profiling 数据，复现时需重新采集）
 
 | 编号 | 物理观察 | 数值 | 证据 | 对应阶段 |
 |------|---------|------|------|---------|
@@ -506,8 +506,8 @@ TP=4 的 6-11% 提升来自 CUDA Graph 减少了 CPU dispatch 开销，但仍走
 ### 3.3-A: meta-infer vs vLLM 三场景 Profiling 对比 (2026-05-26)
 
 > **环境**: Qwen3-8B, GPU 0-3 (A800 80GB), 12 output tokens, temperature=0
-> **meta-infer**: meta conda env (PyTorch 2.9.1), commit `feature/tp-implementation`
-> **vLLM**: meta conda env (vLLM 0.15.1), `max_model_len=1024, gpu_memory_utilization=0.85`
+> **meta-infer**: PyTorch 2.9.1（测试环境参考）, commit `feature/tp-implementation`
+> **vLLM**: vLLM 0.15.1, `max_model_len=1024, gpu_memory_utilization=0.85`
 > **方法**: 5 轮 warmup + 5 轮测量取平均，`torch.cuda.synchronize()` + `time.perf_counter()` 计时
 > **代码修复**: 将 `forward_decode` 拆为两版本——eager 版（无 clone，`CUDA_GRAPH=0`）和 graph 版（clone 输入，`CUDA_GRAPH=1`），消除了之前无条件 clone 造成的 ~15% 性能回退
 
@@ -910,7 +910,7 @@ git commit -m "feat(cudagraph): pass stage_3b_reduce_overhead_no_mutated_inputs
 
 ## 附录 A: vLLM Trace 物理事实全集
 
-来源: `/tmp/prof_vllm_cudagraph_tp4/` rank-0 JSON trace (2,595,861 events)
+来源: `/tmp/prof_vllm_cudagraph_tp4/` rank-0 JSON trace (2,595,861 events)（历史 profiling 数据，复现时需重新采集）
 
 | 编号 | 物理观察 | 数值 | 证据 |
 |------|---------|------|------|

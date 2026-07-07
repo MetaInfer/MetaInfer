@@ -1,6 +1,5 @@
 # TP 通信原语 — API 契约
 
-> 蓝图来源: `framework_layer.data_flow_contracts.tp_layer_interface_contracts.tp_distributed_runtime`
 > 关联 notebooks: —
 
 ## 概述
@@ -51,7 +50,7 @@ def all_gather_last_dim(x):
 
 ### CustomAR (P2P All-Reduce)
 
-- **来源**: `vllm/_custom_ops.py:640-680`
+- **语义**: 可选的 P2P all-reduce 优化，通过 CUDA IPC handle 交换实现跨进程的 GPU 内存直接访问。初始化失败时自动 fallback 到 NCCL/RCCL all_reduce。
 - **约束**: out-of-place (输出新 tensor，非输入别名)
 - **初始化时机**: `load_weights` 后、首次 forward 前
 - **依赖**: gloo ProcessGroup (用于 IPC handle exchange)
@@ -106,14 +105,14 @@ ops.register_buffer(self._ptr, buf_ptrs)
 ### Required imports
 
 ```python
-from vllm import _custom_ops as ops
-# ops.allocate_shared_buffer_and_handle(size) -> (int, bytes)
-# ops.open_mem_handle(ipc_handle) -> int
-# ops.init_custom_ar(meta_ptrs, rank_data, rank, fully_connected) -> int
-# ops.register_buffer(ptr, buf_ptrs) -> None
-# ops.all_reduce(ptr, inp, out, reg_buffer, reg_buffer_sz_bytes) -> None
-# ops.dispose(ptr) -> None
-# ops.meta_size() -> int
+# 实现层通过 engine/kernels/vllm_wrappers.py 导入，契约层只定义接口语义：
+# ops.allocate_shared_buffer_and_handle(size) -> (int, bytes)  — 分配共享内存并返回指针+IPC handle
+# ops.open_mem_handle(ipc_handle) -> int                       — 打开远程 IPC handle 获取本地指针
+# ops.init_custom_ar(meta_ptrs, rank_data, rank, fully_connected) -> int  — 初始化 P2P all-reduce 状态
+# ops.register_buffer(ptr, buf_ptrs) -> None                   — 注册 staging buffer
+# ops.all_reduce(ptr, inp, out, reg_buffer, reg_buffer_sz_bytes) -> None  — 执行 P2P all-reduce
+# ops.dispose(ptr) -> None                                     — 释放 P2P all-reduce 资源
+# ops.meta_size() -> int                                       — 获取元数据大小
 ```
 
 ---
@@ -121,7 +120,7 @@ from vllm import _custom_ops as ops
 ## 陷阱与反模式
 
 - **FM-005**: dist.all_gather_object 需要 gloo ProcessGroup — NCCL 不支持 object collectives
-- **CUSTOMAR-001**: init_custom_ar 必须在 try/except 内 — `open_mem_handle` 在某些 CUDA 版本/容器环境下会抛 "Cannot access data pointer" 异常。失败后 `_custom_ar_handle = None` 触发 NCCL fallback
+- **CUSTOMAR-001**: init_custom_ar 必须在 try/except 内 — IPC handle 交换可能因平台/容器限制而失败（如 "Cannot access data pointer" 异常）。失败后 `_custom_ar_handle = None` 触发 NCCL/RCCL fallback
 - **CUSTOMAR-002**: world_size=1 时 init_custom_ar 立即 return (no-op)
 - **COMM-001**: 各 rank `load_weights` 后必须 `dist.barrier()` 再 `init_custom_ar()`
 - **COMM-002**: TP 采样协议 — 仅 rank 0 执行采样，`dist.broadcast` 给所有 rank。严禁各 rank 独立采样

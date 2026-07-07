@@ -2,7 +2,7 @@
 
 > 日期: 2026-06-07
 > 模型: Qwen3-8B (4096 hidden, 36 layers, 32 heads, 8 KV heads, 12288 intermediate)
-> 环境: A800-SXM4-80GB × 4, PyTorch 2.x, CUDA 12.x
+> 环境: A800-SXM4-80GB × 4, PyTorch 2.x, CUDA 12.x（测试环境参考）
 
 ---
 

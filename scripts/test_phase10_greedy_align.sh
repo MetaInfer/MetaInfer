@@ -167,7 +167,7 @@ fi  # SINGLE_GPU_SKIP
 # ================================================================
 # Step 2: TP=4 torchrun test
 # ================================================================
-TP_SIZE=4
+TP_SIZE=${TP_SIZE:-4}
 
 echo ""
 echo "[GREEDY-ALIGN-002] TP=${TP_SIZE} torchrun test..."

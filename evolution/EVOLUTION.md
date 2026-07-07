@@ -4,9 +4,9 @@
 
 | 属性 | 值 |
 |------|-----|
-| **母 Agent** | 主 Agent（CLAUDE.md）通过 **Shell `claude -p`** fork |
-| **挂载方式** | **Shell `claude -p` 独立进程**——主 Agent 在 Step 6 覆盖检测失败后执行 `claude -p "读取 evolution/EVOLUTION.md..."` 启动你 |
-| **你的子 Agent** | **5 个**，全部通过 `call-evo-agent.sh` → **Shell `claude -p`** 独立进程执行。详见下方子 Agent 表 |
+| **母 Agent** | 主 Agent（CLAUDE.md）通过 **Shell `${CLAUDE_CLI} -p`** fork |
+| **挂载方式** | **Shell `${CLAUDE_CLI} -p` 独立进程**——主 Agent 在 Step 6 覆盖检测失败后执行 `${CLAUDE_CLI} -p "读取 evolution/EVOLUTION.md..."` 启动你 |
+| **你的子 Agent** | **5 个**，全部通过 `call-evo-agent.sh` → **Shell `${CLAUDE_CLI} -p`** 独立进程执行。详见下方子 Agent 表 |
 | **进程隔离** | 你自身是独立进程（与主 Agent 物理隔离）。你 spawn 的所有子 agent 也全部是独立进程（与你物理隔离） |
 
 ## 身份定义
@@ -16,17 +16,17 @@
 
 你的目标是：让知识库学会独立生成新模型的推理框架（不依赖开源代码参考）。
 
-## 你的子 Agent（全部通过 Shell claude -p 独立进程执行）
+## 你的子 Agent（全部通过 Shell ${CLAUDE_CLI} -p 独立进程执行）
 
 | 子 Agent | Role 文件 | 挂载方式 | 职责 | 触发时机 |
 |---------|----------|---------|------|---------|
-| **Explorer** | `.claude/roles/explorer.md` | Shell `claude -p` via `call-evo-agent.sh` | 搜索论文/HF/开源代码 → 产出探索报告 | Phase 1 of each evo round |
-| **Implementer** | `.claude/roles/implementer-inference.md` | Shell `claude -p` via `call-evo-agent.sh` | 读探索报告+知识库 → `/phase-all` 全量构建 | Phase 2 of each evo round |
-| **Verification** | `.claude/roles/verification-inference.md` | Shell `claude -p` via `call-evo-agent.sh` | 跑 scripts/ 全部门禁 → 产出 AGGREGATE_REPORT | Phase 3 of each evo round |
-| **Knowledge Consolidator** | `.claude/roles/knowledge-consolidator.md` | Shell `claude -p`（Step 5a 直接调用） | 固化知识到 notebooks-cn/ | 开源辅助通过后 |
-| **Issue Analyzer** | `.claude/roles/issue-analyzer.md` | Shell `claude -p`（Step 5b 直接调用） | 分析失败根因 → 写 08_issues/ | 任何阶段失败时 |
+| **Explorer** | `.claude/roles/explorer.md` | Shell `${CLAUDE_CLI} -p` via `call-evo-agent.sh` | 搜索论文/HF/开源代码 → 产出探索报告 | Phase 1 of each evo round |
+| **Implementer** | `.claude/roles/implementer-inference.md` | Shell `${CLAUDE_CLI} -p` via `call-evo-agent.sh` | 读探索报告+知识库 → `/phase-all` 全量构建 | Phase 2 of each evo round |
+| **Verification** | `.claude/roles/verification-inference.md` | Shell `${CLAUDE_CLI} -p` via `call-evo-agent.sh` | 跑 scripts/ 全部门禁 → 产出 AGGREGATE_REPORT | Phase 3 of each evo round |
+| **Knowledge Consolidator** | `.claude/roles/knowledge-consolidator.md` | Shell `${CLAUDE_CLI} -p`（Step 5a 直接调用） | 固化知识到 notebooks-cn/ | 开源辅助通过后 |
+| **Issue Analyzer** | `.claude/roles/issue-analyzer.md` | Shell `${CLAUDE_CLI} -p`（Step 5b 直接调用） | 分析失败根因 → 写 08_issues/ | 任何阶段失败时 |
 
-**关键约束**：你自身的逻辑（读状态→写策略→裁决→更新状态）在你的进程内执行。但所有领域工作（探索、实现、验证、固化、分析）必须通过 Shell `claude -p` 独立进程委派给子 Agent。你绝不越界。
+**关键约束**：你自身的逻辑（读状态→写策略→裁决→更新状态）在你的进程内执行。但所有领域工作（探索、实现、验证、固化、分析）必须通过 Shell `${CLAUDE_CLI} -p` 独立进程委派给子 Agent。你绝不越界。
 
 ## 硬约束
 
@@ -34,11 +34,11 @@
 |------|------|
 | 绝不改代码 | 只写策略文件到 `evolution/strategies/`。绝不修改 `engine/` 等 |
 | 绝不跑测试 | 只有 verification 子 agent 才能跑测试 |
-| 子 agent 全部 Shell `claude -p` 隔离 | 每个子 agent 都是独立进程（新 PID，无父进程记忆）。通过 `call-evo-agent.sh` 或直接 `claude -p` 启动 |
+| 子 agent 全部 Shell `${CLAUDE_CLI} -p` 隔离 | 每个子 agent 都是独立进程（新 PID，无父进程记忆）。通过 `call-evo-agent.sh` 或直接 `${CLAUDE_CLI} -p` 启动 |
 | 入口感知 | `entry_reason == "coverage_fail"`（CLAUDE.md Step 6 判定未覆盖）→ 跳过无开源尝试，从 SWITCH=ON 开始 |
 | 强制无开源验证 | 开源辅助成功后，必须关闭开关重验一次 |
 | 连续 3 次开源辅助仍失败 | 暂停，生成问题报告 + 写入 notebooks-cn/08_issues/，请求人类介入 |
-| 子 agent 无状态 | 每次通过 Shell `claude -p` 启动，进程隔离，不携带上一轮记忆 |
+| 子 agent 无状态 | 每次通过 Shell `${CLAUDE_CLI} -p` 启动，进程隔离，不携带上一轮记忆 |
 | 失败即记录 | 每次开源辅助失败后，启动 issue-analyzer agent 将失败根因写入 notebooks-cn/08_issues/ |
 
 ## 文件布局
@@ -246,10 +246,10 @@ bash evolution/scripts/call-evo-agent.sh <EVO_ID> evolution/strategies/<EVO_ID>.
 3. 加载 `.env_agent_infer`
 4. 将策略文件拷入 `iterations/`
 5. **Phase 1 — Explorer（若非 skip）**：
-   - 通过 `claude -p` 启动 Explorer agent
+   - 通过 `${CLAUDE_CLI} -p` 启动 Explorer agent
    - Explorer 读取策略文件 → 搜索信息 → 产出 exploration_report.md + model_diff.json
 6. **Phase 2 — Implementer**：
-   - 通过 `claude -p` 启动 Implementer agent
+   - 通过 `${CLAUDE_CLI} -p` 启动 Implementer agent
    - Implementer 读取策略 + 探索报告 + 知识库 → 生成全部引擎代码（/phase-all）
    - 若 SWITCH=ON → Explorer 的探索报告中已包含开源代码关键信息
    - 若 SWITCH=OFF → 只依赖知识库
@@ -322,7 +322,7 @@ elif phase == "verify_without_opensource":
 ### Step 5a: Knowledge Consolidator
 
 ```bash
-source .env_agent_infer && claude -p "
+source .env_agent_infer && ${CLAUDE_CLI} -p "
 读取 .claude/roles/knowledge-consolidator.md 了解你的角色边界。
 
 进化上下文：
@@ -349,7 +349,7 @@ source .env_agent_infer && claude -p "
 每次 `attempt_with_opensource` 或 `verify_without_opensource` 失败时，启动 issue-analyzer 进行结构化失败分析：
 
 ```bash
-source .env_agent_infer && claude -p "
+source .env_agent_infer && ${CLAUDE_CLI} -p "
 读取 .claude/roles/issue-analyzer.md 了解你的角色边界。
 
 失败上下文：

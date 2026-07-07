@@ -1,6 +1,5 @@
 # TP 线性层 — API 契约
 
-> 蓝图来源: `framework_layer.data_flow_contracts.tp_layer_interface_contracts.tp_linear_layers`
 > 关联 notebooks: `04_parallel_strategies/qwen_dense_tp_implementation_guide.md`
 
 ## 概述
@@ -86,20 +85,23 @@ else:
 
 ---
 
-## 维度验证 (Qwen3-8B TP=4)
+## 维度验证 (示例: Qwen3-8B TP=4)
 
-| 参数 | 值 |
-|------|-----|
-| hidden_size | 4096 |
-| intermediate_size | 12288 |
-| num_attention_heads | 32 |
-| num_key_value_heads | 8 |
-| head_dim | 128 |
-| q_size per rank | 1024 (8×128) |
-| kv_size per rank | 256 (2×128) |
-| qkv_weight per rank | [1536, 4096] |
-| gate_up_weight per rank | [6144, 4096] |
-| intermediate per rank | 3072 |
+> **⚠️ 这是特定模型的验证示例，不是通用规范。** 不同模型/TP size 会产生不同的 per-rank 维度。
+> 表中数值 = 模型全量值 / tp_size 的计算结果。
+
+| 参数 | 计算方式 | 示例值 (Qwen3-8B, TP=4) |
+|------|---------|----------------------|
+| hidden_size | config.json → hidden_size | 4096 |
+| intermediate_size | config.json → intermediate_size | 12288 |
+| num_attention_heads | config.json → num_attention_heads | 32 |
+| num_key_value_heads | config.json → num_key_value_heads | 8 |
+| head_dim | config.json → head_dim | 128 |
+| q_size per rank | num_heads * head_dim | 1024 (8×128) |
+| kv_size per rank | num_kv_heads_local * head_dim | 256 (2×128) |
+| qkv_weight per rank | [q_size+2*kv_size, hidden_size] | [1536, 4096] |
+| gate_up_weight per rank | [2*intermediate/tp, hidden_size] | [6144, 4096] |
+| intermediate per rank | intermediate_size / tp_size | 3072 |
 
 ---
 

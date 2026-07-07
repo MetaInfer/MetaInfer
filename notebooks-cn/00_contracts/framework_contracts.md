@@ -1,6 +1,5 @@
 # 框架外壳 — API 契约
 
-> 蓝图来源: `framework_layer.components[0-5]` + `framework_layer.data_flow_contracts.scheduler_to_runner`
 > 关联 notebooks: `01_framework_design/02_scheduler.md`, `01_framework_design/03_kv_cache.md`
 
 ## 概述

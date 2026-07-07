@@ -125,7 +125,7 @@ if [ "$EXPLORER_MODE" != "skip" ]; then
     fi
 
     set +e
-    claude -p "
+    ${CLAUDE_CLI:-claude} -p "
 读取 .claude/roles/explorer.md 了解你的角色边界。
 
 探索目标模型: ${TARGET_MODEL}
@@ -181,7 +181,7 @@ if [ "$OPEN_SOURCE_ENABLED" = "true" ]; then
 fi
 
 set +e
-claude -p "
+${CLAUDE_CLI:-claude} -p "
 读取 .claude/roles/implementer-inference.md 了解你的角色边界。
 
 你的 Task：为模型 ${TARGET_MODEL} 实现完整的推理框架。
@@ -221,7 +221,7 @@ echo "  Phase 3: Verification Agent"
 echo "═══════════════════════════════════════════"
 
 set +e
-claude -p "
+${CLAUDE_CLI:-claude} -p "
 读取 .claude/roles/verification-inference.md 了解你的角色边界。
 
 验收对象：./engine/、./llm_engine.py、./openai_tp_server.py

@@ -12,7 +12,7 @@
 #   === full 模式（首轮）===
 #   1. 清空引擎代码层（保留知识文档 + master/ + iterations/）
 #   2. 加载 .env_agent_infer + 拷贝策略文件到 iterations/
-#   3. 通过 claude -p 启动子 agent（进程隔离）
+#   3. 通过 ${CLAUDE_CLI} -p 启动子 agent（进程隔离）
 #      → 子 agent 读知识文档 + 策略，通过 /phase-all 从零生成完整引擎
 #      → 每 Phase 的 scripts/test_phaseN_* 全部 PASS 后才进入下一 Phase
 #      → Phase 10/11 完成 benchmark + greedy align 实验
@@ -25,7 +25,7 @@
 #   === incremental 模式（后续轮次）===
 #   1. 检查引擎代码存在（不清理）
 #   2. 加载 .env_agent_infer + 拷贝策略文件到 iterations/
-#   3. 通过 claude -p 启动子 agent（进程隔离）
+#   3. 通过 ${CLAUDE_CLI} -p 启动子 agent（进程隔离）
 #      → 子 agent 读已有代码 + 策略 changes[]
 #      → 通过 /phase-modify 增量应用变更
 #      → 只运行受影响 Phase 的 scripts/ 门禁
@@ -236,7 +236,7 @@ echo "${SUBAGENT_PROMPT}" > "${PROMPT_FILE}"
 set +e
 cd "${PROJECT_ROOT}"
 source "${ENV_FILE}" 2>/dev/null || true
-claude-code-best -p "$(cat ${PROMPT_FILE})" \
+${CLAUDE_CLI:-claude} -p "$(cat ${PROMPT_FILE})" \
     --output-format text \
     --allowedTools "Bash(*:*) Read(*:*) Write(*:*) Edit(*:*) Glob(*:*) Grep(*:*) Skill(*:*) Agent(*:*) Task(*:*)"
 SUBAGENT_EXIT=$?

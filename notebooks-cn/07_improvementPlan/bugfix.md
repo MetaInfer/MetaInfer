@@ -191,10 +191,10 @@ Phase 9 (引擎集成) 首次触发端到端 `generate()` 流程，暴露了前 
 
 ---
 
-## Bug 5: flash_attn 2.8.3 API 签名不兼容
+## Bug 5: flash_attn 2.8.3 API 签名不兼容（特定版本的已知问题，其他版本可能不同）
 
 - **症状**: `flash_attn_with_kvcache` 使用 positional args 调用时参数错位，导致 CUDA kernel 参数 mismatch 或静默数值错误。
-- **发现过程**: Phase 9 环境安装了 flash_attn 2.8.3，其 `flash_attn_with_kvcache` 签名在中间增加了 `softmax_scale` 等新参数。Phase 5 的 positional arg 写法与新签名不兼容。真实引擎 `meta-infer/engine/kernels/custom_ops.py` 使用 keyword args，验证了修复方向。
+- **发现过程**: Phase 9 环境安装了 flash_attn 2.8.3（特定版本的已知问题，其他版本可能不同），其 `flash_attn_with_kvcache` 签名在中间增加了 `softmax_scale` 等新参数。Phase 5 的 positional arg 写法与新签名不兼容。真实引擎 `engine/kernels/custom_ops.py` 使用 keyword args，验证了修复方向。
 - **根因**: flash_attn 不同版本间 `flash_attn_with_kvcache` 参数顺序有变化。修复前全部使用 positional args：
   ```python
   # 修复前 (qwen.py:266-269):
@@ -214,11 +214,11 @@ Phase 9 (引擎集成) 首次触发端到端 `generate()` 流程，暴露了前 
       causal=False)
   ```
   与真实引擎 `meta-infer/engine/kernels/custom_ops.py:16-28` 一致。
-- **为什么单卡/前序 Phase 测试没发现**: Phase 5 测试时可能使用了不同版本 flash_attn，API 签名与 2.8.3 不同。
+- **为什么单卡/前序 Phase 测试没发现**: Phase 5 测试时可能使用了不同版本 flash_attn，API 签名与 2.8.3 不同（特定版本的已知问题，其他版本可能不同）。
 - **关联 Phase**: Phase 5 (Attention — flash_attn_with_kvcache 调用)
 - **关联文件**:
   - [engine/models/qwen.py:269-274](engine/models/qwen.py#L269)
-  - `/home/honglin/meta-infer/engine/kernels/custom_ops.py:16-28` (参考实现)
+  - `engine/kernels/custom_ops.py:16-28` (参考实现)
 
 ---
 
@@ -312,7 +312,7 @@ Phase 9 (引擎集成) 首次触发端到端 `generate()` 流程，暴露了前 
 - **关联 Phase**: Phase 2 (TP 通信)
 - **关联文件**:
   - [engine/tp_layers/distributed.py:132](engine/tp_layers/distributed.py#L132)
-  - `/home/honglin/meta-infer/engine/tp_layers/custom_ar.py:76` (参考实现)
+  - `engine/tp_layers/custom_ar.py:76` (参考实现)
 
 ---
 

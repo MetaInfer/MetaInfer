@@ -5,7 +5,7 @@
 | 项目 | 配置 |
 |------|------|
 | 模型 | DeepSeek-V2-Lite-Chat (~16B MoE) / Qwen3-8B |
-| GPU | NVIDIA A800 80GB PCIe × 4, TP=4 |
+| GPU | NVIDIA A800 80GB PCIe × 4, TP=4（本机实测数据） |
 | 压测参数 | ROUNDS=5, STEPS=8, REQUEST_RATE=4, MAX_CONCURRENCY=1 |
 
 ---

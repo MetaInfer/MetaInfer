@@ -338,10 +338,10 @@ out = out_triton
 **验证删除后正确性**:
 ```bash
 # 运行端到端测试确认输出与基线一致
-PYTHONPATH=$(pwd):$PYTHONPATH CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 -c "
+PYTHONPATH=$(pwd):$PYTHONPATH CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} torchrun --nproc_per_node=${TP_SIZE} -c "
 import os; os.environ['META_INFER_LOG_RANK0_ONLY']='1'
 from llm_engine import LLMEngine; from pathlib import Path
-e = LLMEngine(model_dir=Path('.../models/deepseek-ai/DeepSeek-V2-Lite-Chat'), inference_backend='deepseek_tp', max_num_seqs=4)
+e = LLMEngine(model_dir=Path('${MODEL_DIR}'), inference_backend='deepseek_tp', max_num_seqs=4)
 if int(os.environ.get('RANK','0'))==0: print(e.generate('苏州园林的特点是', max_new_tokens=24, temperature=0.0))
 "
 ```
@@ -350,7 +350,7 @@ if int(os.environ.get('RANK','0'))==0: print(e.generate('苏州园林的特点�
 
 ```bash
 # 对比 P3-FA (V-padding) vs Triton MLA 的吞吐
-SKIP_VLLM=1 CUDA_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 ROUNDS=10 STEPS=8 \
+SKIP_VLLM=1 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} TP_SIZE=${TP_SIZE} ROUNDS=10 STEPS=8 \
   bash run_compare_metainfer_vllm.sh dsv2
 ```
 
@@ -358,7 +358,7 @@ SKIP_VLLM=1 CUDA_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 ROUNDS=10 STEPS=8 \
 
 | 风险 | 影响 | 缓解 |
 |------|------|------|
-| Triton kernel 在 A800 上性能不如 FA2 | 收益不确定 | 先 benchmark 单层 kernel 耗时再决定 |
+| Triton kernel 在 A800（测试 GPU）上性能不如 FA2 | 收益不确定 | 先 benchmark 单层 kernel 耗时再决定 |
 | W_UK_T / W_UV bmm 增加额外计算 | decode 每步多 2 次小矩阵乘 | bmm [H,1,128]@[H,128,128] 极快 (~1us) |
 | KV cache 格式变更影响 prefill | prefill 需要适配 | prefill 仍用 FA2，只改 cache 写入 |
 | torch.compile 与 Triton kernel 冲突 | 可能 graph break | Triton kernel 放在 compile 外或用 custom op |

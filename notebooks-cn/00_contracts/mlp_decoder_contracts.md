@@ -1,6 +1,5 @@
 # MLP & Decoder Layer — API 契约
 
-> 蓝图来源: `framework_layer.data_flow_contracts.tp_layer_interface_contracts.qwen3_tp_model_interfaces.mlp` + `.decode_forward_pattern` + `.prefill_forward_pattern`
 > 关联 notebooks: `07_improvementPlan/kernel_replacement_plan.md` §三
 
 ## 概述

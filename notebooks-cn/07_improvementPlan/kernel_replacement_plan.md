@@ -2,7 +2,7 @@
 
 > **状态**: 全部 Stage 已完成 ✅ — Stage 8 CUDA Graph + paged attention 已实现  
 > **核心理念**: vLLM = 高性能算子标品库，提取成熟 C++/CUDA Kernel，按 Trace 顺序组装  
-> **基准数据**: stag1.md + `/tmp/prof_vllm_qwen_tp4/` (vLLM Qwen3-8B TP=4, 12 steps)
+> **基准数据**: stag1.md + `/tmp/prof_vllm_qwen_tp4/` (vLLM Qwen3-8B TP=4, 12 steps)（历史参考数据，复现时需重新采集）
 
 ---
 
@@ -26,7 +26,7 @@
 
 ### 1.1 vLLM Qwen3-8B TP=4 Decode Trace 实拍 (12 steps: 1 prefill + 11 decode)
 
-来源: `/tmp/prof_vllm_qwen_tp4/profiler_out_0.txt` (rank-0 GPU kernel trace)
+来源: `/tmp/prof_vllm_qwen_tp4/profiler_out_0.txt` (rank-0 GPU kernel trace)（历史参考数据，复现时需重新采集）
 
 | 排名 | vLLM Kernel | GPU Time | 调用数 | 每步调用 | 对应 meta-infer 当前实现 | Plan 覆盖 |
 |------|------------|----------|--------|---------|------------------------|----------|
@@ -627,9 +627,9 @@ Stage 0: 提取代码片段 + cos_sin_cache → 本计划文档中的 Snippets A
 
 ### 当前最佳表现: meta-infer nocompile vs vLLM (2026-05-26 更新)
 
-> **环境**: Qwen3-8B, TP=4, GPU 0-3 (A800 80GB), 12 output tokens, temperature=0
+> **环境**: Qwen3-8B, TP=4, GPU 0-3 (A800 80GB)（测试环境参考）, 12 output tokens, temperature=0
 > **meta-infer 版本**: `META_INFER_CUDA_GRAPH=0`, commit `1ce6f51` (Stage A-C 完成后)
-> **运行方式**: `CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4`
+> **运行方式**: `CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} torchrun --nproc_per_node=${TP_SIZE}`
 > **vLLM**: vLLM 0.15.1, `max_model_len=1024`
 
 #### vs vLLM enforce_eager (无 CUDA Graph, 有 torch.compile)
@@ -667,10 +667,10 @@ def test_snippet_X():
 ### 6.2 端到端正确性
 
 ```bash
-PYTHONPATH=./agent-infer:$PYTHONPATH CUDA_VISIBLE_DEVICES=0 python -c "
+PYTHONPATH=.:$PYTHONPATH CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} python -c "
 import os; os.environ['META_INFER_LOG_RANK0_ONLY'] = '1'
 from llm_engine import LLMEngine; from pathlib import Path
-engine = LLMEngine(model_dir=Path('.../models/qwen/Qwen3-8B'), inference_backend='qwen_tp', max_num_seqs=4)
+engine = LLMEngine(model_dir=Path('${MODEL_DIR}'), inference_backend='qwen_tp', max_num_seqs=4)
 out = engine.generate('苏州园林的特点是', max_new_tokens=24, temperature=0.0)
 print(f'Output: {out!r}')
 "
@@ -689,7 +689,7 @@ print(f'Output: {out!r}')
 
 ### 0.1 Profiling Trace 交叉校验 ✅
 
-来源: `/tmp/prof_vllm_qwen_tp4/profiler_out_0.txt` (rank-0, Qwen3-8B TP=4, 12 steps)
+来源: `/tmp/prof_vllm_qwen_tp4/profiler_out_0.txt` (rank-0, Qwen3-8B TP=4, 12 steps)（历史参考数据，复现时需重新采集）
 
 已逐行核对 vLLM Trace 中的 GPU kernel 调用链与本计划的 4 个替换目标，**全部命中**：
 
@@ -746,7 +746,7 @@ print(f'Output: {out!r}')
 - 单元测试: `rms_norm` 2D/4D、`fused_add_rms_norm` 与 PyTorch 原生数值一致 (rtol=1e-2)
 - 端到端: greedy decode (temperature=0) 输出字字对齐 — `'（ ） A：建筑与园林结合 B：建筑与自然结合 C：建筑与山水结合 D：建筑'`
 
-### Profiling 效果 (单 GPU, 12 step decode, `/tmp/prof_stage1_qwen/`)
+### Profiling 效果 (单 GPU, 12 step decode, `/tmp/prof_stage1_qwen/`，历史参考数据，复现时需重新采集)
 
 | 指标 | 替换前 | 替换后 |
 |------|--------|--------|
@@ -1264,7 +1264,7 @@ def forward_decode(self, hidden_states, positions, kv_len, max_seq_len, residual
 
 ### Benchmark: TP=4 吞吐对比
 
-Qwen3-8B, TP=4, 12 output tokens, temperature=0, GPU 0-3 (A800 80GB):
+Qwen3-8B, TP=4, 12 output tokens, temperature=0, GPU 0-3 (A800 80GB)（测试环境参考）:
 
 | 模式 | Init 时间 | 稳态耗时 | Throughput | vs vLLM |
 |------|----------|---------|-----------|---------|
@@ -1278,7 +1278,7 @@ Qwen3-8B, TP=4, 12 output tokens, temperature=0, GPU 0-3 (A800 80GB):
 
 相同条件: Qwen3-8B, TP=4, 12 output tokens, temperature=0。Trace 文件:
 - `notebooks-cn/07_improvementPlan/traces/profiler_out_0.txt` (vLLM CUDA Graph, rank-0)
-- `/tmp/prof_metainfer_compile_tp4/profiler_out_0.json` (meta-infer compile, rank-0)
+- `/tmp/prof_metainfer_compile_tp4/profiler_out_0.json` (meta-infer compile, rank-0)（历史参考数据，复现时需重新采集）
 
 #### GPU 时间分解
 

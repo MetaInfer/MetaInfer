@@ -1,8 +1,8 @@
 # Stage 0-2 完成后 meta-infer vs vLLM 三模式 Profiling 对比
 
 > **状态**: 阶段零/一/二已完成 ✅，阶段三待实施  
-> **环境**: Qwen3-8B, TP=4 (GPU 0-3, A800 80GB), 12 output tokens, temperature=0  
-> **meta-infer**: `META_INFER_CUDA_GRAPH=0` (nocompile, eager path), meta conda env (PyTorch 2.9.1)  
+> **环境**: Qwen3-8B, TP=4 (GPU 0-3, A800 80GB)（测试环境参考）, 12 output tokens, temperature=0  
+> **meta-infer**: `META_INFER_CUDA_GRAPH=0` (nocompile, eager path), PyTorch 2.9.1（测试环境参考）  
 > **vLLM**: vLLM 0.15.1, `max_model_len=1024, gpu_memory_utilization=0.85`，两种模式:
 > - `enforce_eager=True` — **无 CUDA Graph**，有 torch.compile (用于 kernel fusion)
 > - `enforce_eager=False` — **有 CUDA Graph**（VllmBackend FULL_AND_PIECEWISE 模式）

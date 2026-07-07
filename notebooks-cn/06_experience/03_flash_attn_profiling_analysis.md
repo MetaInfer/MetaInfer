@@ -3,8 +3,8 @@
 ## 1. 测试环境
 
 - **模型**: DeepSeek-V2-Lite-Chat (MLA, QK headdim=192, V headdim=128)
-- **GPU**: 4x A800 80GB, TP=4
-- **Conda 环境**: meta (flash_attn 2.8.3, PyTorch 2.9.1+cu128)
+- **GPU**: 4x A800 80GB, TP=4（测试环境参考）
+- **Conda 环境**: meta (flash_attn 2.8.3, PyTorch 2.9.1+cu128)（测试环境的参考快照，不同环境可能使用不同版本）
 - **Profiling**: PyTorch Profiler (CPU + CUDA activities, record_shapes=True)
 
 ## 2. P2 基线使用的 Kernel
@@ -84,7 +84,7 @@ attention 层差异只有 +14.6%（+115ms），但总吞吐下降 28%，说明 *
 
 ### 5.3 vLLM 的做法
 
-vLLM 在 SM80 (A800) 上对 DeepSeek-V2 使用 **Triton MLA kernel**（`decode_attention_fwd`），而非 `flash_attn_varlen_func`：
+vLLM 在 SM80 (测试 GPU) 上对 DeepSeek-V2 使用 **Triton MLA kernel**（`decode_attention_fwd`），而非 `flash_attn_varlen_func`：
 
 - Triton MLA 在**压缩潜空间**（kv_lora_rank=512）中操作，避免 K/V headdim 不匹配
 - KV cache 存储 `[kv_lora_rank + rope_dim]`（512+64=576），而非展开的 Q/K/V
