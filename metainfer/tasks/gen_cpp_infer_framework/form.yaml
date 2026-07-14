@@ -1,0 +1,99 @@
+# Question bank for the `gen-cpp-infer-framework` task type.
+# Add or edit entries freely; the skill loader just iterates this list.
+# Notes:
+#   - options: omit for free-form text questions
+#   - The harness auto-appends an "Other" option; do not add it yourself.
+#   - header: <= 12 chars
+
+- key: target_model
+  question: "Enter the model weight path (path on your storage, not model name on hugging face):"
+  header: "Target model path"
+  required: true
+
+
+- key: target_hardware
+  question: "Which GPU platform is the primary target?"
+  header: "Hardware"
+  required: true
+  multi: false
+  options:
+    - label: "Hygon K100AI"
+      description: ""
+    - label: "Hygon BW1000"
+      description: ""
+
+- key: cpp_standard
+  question: "Which C++ standard should the generated framework target?"
+  header: "C++ std"
+  required: false
+  multi: false
+  default: "C++17"
+  options:
+    - label: "C++17"
+      description: "Portable baseline"
+    - label: "C++20"
+      description: "Use newer language/library features if available"
+
+- key: build_constraints
+  question: "Any build or dependency constraints for the C++ implementation?"
+  header: "Build"
+  required: false
+  default: "Use CMake; no network downloads; prefer system libraries or small self-contained code."
+
+- key: features
+  question: "Which features must the C++ framework support?"
+  header: "Features"
+  required: false
+  multi: true
+  options:
+    - label: "Native C++ HTTP server"
+      description: "serve.sh launches a C++ server binary"
+    - label: "CMake build"
+      description: "build.sh configures and builds with CMake"
+    - label: "Paged KV cache"
+      description: "Block-based KV management"
+    - label: "Continuous batching"
+      description: "In-flight request scheduling"
+    - label: "Tensor parallelism"
+      description: "Multi-GPU TP"
+    - label: "Speculative decoding"
+      description: "Draft + verify"
+
+- key: perf_target
+  question: "What is the primary performance goal?"
+  header: "Perf goal"
+  required: false
+  multi: false
+  default: "throughput"
+  options:
+    - label: "Throughput"
+      description: "Max tokens/sec aggregate"
+    - label: "Latency"
+      description: "Min per-request TTFT/TPOT"
+    - label: "Memory"
+      description: "Min GPU memory footprint"
+
+- key: perf_budget
+  question: "What is the acceptance perf bar (vs a reference like vLLM)?"
+  header: "Perf bar"
+  required: false
+  default: ">=50% of vLLM throughput"
+
+- key: max_iterations
+  question: "Max orchestrator iterations to allow (each iteration = plan/implement/test/optimize)?"
+  header: "Max iters"
+  required: false
+  multi: false
+  default: "20"
+  options:
+    - label: "10"
+      description: "Quick prototype"
+    - label: "20"
+      description: "Balanced (recommended)"
+    - label: "50"
+      description: "Long-running, multi-day"
+
+- key: extra_notes
+  question: "Any extra C++ constraints or notes (free text)?"
+  header: "Notes"
+  required: false
