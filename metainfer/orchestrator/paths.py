@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+
 def repo_root() -> Path:
     """Absolute path to the repo / install root.
 

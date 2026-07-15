@@ -54,6 +54,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
+
 def _infer_field_type(entry: Dict[str, Any]) -> str:
     """Canonical widget type. Explicit ``form`` wins; otherwise infer
     from multi/options presence."""

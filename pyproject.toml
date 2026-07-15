@@ -46,7 +46,6 @@ include = ["metainfer*"]
 #     package owns its non-Python assets.
 "*" = [
     "*.yaml",
-    "orchestrator/*.yaml",
     "static/**/*",
     "orchestrator/oracles/**/*.yaml",
     "orchestrator/prompts/**/*",
