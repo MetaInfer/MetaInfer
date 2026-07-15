@@ -424,6 +424,12 @@ class Orchestrator:
                     break
                 iter_num += 1
                 iter_dir = self.workspace.open_iteration(iter_num)
+                # Build flags and hardware commands are system-owned. Seed
+                # every fresh/copied iteration before an agent can edit it.
+                # C/E materialize again immediately before execution, so an
+                # agent edit cannot change the command path.
+                from .hardware import materialize_hardware_binding
+                hardware_snapshot = materialize_hardware_binding(self.req, iter_dir)
                 iter_rec = IterationRecord(
                     iteration=iter_num,
                     started_at=time.time(),
@@ -447,7 +453,8 @@ class Orchestrator:
                 self.store.append_timeline(
                     "iteration_start",
                     {"iteration": iter_num, "start_phase": phase,
-                     "carried_failure": ctx.failure is not None},
+                     "carried_failure": ctx.failure is not None,
+                     "hardware_profile": str(hardware_snapshot)},
                 )
                 ctx.phase_attempts.clear()
 

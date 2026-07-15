@@ -12,6 +12,13 @@ from metainfer.tasks.gen_cpp_infer_framework.web_server_handler._qa import (
     GenCppInferQAConfig,
     _resolve_events_file,
 )
+from metainfer.tasks.gen_cpp_infer_framework.orchestrator.hardware import (
+    execution_environment,
+    materialize_hardware_binding,
+    profiler_launch_command,
+    render_hardware_profile,
+    resolve_hardware_profile,
+)
 from metainfer.web.registry import get as _get_web_plugin
 
 
@@ -34,7 +41,7 @@ def test_web_plugin_registered():
     assert plugin.qa_config is not None
 
 
-def test_cpp_task_reuses_gen_infer_notebooks():
+def test_cpp_task_uses_its_own_notebooks():
     from metainfer.tasks.gen_cpp_infer_framework.orchestrator import (
         orchestrator as orch,
     )
@@ -43,9 +50,34 @@ def test_cpp_task_reuses_gen_infer_notebooks():
     assert notebooks_dir.name == "notebooks"
     assert "metainfer" in notebooks_dir.parts
     assert "tasks" in notebooks_dir.parts
-    assert "gen_infer_framework" in notebooks_dir.parts
+    assert "gen_cpp_infer_framework" in notebooks_dir.parts
     assert notebooks_dir.is_dir()
-    assert (notebooks_dir / "00_contracts").is_dir()
+    assert (notebooks_dir / "README.md").is_file()
+
+
+def test_z200_hardware_profile_binds_system_build_and_profiler(tmp_path: Path):
+    req = {"target_hardware": "Hygon Z200"}
+    selected, profile = resolve_hardware_profile(req)
+    assert selected == "Hygon Z200"
+    assert profile is not None
+    assert profile["build"]["cmake_cache"]["CMAKE_HIP_ARCHITECTURES"] == "gfx906"
+    assert profile["profiling"]["profiler"] == "rocprof"
+    snapshot = materialize_hardware_binding(req, tmp_path)
+    assert snapshot.is_file()
+    build_sh = tmp_path / "build.sh"
+    assert "SYSTEM-OWNED FILE" in build_sh.read_text(encoding="utf-8")
+    assert "-DCMAKE_HIP_ARCHITECTURES=gfx906" in build_sh.read_text(encoding="utf-8")
+    # Re-materializing restores the system command path after an agent edit.
+    build_sh.write_text("agent override", encoding="utf-8")
+    materialize_hardware_binding(req, tmp_path)
+    assert "agent override" not in build_sh.read_text(encoding="utf-8")
+    env = execution_environment(req, tmp_path)
+    assert env["METAINFER_HIPCC"] == "hipcc"
+    assert profiler_launch_command(req) == ["rocprof", "--stats"]
+    rendered = render_hardware_profile(req)
+    assert "hipcc" in rendered
+    assert "gfx906" in rendered
+    assert "do not edit build.sh" in rendered
 
 
 def test_qa_explicit_events_file(tmp_path: Path):

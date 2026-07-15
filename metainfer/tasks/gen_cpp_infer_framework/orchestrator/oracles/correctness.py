@@ -49,8 +49,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from ....oracles.base import Oracle, OracleCaseResult, OracleResult
-from ....oracles.judge import JudgeInput, run_judge_batch
+from ..hardware import (
+    HardwareProfileError,
+    execution_environment,
+    materialize_hardware_binding,
+)
+from metainfer.orchestrator.oracles.base import Oracle, OracleCaseResult, OracleResult
+from metainfer.orchestrator.oracles.judge import JudgeInput, run_judge_batch
 
 
 PROMPTS_FILE = Path(__file__).parent / "data" / "correctness_cases.yaml"
@@ -105,6 +110,12 @@ class InferFrameworkOracle(Oracle):
         if not serve_sh.exists():
             return self._fail(report_dir, f"no serve.sh at {serve_sh}")
 
+        try:
+            materialize_hardware_binding(req, iter_dir)
+            hardware_env = execution_environment(req, iter_dir)
+        except HardwareProfileError as exc:
+            return self._fail(report_dir, f"hardware profile error: {exc}")
+
         port = _pick_free_port()
         cases_cfg = _load_cases(req)
         if not cases_cfg:
@@ -112,7 +123,8 @@ class InferFrameworkOracle(Oracle):
 
         model_dir = req.get("target_model") or (req.get("answers") or {}).get("target_model")
         ok, build_err = _run_build_check(
-            build_sh, report_dir, model_dir=model_dir, timeout_s=min(timeout_s, 900)
+            build_sh, report_dir, model_dir=model_dir,
+            extra_env=hardware_env, timeout_s=min(timeout_s, 900)
         )
         if not ok:
             return self._fail(report_dir, build_err or "C++ build failed")
@@ -122,7 +134,10 @@ class InferFrameworkOracle(Oracle):
             # Pass the real model path (if captured in requirements) to
             # serve.sh via env var so a weakly-written serve.sh still finds
             # the weights instead of falling into mock mode.
-            proc = _start_server(serve_sh, port, report_dir, model_dir=model_dir)
+            proc = _start_server(
+                serve_sh, port, report_dir, model_dir=model_dir,
+                extra_env=hardware_env,
+            )
             startup_to = _resolve_startup_timeout_s()
             ok, err = _wait_healthy(
                 port, proc,
@@ -275,6 +290,7 @@ def _run_build_check(
     report_dir: Path,
     *,
     model_dir: Optional[str] = None,
+    extra_env: Optional[Dict[str, str]] = None,
     timeout_s: int = 900,
 ) -> Tuple[bool, Optional[str]]:
     """Run the C++ build before booting serve.sh.
@@ -288,6 +304,8 @@ def _run_build_check(
     env = dict(os.environ)
     if model_dir:
         env["MODEL_DIR"] = str(model_dir)
+    if extra_env:
+        env.update(extra_env)
     env.setdefault("OMP_NUM_THREADS", "8")
     try:
         with open(out_path, "wb") as out_fp, open(err_path, "wb") as err_fp:
@@ -316,6 +334,7 @@ def _run_build_check(
 def _start_server(
     serve_sh: Path, port: int, report_dir: Path,
     model_dir: Optional[str] = None,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> subprocess.Popen:
     # Kill any orphan process holding GPU VRAM before booting. A previous
     # crashed experiment (implementer's self-test, prior iteration's C
@@ -335,6 +354,8 @@ def _start_server(
     # serve.sh ends up serving mock responses — every C step then fails.
     if model_dir:
         env["MODEL_DIR"] = str(model_dir)
+    if extra_env:
+        env.update(extra_env)
     # Best-effort determinism hints
     env.setdefault("PYTHONHASHSEED", "0")
     env.setdefault("OMP_NUM_THREADS", "8")

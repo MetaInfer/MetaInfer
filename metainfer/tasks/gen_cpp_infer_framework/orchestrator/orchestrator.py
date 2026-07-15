@@ -31,6 +31,10 @@ from ...state import StateStore
 from .pipeline import Orchestrator, OrchestratorConfig
 
 
+# Each task owns its knowledge base.  The C++ task starts with a small
+# placeholder and can grow its own hardware, build, and profiling contracts
+# without mixing them into the Python-oriented inference task's notebooks.
+_NOTEBOOKS_DIR = Path(__file__).resolve().parent.parent / "notebooks"
 # --------------------------------------------------------------------------- #
 # Per-task state_dir layout for the gen-cpp-infer-framework task type
 # --------------------------------------------------------------------------- #

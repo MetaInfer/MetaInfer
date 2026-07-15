@@ -33,6 +33,7 @@ import concurrent.futures
 import json
 import math
 import os
+import shutil
 import signal
 import socket
 import statistics
@@ -48,6 +49,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 from .gpu import GpuTelemetry
+from ..hardware import (
+    HardwareProfileError,
+    execution_environment,
+    materialize_hardware_binding,
+    profiler_artifact_globs,
+    profiler_launch_command,
+    require_hardware_profile,
+)
 
 
 PROMPTS_FILE = Path(__file__).parent / "data" / "perf_prompts.yaml"
@@ -219,6 +228,8 @@ def _start_server(
     model_dir: Optional[str] = None,
     profile_dir: Optional[Path] = None,
     profile_duration_s: int = 1800,
+    extra_env: Optional[Dict[str, str]] = None,
+    profiler_prefix: Optional[List[str]] = None,
 ) -> subprocess.Popen:
     # Kill any orphan process holding GPU VRAM before booting. The perf
     # sweep loads the model once and stresses it; any leftover allocation
@@ -232,13 +243,19 @@ def _start_server(
     env["METAINFER_PERF_ORACLE_PORT"] = str(port)
     if model_dir:
         env["MODEL_DIR"] = str(model_dir)
+    if extra_env:
+        env.update(extra_env)
     env.setdefault("PYTHONHASHSEED", "0")
     # Enable the in-framework profiler hook. The contract in
     # notebooks/00_contracts/profiling_contracts.md REQUIRES the framework
     # to honor these vars. We set duration to a large value as a backstop;
     # the real stop trigger is the SIGTERM we send at the end of the sweep
     # (the framework MUST call profiler.stop() + export on SIGTERM).
-    if profile_dir is not None:
+    if profiler_prefix:
+        # The platform profile owns profiling. Do not require generated C++
+        # code to emulate the old CUDA/PyTorch profile hook.
+        env["METAINFER_PROFILE"] = "0"
+    elif profile_dir is not None:
         env["METAINFER_PROFILE"] = "1"
         env["METAINFER_PROFILE_OUTDIR"] = str(profile_dir)
         env.setdefault("METAINFER_PROFILE_DURATION_S", str(profile_duration_s))
@@ -246,8 +263,9 @@ def _start_server(
     else:
         # Explicitly disable in case the user had it set in their shell env.
         env["METAINFER_PROFILE"] = "0"
+    command = [*(profiler_prefix or []), "bash", str(serve_sh), str(port)]
     return subprocess.Popen(
-        ["bash", str(serve_sh), str(port)],
+        command,
         stdout=log_fp, stderr=err_fp,
         cwd=str(serve_sh.parent),
         env=env, start_new_session=True,
@@ -379,6 +397,22 @@ def _scan_profile_dir(profile_dir: Path) -> List[Dict[str, Any]]:
             "suspect_empty": st.st_size < 1024,
         })
     return out
+
+
+def _collect_external_profile_artifacts(
+    iter_dir: Path, profile_dir: Path, patterns: List[str],
+) -> None:
+    """Copy profiler-owned files emitted beside ``serve.sh`` into report dir."""
+    copied: set[Path] = set()
+    for pattern in patterns:
+        for source in iter_dir.glob(pattern):
+            if not source.is_file() or source in copied:
+                continue
+            copied.add(source)
+            try:
+                shutil.copy2(source, profile_dir / source.name)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -632,6 +666,23 @@ class PerfOracle:
             self._write_report(report, iter_dir, report_dir)
             return report
 
+        try:
+            materialize_hardware_binding(req, iter_dir)
+            selected_hardware, hardware_profile = require_hardware_profile(req)
+            hardware_env = execution_environment(req, iter_dir)
+            profiler_prefix = profiler_launch_command(req)
+            external_artifact_globs = profiler_artifact_globs(req)
+        except HardwareProfileError as exc:
+            report.notes = f"hardware profile error: {exc}"
+            self._write_report(report, iter_dir, report_dir)
+            return report
+
+        report.methodology["hardware_profile"] = {
+            "selected": selected_hardware,
+            "id": hardware_profile["id"],
+            "external_profiler_command": profiler_prefix,
+        }
+
         cases, prompt_source = _load_cases(req)
         if not cases:
             report.notes = "no benchmark prompts available"
@@ -669,6 +720,8 @@ class PerfOracle:
                     model_dir=model_dir,
                     profile_dir=profile_dir if profile_dir_ok else None,
                     profile_duration_s=profile_duration,
+                    extra_env=hardware_env,
+                    profiler_prefix=profiler_prefix,
                 )
                 startup_to = _resolve_startup_timeout_s()
                 ok, err = _wait_healthy(
@@ -703,6 +756,9 @@ class PerfOracle:
         # iteration or skipped the contract). The F-step perf planner
         # treats presence of artifacts as a bonus signal, not a gate.
         if profile_dir_ok and profile_dir is not None:
+            _collect_external_profile_artifacts(
+                iter_dir, profile_dir, external_artifact_globs,
+            )
             report.profile_artifacts = _scan_profile_dir(profile_dir)
 
         # Pick the primary headline (saturated concurrency = max in ladder).

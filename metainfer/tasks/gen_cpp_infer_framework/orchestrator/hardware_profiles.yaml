@@ -1,0 +1,81 @@
+# Executable hardware profiles for gen-cpp-infer-framework.
+#
+# The selected form value is the key under `profiles`.  The orchestrator
+# renders the matching profile into agent prompts, so build, operator, and
+# profiling decisions come from one source of truth rather than being guessed
+# independently in each phase.
+schema_version: 1
+
+profiles:
+  Hygon Z200:
+    id: hygon-z200sm80-gfx906
+    status: initial-validation
+    source_notebook: notebooks/01_Hardware.md
+
+    detection:
+      required_commands:
+        - hipcc
+        - rocminfo
+        - rocprof
+        - rocm-smi
+      expected_device:
+        vendor: HYGON
+        marketing_name: Z200SM_80
+        device_type: DCU
+        target_id_prefix: gfx906
+
+    build:
+      build_system: cmake
+      languages: [CXX, HIP]
+      artifact: build/metainfer_cpp_server
+      cmake_cache:
+        CMAKE_CXX_STANDARD: "17"
+        CMAKE_HIP_STANDARD: "17"
+        CMAKE_HIP_ARCHITECTURES: gfx906
+      compiler:
+        command: hipcc
+        release_args: ["-O3", "--offload-arch=gfx906"]
+        inspection_args: ["-gline-tables-only", "-save-temps"]
+
+    runtime:
+      backend: hip
+      device_select_api: hipSetDevice
+      target_arch: gfx906
+      wavefront_size: 64
+      compute_units: 64
+      lds_per_cu_kib: 64
+
+    operators:
+      gemm:
+        baseline: DTK hipBLAS
+        custom_route: Wave64 VALU with FP32 FMA
+        do_not_assume: [MFMA, WMMA, tensor-core-equivalent]
+      attention:
+        route: Wave64 online softmax with explicit LDS sizing
+        do_not_assume: [CUDA cp.async, Hopper TMA, NVIDIA Warp32 mapping]
+      reductions:
+        wave_route: HIP __shfl_* with width=warpSize
+        block_route: wave reduction followed by LDS plus __syncthreads
+      memory:
+        vector_load_types: [float4, int4, uint4]
+        alignment_bytes: 16
+
+    profiling:
+      telemetry_commands: [hy-smi, rocm-smi, rocminfo]
+      profiler: rocprof
+      launch_args: ["--stats"]
+      artifact_globs: ["results*.csv", "*.stats.csv"]
+      captures:
+        kernel_stats: ["--stats"]
+        hip_api_trace: ["--hip-trace"]
+        counter_discovery: ["--list-basic", "--list-derived"]
+        counter_capture: ["-i", "<counters-file>"]
+      clock_policy:
+        automatic_change: false
+        optional_manual_command: "sudo rocm-smi --setperflevel high"
+        verify_after_change: ["rocm-smi --showclocks", "rocm-smi --showperflevel"]
+
+    validation_rules:
+      - Reject a device whose rocminfo target is not gfx906-compatible.
+      - Do not select unsupported profiler counters without first querying rocprof.
+      - Do not assume matrix instructions or NVIDIA-specific async-copy features.

@@ -17,10 +17,8 @@
   required: true
   multi: false
   options:
-    - label: "Hygon K100AI"
-      description: ""
-    - label: "Hygon BW1000"
-      description: ""
+    - label: "Hygon Z200"
+      description: "Initial validation target"
 
 - key: cpp_standard
   question: "Which C++ standard should the generated framework target?"
