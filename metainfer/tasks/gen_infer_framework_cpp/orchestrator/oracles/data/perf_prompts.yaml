@@ -1,0 +1,223 @@
+# Fixed benchmark prompt set for the perf oracle.
+#
+# This file is IMMUTABLE from the agent's perspective — it lives inside
+# the metainfer package, not in iter_dir. Agents cannot game the
+# benchmark by editing prompts.
+#
+# Design principles (different from the correctness oracle's prompts.yaml):
+#
+# 1. **Larger N** for stable percentiles. The correctness set has 8
+#    cases; we have ~40 because p99 stabilization needs N >= 100
+#    across the full sweep.
+#
+# 2. **Varied output length** so generation cost dominates the wall
+#    clock (not prompt processing). Each prompt has an explicit
+#    `max_tokens` controlling output size.
+#
+# 3. **Varied prompt length** to exercise both short and long prefill.
+#
+# 4. **Mix of categories** so a regression specific to (e.g.) long
+#    output is visible. Categories enable per-group drill-down in the
+#    report.
+#
+# 5. **Deterministic content** (math, factual recall, fixed translation)
+#    so correctness oracle can also judge these if desired. We do NOT
+#    judge correctness here — only measure throughput / latency.
+#
+# Each case has:
+#   id            : stable identifier
+#   category      : for per-group drill-down
+#   prompt        : user-side prompt
+#   max_tokens    : output cap (controls generation length)
+#   temperature   : always 0 for reproducibility
+#
+# To extend: add cases here. The oracle iterates the whole list at
+# every concurrency level, so more cases = longer benchmark wall time.
+
+# ---- short output (16-32 tokens) ----
+- id: s01
+  category: short_math
+  prompt: "What is 12 times 7? Answer with just the number."
+  max_tokens: 16
+- id: s02
+  category: short_math
+  prompt: "What is the square root of 144? Answer with just the number."
+  max_tokens: 16
+- id: s03
+  category: short_factual
+  prompt: "What is the capital of Japan? Answer in one word."
+  max_tokens: 16
+- id: s04
+  category: short_factual
+  prompt: "What is the chemical symbol for gold? Answer in one word."
+  max_tokens: 16
+- id: s05
+  category: short_factual
+  prompt: "In which continent is Egypt? Answer in one word."
+  max_tokens: 16
+- id: s06
+  category: short_code
+  prompt: "Write a Python one-liner that reverses 'abc'. Reply with only the code."
+  max_tokens: 32
+- id: s07
+  category: short_code
+  prompt: "Write a Python one-liner that sums [1,2,3]. Reply with only the code."
+  max_tokens: 32
+- id: s08
+  category: short_translation
+  prompt: "Translate 'hello' to French. Reply with only the word."
+  max_tokens: 16
+- id: s09
+  category: short_translation
+  prompt: "Translate 'thank you' to Spanish. Reply with only the word."
+  max_tokens: 16
+- id: s10
+  category: short_instruction
+  prompt: "List exactly two fruits, comma-separated."
+  max_tokens: 24
+
+# ---- medium output (64-128 tokens) ----
+- id: m01
+  category: medium_math
+  prompt: "Solve step by step: a train travels 60 km/h for 2.5 hours, then 80 km/h for 1.5 hours. What is the total distance?"
+  max_tokens: 96
+- id: m02
+  category: medium_math
+  prompt: "Explain in 3 steps how to compute the Fibonacci number at position 10."
+  max_tokens: 96
+- id: m03
+  category: medium_factual
+  prompt: "Explain in 2-3 sentences what DNA is and its function."
+  max_tokens: 96
+- id: m04
+  category: medium_factual
+  prompt: "Describe in 2-3 sentences how a photovoltaic cell converts light to electricity."
+  max_tokens: 96
+- id: m05
+  category: medium_code
+  prompt: "Write a Python function `is_palindrome(s)` that returns True iff the string s is a palindrome. Reply with only the code, no explanation."
+  max_tokens: 96
+- id: m06
+  category: medium_code
+  prompt: "Write a Python function `flatten(lst)` that flattens a nested list one level. Reply with only the code."
+  max_tokens: 96
+- id: m07
+  category: medium_translation
+  prompt: "Translate to French: 'The weather is nice today, so let's go for a walk in the park.'"
+  max_tokens: 96
+- id: m08
+  category: medium_translation
+  prompt: "Translate to Spanish: 'I would like to order a coffee with milk and a piece of cake, please.'"
+  max_tokens: 96
+- id: m09
+  category: medium_instruction
+  prompt: "Write a 3-bullet-point summary of how a bill becomes a law in a parliamentary system."
+  max_tokens: 96
+- id: m10
+  category: medium_creative
+  prompt: "Write a 3-sentence product description for a smart umbrella that alerts you when rain is forecast."
+  max_tokens: 96
+- id: m11
+  category: medium_creative
+  prompt: "Write a 3-sentence sci-fi opening about a city that floats above the clouds."
+  max_tokens: 96
+- id: m12
+  category: medium_factual
+  prompt: "In 2-3 sentences, explain the difference between TCP and UDP."
+  max_tokens: 96
+- id: m13
+  category: medium_code
+  prompt: "Write a Python function `merge_dicts(a, b)` that returns a new dict with b's keys overriding a's on conflict. Reply with only the code."
+  max_tokens: 96
+- id: m14
+  category: medium_math
+  prompt: "Compute and explain: how many minutes are in a 365-day year? Show the multiplication."
+  max_tokens: 96
+- id: m15
+  category: medium_instruction
+  prompt: "List exactly 4 best practices for writing maintainable Python code, each as a short bullet."
+  max_tokens: 128
+
+# ---- long output (192-256 tokens) ----
+- id: l01
+  category: long_code
+  prompt: "Write a complete Python class `BoundedQueue` with __init__, push, pop, __len__, and is_full methods. Use a fixed-capacity list. Include docstrings. Reply with only the code."
+  max_tokens: 256
+- id: l02
+  category: long_code
+  prompt: "Write a complete Python function `word_frequency(text)` that takes a string and returns a dict mapping each lowercase word to its count. Handle punctuation. Reply with only the code."
+  max_tokens: 256
+- id: l03
+  category: long_factual
+  prompt: "Explain in 5-7 sentences the lifecycle of a star like our Sun, from formation to white dwarf."
+  max_tokens: 256
+- id: l04
+  category: long_factual
+  prompt: "Describe in 5-7 sentences how the human immune system responds to a viral infection."
+  max_tokens: 256
+- id: l05
+  category: long_creative
+  prompt: "Write a 6-sentence short story about an astronaut discovering a garden on Mars."
+  max_tokens: 256
+- id: l06
+  category: long_creative
+  prompt: "Write a 6-sentence product review for a fictional pair of boots that adjusts its size to the wearer."
+  max_tokens: 256
+- id: l07
+  category: long_instruction
+  prompt: "Write a step-by-step recipe (7-9 sentences) for making a basic tomato pasta sauce from scratch."
+  max_tokens: 256
+- id: l08
+  category: long_instruction
+  prompt: "Write a 7-step guide for setting up a basic CI pipeline for a Python project on GitHub Actions."
+  max_tokens: 256
+- id: l09
+  category: long_translation
+  prompt: "Translate to French: 'The quick brown fox jumps over the lazy dog. The early bird catches the worm. A journey of a thousand miles begins with a single step. Practice makes perfect.'"
+  max_tokens: 256
+- id: l10
+  category: long_math
+  prompt: "Solve step by step: a store sells apples at $1.20 each and oranges at $1.50 each. A customer buys 7 apples and 5 oranges and pays with a $20 bill. Compute the change. Show every multiplication and addition."
+  max_tokens: 256
+
+# ---- extra short cases to reach N≈40 across the sweep ----
+- id: s11
+  category: short_math
+  prompt: "What is 9 cubed? Answer with just the number."
+  max_tokens: 16
+- id: s12
+  category: short_math
+  prompt: "What is 15% of 200? Answer with just the number."
+  max_tokens: 16
+- id: s13
+  category: short_factual
+  prompt: "What planet is known as the Red Planet? Answer in one word."
+  max_tokens: 16
+- id: s14
+  category: short_factual
+  prompt: "Who wrote 'Romeo and Juliet'? Answer with only the surname."
+  max_tokens: 16
+- id: s15
+  category: short_factual
+  prompt: "What is the largest ocean on Earth? Answer in one word."
+  max_tokens: 16
+- id: s16
+  category: short_code
+  prompt: "Write a bash one-liner to list all .py files in the current directory. Reply with only the command."
+  max_tokens: 32
+- id: s17
+  category: short_translation
+  prompt: "Translate 'goodbye' to Italian. Reply with only the word."
+  max_tokens: 16
+- id: s18
+  category: short_translation
+  prompt: "Translate 'one, two, three' to German. Reply with only those three words."
+  max_tokens: 24
+- id: s19
+  category: short_instruction
+  prompt: "List exactly three vegetables, comma-separated."
+  max_tokens: 24
+- id: s20
+  category: short_instruction
+  prompt: "Name exactly two programming languages that compile to JavaScript, comma-separated."
+  max_tokens: 24

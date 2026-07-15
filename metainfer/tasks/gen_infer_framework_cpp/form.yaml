@@ -1,0 +1,202 @@
+# C++ 优先推理框架生成器的表单定义。
+# Serving Runtime、Scheduler、Cache、Model Runner、Operator、Sampler 和 HTTP
+# Server 必须主要使用 C++ 实现；Python 仅用于少量离线工具或不可避免的集成胶水。
+
+- key: target_model
+  question: "包含 config.json、Tokenizer 和权重文件的模型目录绝对路径："
+  header: "目标模型"
+  required: true
+  form: file
+
+- key: model_family
+  question: "原生 Runtime 需要支持的模型范围："
+  header: "模型类型"
+  required: false
+  multi: false
+  default: "Auto-detect from config.json"
+  options:
+    - label: "Auto-detect from config.json"
+      description: "从 Checkpoint 配置识别 Qwen3 Dense/MoE，并拒绝未实现的变体"
+    - label: "Qwen3 Dense"
+      description: "Qwen3-8B/14B/32B 等 Dense Decoder 模型"
+    - label: "Qwen3 MoE"
+      description: "Qwen3 混合专家模型，需要原生 Router 和 Expert 执行"
+    - label: "Other / Custom"
+      description: "在备注中描述模型契约"
+
+- key: weight_dtype
+  question: "Runtime 权重 DType（必须同时受 Checkpoint 和已探测 Backend 支持）："
+  header: "权重类型"
+  required: false
+  multi: false
+  default: "Auto"
+  options:
+    - label: "Auto"
+      description: "从 Checkpoint 元数据保留或推导"
+    - label: "BF16"
+      description: "原生 BLAS/Kernel 能力探针通过后使用 BF16"
+    - label: "FP16"
+      description: "原生 BLAS/Kernel 能力探针通过后使用 FP16"
+    - label: "FP32"
+      description: "显存占用较高的 Reference/Debug 路径"
+
+- key: kv_cache_dtype
+  question: "KV Cache 存储 DType："
+  header: "KV 类型"
+  required: false
+  multi: false
+  default: "Auto"
+  options:
+    - label: "Auto"
+      description: "选择 Backend 支持且满足模型数值要求的 DType"
+    - label: "BF16"
+      description: "使用 BF16 存储 KV"
+    - label: "FP16"
+      description: "使用 FP16 存储 KV"
+
+- key: target_hardware
+  question: "主要部署目标硬件："
+  header: "目标硬件"
+  required: true
+  multi: false
+  options:
+    - label: "Hygon K100AI"
+      description: "海光 K100AI DCU"
+    - label: "Hygon BW1000"
+      description: "海光 BW1000 加速器"
+    - label: "Hygon Z200SM"
+      description: "海光 Z200 系列 DCU；PCI/SMI/HIP 详细信息自动探测"
+    - label: "NVIDIA H100"
+      description: "CUDA, SM90"
+    - label: "NVIDIA A100"
+      description: "CUDA, SM80"
+    - label: "AMD MI300"
+      description: "HIP / ROCm"
+    - label: "CPU / custom accelerator"
+      description: "在备注中描述工具链和 SDK"
+
+- key: accelerator_backend
+  question: "C++ Runtime 使用的原生加速后端："
+  header: "加速后端"
+  required: true
+  multi: false
+  options:
+    - label: "Hygon DTK / HIP"
+      description: "DTK 工具链、HIP Runtime、厂商 BLAS 和可选 HIP Kernel"
+    - label: "CUDA"
+      description: "CUDA Runtime、cuBLAS 和可选自定义 CUDA Kernel"
+    - label: "HIP / ROCm"
+      description: "HIP Runtime、rocBLAS 和可选自定义 HIP Kernel"
+    - label: "LibTorch device API"
+      description: "使用平台设备后端的 LibTorch C++ Frontend"
+    - label: "CPU"
+      description: "可移植的 C++ CPU 实现"
+    - label: "Vendor SDK"
+      description: "使用备注中描述的厂商工具链"
+
+- key: assigned_devices
+  question: "管理员/调度器分配给本任务的设备编号（例如 0,1,2,3）；留空则保留已有可见设备环境变量："
+  header: "分配设备"
+  required: false
+  form: text
+
+- key: cpp_standard
+  question: "要求使用的 C++ 语言标准："
+  header: "C++ 标准"
+  required: true
+  multi: false
+  options:
+    - label: "C++17"
+      description: "兼容较广的编译器和 LibTorch 版本"
+    - label: "C++20"
+      description: "在工具链支持时使用现代语言/标准库能力"
+
+- key: build_type
+  question: "serve.sh 和测试使用的默认 CMake Build Type："
+  header: "构建类型"
+  required: true
+  multi: false
+  options:
+    - label: "Release"
+      description: "面向生产的优化构建"
+    - label: "RelWithDebInfo"
+      description: "保留调试符号的优化构建，便于 Profiling"
+
+- key: features
+  question: "C++ 框架必须支持的 Serving 功能："
+  header: "功能要求"
+  required: false
+  multi: true
+  options:
+    - label: "Paged KV cache"
+      description: "基于 Block 的原生 KV 显存管理"
+    - label: "Continuous batching"
+      description: "运行中请求的连续批处理调度"
+    - label: "Tensor parallelism"
+      description: "C++ 原生多卡通信与权重切分"
+    - label: "Speculative decoding"
+      description: "Draft/Verify 推测解码"
+    - label: "Streaming responses"
+      description: "OpenAI-compatible SSE Token 流式响应"
+
+- key: tensor_parallel_size
+  question: "Tensor Parallel Size；选择 TP 功能时，Auto 使用显式分配的全部可见设备："
+  header: "TP 大小"
+  required: false
+  multi: false
+  options:
+    - label: "Auto"
+      description: "根据分配/可见设备推导"
+    - label: "1"
+      description: "单设备 Reference 路径"
+    - label: "2"
+      description: "两个原生 Rank"
+    - label: "4"
+      description: "四个原生 Rank"
+    - label: "8"
+      description: "八个原生 Rank"
+
+- key: perf_target
+  question: "主要性能目标："
+  header: "性能目标"
+  required: false
+  multi: false
+  options:
+    - label: "Throughput"
+      description: "最大化聚合输出 Tokens/s"
+    - label: "Latency"
+      description: "最小化 TTFT 和 TPOT"
+    - label: "Memory"
+      description: "最小化加速器显存占用"
+
+- key: perf_budget
+  question: "性能验收目标（例如吞吐达到某个明确 Tokens/s）："
+  header: "性能门槛"
+  required: false
+  form: text
+
+- key: max_iterations
+  question: "ABCDEF 优化流程的最大迭代次数："
+  header: "最大迭代"
+  required: false
+  multi: false
+  options:
+    - label: "10"
+      description: "快速原生原型"
+    - label: "20"
+      description: "平衡实现与优化"
+    - label: "50"
+      description: "深度优化"
+
+- key: token_budget_max_cost_usd
+  question: "本任务允许使用的 Agent 成本上限（美元）；留空表示不限制："
+  header: "成本上限"
+  required: false
+  form: number
+  default: ""
+
+- key: extra_notes
+  question: "编译器路径、SDK 限制、允许的 Library、ABI 要求和其他说明："
+  header: "补充说明"
+  required: false
+  form: textarea

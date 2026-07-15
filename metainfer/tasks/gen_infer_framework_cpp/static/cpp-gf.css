@@ -1,0 +1,17 @@
+/* gen-infer-framework-cpp phase pills.
+ *
+ * The shell's styles.css only ships semantic pill colors
+ * (.running/.success/.failed/.idle/...). Phase names are task-specific
+ * vocabulary, so each plugin colors its own phases here. All gf
+ * in-progress phases share the accent color — gf doesn't have a
+ * per-phase semantic beyond "currently in this step".
+ */
+.pill.A_plan,
+.pill.B_implement,
+.pill.C_test,
+.pill.D_review,
+.pill.E_perf_test,
+.pill.F_perf_plan {
+  background: rgba(88, 166, 255, 0.15);
+  color: #58a6ff;
+}
