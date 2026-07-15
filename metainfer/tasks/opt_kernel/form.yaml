@@ -1,0 +1,109 @@
+# Question bank for the `opt-kernel` task type (invoked as `/metainfer opt-kernel`).
+
+- key: operator
+  question: "Which operator should the kernel implement?"
+  header: "Operator"
+  required: true
+  multi: false
+  options:
+    - label: "Attention"
+      description: "MHA / MQA / GQA / MLA, with or without KV cache"
+    - label: "Quantized GEMM"
+      description: "int4/int8/fp8 weight GEMM"
+    - label: "RMSNorm / LayerNorm"
+      description: "Normalization layers"
+    - label: "RoPE"
+      description: "Rotary positional embedding"
+
+- key: kernel_language
+  question: "Which kernel language / stack?"
+  header: "Stack"
+  required: true
+  multi: false
+  default: "cuda"
+  options:
+    - label: "CUDA C++"
+      description: "Hand-written .cu with torch extension"
+    - label: "Triton"
+      description: "Python-traced, JIT compiled"
+    - label: "CUTLASS"
+      description: "C++ template library"
+    - label: "HIP"
+      description: "AMD ROCm"
+
+- key: target_hardware
+  question: "Target GPU?"
+  header: "Hardware"
+  required: true
+  multi: false
+  options:
+    - label: "K100AI / K500SM (DCU)"
+      description: "Hygon DCU, DTK/HIP"
+    - label: "H100 (SM 90)"
+      description: "TMA, wgmma, fp8"
+    - label: "A100 (SM 80)"
+      description: "Ampere, async cp"
+    - label: "RTX 4090 (SM 89)"
+      description: "Consumer Ada"
+    - label: "MI300 (CDNA3)"
+      description: "AMD ROCm"
+
+- key: input_shapes
+  question: "What are the primary input shapes the kernel must be tuned for? (free text, e.g. M=4096,N=4096,K=4096 or batch=8,seq=2048,heads=32,head_dim=128)"
+  header: "Shapes"
+  required: true
+
+- key: dtype
+  question: "Compute / storage dtype?"
+  header: "Dtype"
+  required: true
+  multi: false
+  default: "fp16"
+  options:
+    - label: "fp16/bf16"
+      description: "Half precision"
+    - label: "fp8 (e4m3/e5m2)"
+      description: "Hopper native"
+    - label: "int8"
+      description: "W8A16 or W8A8"
+    - label: "int4"
+      description: "W4A16"
+
+- key: correctness_ref
+  question: "What is the correctness reference?"
+  header: "Reference"
+  required: false
+  multi: false
+  default: "pytorch eager"
+  options:
+    - label: "PyTorch eager"
+      description: "Compare against torch reference impl"
+    - label: "vLLM/SGLang op"
+      description: "Compare against the framework's existing op"
+    - label: "Hand-written ref"
+      description: "A reference provided in notebooks/"
+
+- key: perf_target
+  question: "What is the perf target? (free text, e.g. >=80% of cuBLAS, or >=2x torch.compile)"
+  header: "Perf bar"
+  required: false
+  default: ">=80% of best reference"
+
+- key: max_iterations
+  question: "Max orchestrator iterations?"
+  header: "Max iters"
+  required: false
+  multi: false
+  default: "20"
+  options:
+    - label: "10"
+      description: "Quick prototype"
+    - label: "20"
+      description: "Balanced (recommended)"
+    - label: "50"
+      description: "Deep tuning, multi-day"
+
+- key: extra_notes
+  question: "Extra constraints (e.g. must not use cublas, must be deterministic)?"
+  header: "Notes"
+  required: false
