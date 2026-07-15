@@ -2,6 +2,7 @@
 
 > 用途：它定义“必须实现什么、张量应是什么形状、权重怎样装载、prefill/decode 怎样共用 KV cache”，而不绑定 CUDA、CPU 或某个张量库。
 > 配套阅读：`02_qwen3_forwrad compute.md` 解释 llama.cpp 的计算图；本文优先给出自己的 C++ 类边界和实现验收条件。
+> Z200 算子与调用知识库：`04_qwen3_z200_operator_contract.md`。算子事实来源是 `qwen3_z200_kernels.hip.cpp`；Agent 生成单卡版本时必须先读算子契约，再按参考源码接线。所有带权重矩阵乘统一由 `qwen3_z200_q8_linear_fp32()` 调用 `hipblasGemmEx`。
 
 ## 1. 首个可用版本的范围
 
@@ -217,7 +218,198 @@ Tensor Qwen3Model::forward_decode(int32_t token_id, KVCache& cache);
 
 因此 `max_seq_len` 是实打实的显存接口，而不仅是 RoPE 参数。第一版可用连续 dense cache；随后需要多请求时再换 block/paged cache。
 
-## 8. 生成循环与验证顺序
+## 8. Z200 单卡 Q8_0 落地流程（首版 Agent 参考）
+
+本节把前面的通用数学契约收敛为当前目标机器上的一条可执行路径：**一张 Hygon Z200（约 15.98 GiB 显存）、Qwen3-8B Q8_0、B=1、HIP + hipBLAS**。首版目标是正确运行，不以 decode 性能为验收条件。
+
+完整的 public wrapper、反量化公式、hipBLAS 参数表、buffer 布局和逐算子调用顺序见 `04_qwen3_z200_operator_contract.md`。若本文摘要与算子契约对接口的描述不同，以算子契约和 `qwen3_z200_kernels.hip.cpp` 的实际签名为准。
+
+### 8.1 首版数据类型边界
+
+当前 `qwen3_z200_kernels.hip.cpp` 的非线性算子接口使用 FP32，线性层则通过 FP16 临时矩阵调用 hipBLAS：
+
+| 对象 | 首版存储/计算类型 | 说明 |
+| --- | --- | --- |
+| 模型线性权重 | Q8_0，常驻显存 | 不在启动时把全模型永久展开为 FP16 |
+| Embedding 权重 | Q8_0，常驻显存 | 只查表并解量化本次 token 对应的行 |
+| RMSNorm、RoPE、attention、SwiGLU、残差的输入输出 | FP32 | 与当前自定义 kernel 接口保持一致 |
+| 线性层输入临时区 | FP16 | 每次线性调用前由 `x_fp32` cast 得到 |
+| 线性层权重临时区 | FP16 | 每次线性调用前由当前 Q8_0 矩阵解量化得到 |
+| hipBLAS 累加与线性输出 | FP32 | `FP16 x FP16 -> FP32`，输出直接交给现有 FP32 kernel |
+| 当前 K/V cache | FP32 | 因当前 cache/attention kernel 使用 `float*`；后续可统一改为 FP16 |
+
+Q8_0 的块布局必须与加载文件一致：每 32 个权重共享一个 FP16 scale，随后是 32 个有符号 INT8 值。
+
+```cpp
+struct BlockQ8_0 {
+    half   d;       // 2 bytes
+    int8_t qs[32];  // 32 bytes
+};                  // 共 34 bytes
+
+w[i] = fp16_to_fp32(block.d) * fp32(block.qs[i % 32]);
+```
+
+加载器必须校验 `sizeof(BlockQ8_0) == 34`、被量化矩阵的 `K % 32 == 0`、shape 与 GGUF 元数据一致。QKV 和 gate-up 可通过按输出行拼接已经量化的完整行来融合；不能切开或重排一行内部的 Q8_0 block。
+
+标准 hipBLAS 的 INT8 GEMM 不能直接表达“FP32/FP16 激活 × GGUF Q8_0 权重”：Q8_0 的 scale 沿 K 维每 32 个元素变化。因此首版不要把 `BlockQ8_0*` 直接传给普通 INT8 GEMM。当前正确路径是：
+
+```text
+x_fp32 ──cast──> x_fp16 ───────────────┐
+                                       ├─ hipblasGemmEx ──> y_fp32
+W_q8_0 ──dequant──> W_fp16 ────────────┘
+```
+
+`qwen3_z200_q8_linear_fp32()` 已封装这三个步骤，并约定行主序数学语义：
+
+```text
+Y[M, N] = X[M, K] @ W[N, K]^T
+```
+
+它每调用一次都会重新 cast 当前激活、重新解量化当前矩阵，然后 enqueue 一次 hipBLAS GEMM。这条路径**能作为正确性基线**，但 decode 时会反复读完整权重并产生较大的解量化开销；不能把它描述成最终性能方案。
+
+### 8.2 启动时只分配一次的资源
+
+Agent 生成 runtime 时应在模型初始化阶段完成以下工作，禁止在逐层 forward 中反复 `hipMalloc/hipFree`：
+
+1. 读取配置并执行第 2 节的 shape 校验。
+2. 加载 GGUF Q8_0 tensor；按第 4 节映射或融合 QKV、gate-up，Q8_0 权重常驻 device memory。
+3. 创建一个 hipBLAS handle，并让所有 kernel、cast、dequant、GEMM 使用同一条 HIP stream，依靠流内顺序保证依赖。
+4. 分配可复用的 FP32 激活区、attention/MLP 中间区、logits、KV cache。
+5. 分配一个 FP16 激活 workspace，容量至少为本次最大 GEMM 的 `M * K` 个元素。prefill 太长时应先按 token chunk 限制 `M`，而不是无上限扩大 workspace。
+6. 分配一个 FP16 权重 workspace，多个线性层串行复用。若 LM Head 首版不分块，它必须容纳最大矩阵 `[V, H]`。
+
+Qwen3-8B 最大的 FP16 临时权重是 LM Head：
+
+```text
+151936 * 4096 * 2 bytes
+= 1,244,659,712 bytes
+= 1187 MiB ≈ 1.159 GiB
+```
+
+作为对比，gate-up 的临时权重为：
+
+```text
+24576 * 4096 * 2 bytes = 192 MiB
+```
+
+因此只按 gate-up 分配 192 MiB 会在 LM Head 处失败。首版最简单的策略是分配约 1.159 GiB 的单个权重 workspace，让所有线性层复用；若 `hipMemGetInfo` 显示余量不足，再实现第 8.5 节的 LM Head 分块。
+
+当前 FP32 KV cache 在 `max_seq_len=4096` 时为：
+
+```text
+2 * 36 * 4096 * 8 * 128 * 4 bytes = 1.125 GiB
+```
+
+若直接按 `40960` 分配则是 `11.25 GiB`，加上 Q8_0 权重、1.159 GiB 权重 workspace 和其他激活后无法在约 15.98 GiB 的卡上安全运行。因此：
+
+- 第一版把运行时 `max_seq_len` 默认限制在 4096 或更小，并在启动时根据实际空闲显存校验；
+- 不要因为 `config.max_position_embeddings == 40960` 就无条件分配 40960 长度的 cache；
+- 后续把 K/V cache 改为 FP16 后，4096 长度会降为约 0.5625 GiB，但长上下文仍要做实际显存预算；
+- Q8_0 模型文件/权重实际字节数必须从 GGUF tensor 信息统计，不能只用“8B 参数”估算后承诺一定可跑。
+
+### 8.3 单卡 prefill 参考调用流程
+
+下面是 Agent 应生成的调用骨架。`T` 可以是整个 prompt，也可以是受 workspace 限制的 prefill chunk；首版 B 固定为 1。
+
+```text
+token_ids[T]
+  └─ qwen3_z200_launch_embedding_lookup_q8_0
+       └─ x_fp32[T, 4096]                 // 只解 token 对应行，不展开整个 embedding
+
+for layer = 0 .. 35:
+  residual = x_fp32
+  h = RMSNorm(x_fp32, attn_norm)          // FP32
+
+  qkv = q8_linear(h, qkv_weight,
+                  M=T, N=6144, K=4096)    // 输出 FP32
+  split/pack -> q[T,32,128], k/v[T,8,128] // T>1 时必须搬成 compact，不能只偏移指针
+  per_head_rms(q, q_norm)
+  per_head_rms(k, k_norm)
+  RoPE(q, absolute_positions)
+  RoPE(k, absolute_positions)
+  write_kv(layer, positions, k, v)
+  attn = prefill_gqa(q, K_cache, V_cache, causal=true)
+
+  attn_out = q8_linear(attn, o_proj,
+                       M=T, N=4096, K=4096)
+  x_fp32 = residual + attn_out
+
+  residual = x_fp32
+  h = RMSNorm(x_fp32, ffn_norm)
+  gate_up = q8_linear(h, gate_up_weight,
+                      M=T, N=24576, K=4096)
+  ffn = strided_SwiGLU(gate_up)            // 或先 pack gate/up 再调用现有 SwiGLU
+  down = q8_linear(ffn, down_proj,
+                   M=T, N=4096, K=12288)
+  x_fp32 = residual + down
+
+last_hidden = RMSNorm(x_fp32[T-1], final_norm)
+logits[1,V] = q8_linear(last_hidden, lm_head,
+                        M=1, N=151936, K=4096)
+```
+
+关键点是 LM Head 的 `M=1`：prefill 生成只需要最后一个 prompt token 的 logits。绝不能为了取最后一行而计算 `[T, 151936]` 的完整 logits。若将 prompt 分块，还必须确保 attention 保持全局 causal 语义，且最终仅在最后一个 chunk 的最后一个位置执行 LM Head。
+
+这里的 QKV split/pack 和 strided SwiGLU 是 `T>1` prefill 的正确性要求，当前参考源码尚未提供这两个 helper；原因和两种补齐方式见 `04_qwen3_z200_operator_contract.md` 第 6 节。
+
+### 8.4 单卡 decode 参考调用流程
+
+Decode 复用同一套 buffer 和线性接口，但所有线性层的 `M=1`：
+
+```text
+token_id -> Q8_0 embedding row -> x_fp32[1,H]
+
+for each layer:
+  attn norm
+  q8 qkv linear (M=1)
+  q/k per-head norm -> RoPE(position=cache.length)
+  write K/V at cache.length
+  decode GQA over [0, cache.length]
+  q8 o linear (M=1) -> residual add
+  ffn norm
+  q8 gate-up linear (M=1) -> SwiGLU
+  q8 down linear (M=1) -> residual add
+
+final norm
+q8 lm_head linear (M=1) -> logits[V]
+sample -> cache.length += 1
+```
+
+在此正确性版本中，每层的 QKV、O、gate-up、down，以及最终 LM Head 都会在各自调用前解量化一次。不要把“每个算子都解量化”理解成要单独保存 36 层的 FP16 副本；它们按流串行地覆盖同一个权重 workspace。
+
+为了先跑通，允许这种重复解量化；为了提高 decode 速度，后续应优先实现直接读取 Q8_0 的 fused GEMV/GEMM（decode 的 `M=1` 特别适合 GEMV），而不是长期依赖“整矩阵解到 FP16 + hipBLAS”。
+
+### 8.5 Embedding 与 LM Head 的特殊处理
+
+**Embedding 不是 GEMM。** 调用 `qwen3_z200_launch_embedding_lookup_q8_0()`，根据 token id 找到 `[H]` 行并在读取时解成 FP32。一次 prompt 只解 `T * H` 个元素；decode 只解一行。禁止先把 `[V,H]` embedding 全部展开为 FP16/FP32。
+
+**LM Head 首版可以不分块。** 使用通用 `qwen3_z200_q8_linear_fp32()`，传入 `M=1, N=V, K=H`，把整个独立 `lm_head.weight` 解到约 1.159 GiB FP16 workspace 后做一次 GEMM。Qwen3-8B 的 `tie_word_embeddings=false`，不能默认拿 embedding 指针代替 LM Head。
+
+只有在显存检查失败时，才将 vocab 维分块。例如 `vocab_chunk=16384`：
+
+```text
+for v0 in range(0, V, vocab_chunk):
+    rows = min(vocab_chunk, V - v0)
+    dequant lm_head[v0:v0+rows, :] -> smaller FP16 workspace
+    GEMM [1,H] x [rows,H]^T -> logits[v0:v0+rows]
+```
+
+分块不改变数学结果，只减少峰值 workspace；会增加 kernel/GEMM 调度次数。第一版显存足够时不应把它设为前置条件。
+
+### 8.6 Agent 实现边界与验收
+
+Agent 按本节实现时，必须满足：
+
+- 所有 workspace 在初始化时分配并在模型销毁时释放，逐 token 路径无 `hipMalloc/hipFree`；
+- 每个 launch 和 hipBLAS 调用都检查返回值，错误信息至少包含 layer、算子名和 `(M,N,K)`；
+- 同一线性调用的 cast、dequant、GEMM 位于同一 stream，权重 workspace 在 GEMM 消费完成前不得被下一条并发 stream 覆盖；
+- 正常逐层执行不调用 `hipDeviceSynchronize()`；调试时可在层边界同步定位错误；
+- 启动日志打印 Q8_0 权重总字节数、KV cache、两个 FP16 workspace、FP32 激活/中间区和剩余显存；
+- 先通过第 9 节的数值验证，再评估或实现 Q8_0 fused GEMV、FP16 KV cache、prefill 优化和 LM Head 分块。
+
+这份首版流程保证的是接口和数学路径闭合。Z200 的 `gfx906` 编译、hipBLAS 版本兼容性以及实卡数值结果仍必须在目标环境验证，不能只以静态源码测试代替。
+
+## 9. 生成循环与验证顺序
 
 最小生成循环应当是：
 
@@ -238,7 +430,7 @@ decode(token_1) → logits      → sample(token_2)
 4. 固定 greedy sampling，比较连续生成的 token id；不一致时优先检查 QKV 拼接、gate/up 顺序、Q/K norm、RoPE position、KV 写入索引和残差加法。
 5. 只在正确性通过后，才融合 RMSNorm+residual、QKV GEMM、RoPE、paged attention 或加入 CUDA Graph。
 
-## 9. 后续 TP=4 扩展（不是第一版前置条件）
+## 10. 后续 TP=4 扩展（不是第一版前置条件）
 
 来源契约的 TP=4 每 rank 数值为：`Nq=8`、`Nkv=2`、`q_size=1024`、`kv_size=256`。可沿输出维切分并在每 rank 内按同样的 `Q-K-V`、`gate-up` 顺序融合：
 
@@ -251,7 +443,7 @@ local_gate_up = [2 * (12288 / 4), 4096]  = [6144, 4096]
 
 TP 下要保证每个 rank 的 K/V cache 只存自己的两个 KV heads；不要在每 rank 复制全量 KV heads，否则既浪费显存也容易和本地 Q head 的映射混淆。
 
-## 10. 实现前检查表
+## 11. 实现前检查表
 
 - [ ] 从 `config.json` 读取所有字段，并验证 `H == Nq * D`、`Nq % Nkv == 0`。
 - [ ] HF 权重名使用 Qwen3-8B 的 `model.layers.*` 前缀，而非 Qwen3.5/3.6 的 `model.language_model.*`。
@@ -260,4 +452,9 @@ TP 下要保证每个 rank 的 K/V cache 只存自己的两个 KV heads；不要
 - [ ] 注意力缩放为 `1/sqrt(head_dim)`，并按 4 个 Q head 共享一个 KV head 实现 GQA。
 - [ ] 两次残差加法均存在：attention 后一次，MLP 后一次。
 - [ ] 最终 RMSNorm 后才做 lm head，并在第一版仅提取最后位置的 logits。
+- [ ] Z200 单卡 Q8_0 路径使用“激活 cast FP16 + 当前权重解量化 FP16 + hipBLAS FP32 累加”，没有把 Q8_0 指针直接传给普通 INT8 GEMM。
+- [ ] Embedding 仅解量化 token 对应行；未把整个 `[V,H]` embedding 展开。
+- [ ] 不分块 LM Head 的 FP16 权重 workspace 至少为 `151936 * 4096` 个元素，prefill/decode 均只以 `M=1` 计算最终 logits。
+- [ ] FP32 KV cache 按实际 `max_seq_len` 做显存预算，单卡首版不因配置上限而盲目分配 40960 长度。
+- [ ] 逐层复用初始化时分配的 workspace，forward 内无反复 `hipMalloc/hipFree`。
 - [ ] 先完成 prefill/decode 等价性测试，再做融合或并行优化。
