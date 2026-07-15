@@ -44,7 +44,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import phases as P
-from ...iteration import IterationWorkspace
+from .plugin import PLUGIN
+from metainfer.orchestrator.iteration import IterationWorkspace
 from .prompts import (
     c_repair_followup_prompt,
     c_repair_prompt,
@@ -58,8 +59,21 @@ from .prompts import (
     review_prompt,
     write_test_harness_prompt,
 )
-from ...state import IterationRecord, StateStore
-from ...subagent_manager import AgentSpec, SubAgentManager
+from metainfer.orchestrator.state import StateStore
+from metainfer.orchestrator.subagent_manager import AgentSpec, SubAgentManager
+from metainfer.orchestrator.token_budget import TokenBudget
+from .iteration_record import IterationRecord
+
+
+def _load_iter(store: StateStore, n: int) -> Optional[IterationRecord]:
+    """Convert the shared store's opaque dict into this task's schema."""
+    data = store.load_iteration(n)
+    return IterationRecord.from_dict(data) if data else None
+
+
+def _write_iter(store: StateStore, rec: IterationRecord) -> None:
+    """Persist this task's record through the shared opaque store."""
+    store.write_iteration(rec.iteration, rec.to_dict())
 
 
 JSON_LINE_RE = re.compile(r"\{.*\}")
@@ -192,10 +206,12 @@ class Orchestrator:
         store: StateStore,
         cfg: OrchestratorConfig,
         manager: Optional[SubAgentManager] = None,
+        budget: Optional[TokenBudget] = None,
     ) -> None:
         self.req = req
         self.store = store
         self.cfg = cfg
+        self.budget = budget
         self.manager = manager or SubAgentManager(
             claude_bin=cfg.claude_bin,
             default_model=cfg.model,
@@ -211,6 +227,7 @@ class Orchestrator:
         )
         self.workspace = IterationWorkspace(
             cfg.iterations_root, logs_root=cfg.logs_root,
+            diagnostic_globs=PLUGIN.diagnostic_globs,
         )
         self._stop = False
         # Set when run() no-ops because the task was already finished.
@@ -300,7 +317,7 @@ class Orchestrator:
         #    "interrupted" marker) so the user can see what happened.
         discarded = self.workspace.discard_latest_incomplete()
         if discarded is not None:
-            old_rec = self.store.load_iteration(discarded)
+            old_rec = _load_iter(self.store, discarded)
             # Capture the phase the iteration was in when the orchestrator
             # died, if we can tell from the partial phases dict.
             interrupted_in = None
@@ -331,7 +348,7 @@ class Orchestrator:
             # Look at the iteration just before the discarded one to recover
             # context (failure reason, outcome) so the retry has the same
             # starting point as the original attempt.
-            prev_rec = self.store.load_iteration(iter_num - 1) if iter_num > 1 else None
+            prev_rec = _load_iter(self.store, iter_num - 1) if iter_num > 1 else None
             if prev_rec is not None:
                 last_outcome = prev_rec.outcome
                 if start_phase == "B_implement" and prev_rec.outcome != P.OK:
@@ -340,7 +357,7 @@ class Orchestrator:
             # All existing iterations complete → start a fresh next one
             # whose phase is determined by the last iteration's outcome.
             last_complete = self.workspace.latest_complete_number()
-            prev_rec = self.store.load_iteration(last_complete) if last_complete else None
+            prev_rec = _load_iter(self.store, last_complete) if last_complete else None
             iter_num = last_complete + 1
             start_phase = self._phase_after(prev_rec)
             carried_failure = (
@@ -435,7 +452,7 @@ class Orchestrator:
                     started_at=time.time(),
                     start_phase=phase,
                 )
-                self.store.write_iteration(iter_rec)
+                _write_iter(self.store, iter_rec)
                 # Reset per-iteration session state — the new iteration's
                 # code tree is a fresh starting point, so resuming from
                 # the prior iter's B/C sessions would only confuse the
@@ -475,6 +492,48 @@ class Orchestrator:
                 phase_rec["failure"] = failure
             if perf:
                 phase_rec["perf"] = perf
+
+            # ---- token-budget circuit breaker ------------------------------ #
+            # After every phase, check whether the task's cost budget has
+            # been exhausted. If so: close the current iteration (with
+            # status=aborted so the WebUI distinguishes "we ran out of
+            # money" from "the agent gave up"), write a timeline event,
+            # set final_status, and break. Subsequent launch() calls
+            # would refuse anyway via the budget's own pre-check; this
+            # loop-level check is what makes the exit prompt + clean.
+            if self.budget is not None and self.budget.snapshot().exhausted:
+                snap = self.budget.snapshot()
+                budget_reason = (
+                    f"token budget exhausted: used ${snap.total_cost_usd:.4f} "
+                    f">= limit ${snap.limit_cost_usd:.4f} "
+                    f"(agents={snap.agent_count}, "
+                    f"in_tokens={snap.total_input_tokens}, "
+                    f"out_tokens={snap.total_output_tokens})"
+                )
+                # Close the iteration as failed (the only closed state
+                # besides success) but stamp outcome=ABORTED so the
+                # record distinguishes "ran out of budget" from "agent
+                # gave up". The TASK-level run.json::final_status is
+                # where we surface "aborted" to the WebUI.
+                self._close_iteration(
+                    iter_rec, status="failed",
+                    failure=budget_reason, perf=ctx.this_iter_perf,
+                    outcome=P.ABORTED,
+                )
+                self.store.append_timeline(
+                    "token_budget_exhausted",
+                    {
+                        "phase": phase, "iteration": iter_num,
+                        "used_cost_usd": snap.total_cost_usd,
+                        "limit_cost_usd": snap.limit_cost_usd,
+                        "agent_count": snap.agent_count,
+                        "per_source": snap.per_source,
+                        "per_phase": snap.per_phase,
+                    },
+                )
+                final_status = "aborted"
+                phase = "finished"
+                break
 
             # ---- escalation: too many attempts at this phase in this folder #
             # Instead of aborting the whole run, close this iteration as
@@ -871,7 +930,7 @@ class Orchestrator:
         retro path survives the close write — loading a fresh copy from
         the store here would be a lost update (close would overwrite it).
         """
-        prev_rec = self.store.load_iteration(n - 1) if n > 1 else None
+        prev_rec = _load_iter(self.store, n - 1) if n > 1 else None
         prev_perf = dict(prev_rec.perf) if prev_rec and prev_rec.perf else None
         # Goal: prefer the most recent plan-level goal we can find. We
         # don't currently store a one-line goal separately on the record,
@@ -916,7 +975,7 @@ class Orchestrator:
         # record now so the path is durable even if the orchestrator dies
         # between here and the close write.
         rec.retrospective_path = str(retro_path)
-        self.store.write_iteration(rec)
+        _write_iter(self.store, rec)
         self.store.append_timeline(
             "retrospective_written",
             {"iteration": n, "path": str(retro_path),
@@ -1412,7 +1471,7 @@ class Orchestrator:
         which is where :meth:`IterationWorkspace._copy_prev_diagnostics`
         will land the snapshot during ``open_iteration(iter_num + 1)``.
         """
-        from ...iteration import PREV_ITER_LOGS_SUBDIR
+        from metainfer.orchestrator.iteration import PREV_ITER_LOGS_SUBDIR
 
         next_logs = self._logs_dir_for(iter_num + 1)
         snap = next_logs / PREV_ITER_LOGS_SUBDIR
@@ -1509,7 +1568,7 @@ class Orchestrator:
 
         # record into the iteration record's phases dict (best-effort)
         try:
-            rec = self.store.load_iteration(iteration)
+            rec = _load_iter(self.store, iteration)
             if rec is not None:
                 rec.phases.setdefault(role, {}).update({
                     "duration_s": result.duration_s,
@@ -1521,7 +1580,7 @@ class Orchestrator:
                     "log_file": str(spec.log_file(result.attempts)),
                     "session_id": result.session_id,
                 })
-                self.store.write_iteration(rec)
+                _write_iter(self.store, rec)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1542,10 +1601,10 @@ class Orchestrator:
     def _set_phase(self, n: int, iter_dir: Path, phase: P.Phase) -> None:
         self.store.update_run(current_iteration=n, current_phase=phase)
         self.store.append_timeline("phase_start", {"iteration": n, "phase": phase})
-        rec = self.store.load_iteration(n)
+        rec = _load_iter(self.store, n)
         if rec is not None:
             rec.phases.setdefault(phase, {"started_at": time.time()})
-            self.store.write_iteration(rec)
+            _write_iter(self.store, rec)
 
     def _close_iteration(
         self,
@@ -1577,7 +1636,7 @@ class Orchestrator:
                     {"iteration": rec.iteration,
                      "error": f"close-path raised: {exc!r}"},
                 )
-        self.store.write_iteration(rec)
+        _write_iter(self.store, rec)
         # Mark the folder complete *after* the record write so the sentinel
         # is a durable signal that the close path ran end-to-end. An
         # iteration that lacks this sentinel on resume was killed mid-flight.

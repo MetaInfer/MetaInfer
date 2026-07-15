@@ -187,12 +187,23 @@ TRANSITIONS: Dict[Tuple[Phase, Outcome], Transition] = {
                                                   label="new iter",
                                                   carry_failure=False, consume_iteration=True),
 
-    # ---- infra failures: retry in place, same folder ---------------------- #
+    # ---- infra failures --------------------------------------------------- #
     # B is intentionally excluded — see the dedicated B-fail block below.
+    #
+    # A_plan: rare (no GPU work, just agent). Retry in place is fine.
     ("A_plan",       INFRA_FAIL): Transition("A_plan",       INFRA_FAIL, "A_plan",
                                              label="retry", carry_failure=False, consume_iteration=False),
-    ("E_perf_test",  INFRA_FAIL): Transition("E_perf_test",  INFRA_FAIL, "E_perf_test",
-                                             label="retry", carry_failure=False, consume_iteration=False),
+    # E_perf_test: GPU OOM / serve.sh hang / ccb crash. Retrying in place
+    # traps the loop in a 2-hour spiral (PerfOracle waits on the same hung
+    # server, OOMs again). Close the iteration and replan: A_plan in the
+    # next iteration sees the carried failure ("E_perf_test crashed: HIP
+    # OOM") and can adjust the plan (smaller batch / KV cache / etc.).
+    # SubAgentManager already retried the agent internally, so in-place
+    # retry at the pipeline level adds no value here.
+    ("E_perf_test",  INFRA_FAIL): Transition("E_perf_test",  INFRA_FAIL, "A_plan",
+                                             label="E infra → replan",
+                                             carry_failure=True, consume_iteration=True),
+    # F_perf_plan: short (no GPU). Retry in place is fine.
     ("F_perf_plan",  INFRA_FAIL): Transition("F_perf_plan",  INFRA_FAIL, "F_perf_plan",
                                              label="retry", carry_failure=False, consume_iteration=False),
 

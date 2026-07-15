@@ -167,13 +167,21 @@ class InferFrameworkOracle(Oracle):
             judge_inputs: List[JudgeInput] = []
             preliminary: List[OracleCaseResult] = []
             for cfg, resp, status, elapsed, err in case_results_raw:
+                gating = cfg.get("gating") or "hard"
                 if err is not None or status is None or status >= 500:
-                    # infra-level failure — no point judging
+                    # infra-level failure — no point judging.
+                    # NOTE: even "soft" cases escalate to hard when the
+                    # failure is infrastructural (HTTP 5xx / timeout). A
+                    # model getting the wrong number is soft; the server
+                    # being unreachable is a real framework regression.
+                    if gating == "soft":
+                        gating = "hard"
                     preliminary.append(OracleCaseResult(
                         case_id=cfg["id"], prompt=cfg["prompt"], response=resp,
                         elapsed_s=elapsed, http_status=status, error=err,
                         judge_verdict="error",
                         judge_reason=f"http error: status={status} err={err}",
+                        gating=gating,
                     ))
                 else:
                     preliminary.append(None)  # placeholder, filled below
@@ -182,7 +190,15 @@ class InferFrameworkOracle(Oracle):
                         user_prompt=cfg["prompt"],
                         model_response=resp,
                         expected_keywords=cfg.get("expected_keywords") or [],
+                        # Stash gating on JudgeInput? Judge doesn't see
+                        # it. We'll re-stamp from cfg after the verdict
+                        # comes back, keyed by case_id.
                     ))
+
+            # Build cfg lookup by case_id so we can stamp gating onto
+            # judge results (JudgeInput doesn't carry it through).
+            gating_by_id = {cfg["id"]: (cfg.get("gating") or "hard")
+                            for cfg, *_ in case_results_raw}
 
             # Run judge sub-agent (if manager available)
             judged: List[OracleCaseResult] = []
@@ -196,7 +212,7 @@ class InferFrameworkOracle(Oracle):
                 judge_mode = "llm"
             else:
                 # Heuristic-only path (no manager passed — e.g. dry-run)
-                from ....oracles.judge import heuristic_verdict
+                from metainfer.orchestrator.oracles.judge import heuristic_verdict
                 judged = []
                 for ji in judge_inputs:
                     v = heuristic_verdict(ji)
@@ -212,22 +228,36 @@ class InferFrameworkOracle(Oracle):
             ji_idx = 0
             for entry in preliminary:
                 if entry is None:
-                    # augment judged entry with http status + timing
+                    # augment judged entry with http status + timing + gating
                     j = judged[ji_idx]; ji_idx += 1
                     # find raw timing
                     raw = next((c for c in case_results_raw if c[0]["id"] == j.case_id), None)
                     if raw:
                         j.http_status = raw[2]
                         j.elapsed_s = raw[3]
+                    j.gating = gating_by_id.get(j.case_id, "hard")
                     final_cases.append(j)
                 else:
                     final_cases.append(entry)
 
-            # Aggregate
+            # Aggregate — SOFT-GATE POLICY:
+            # Only HARD cases gate the pass verdict. SOFT cases (e.g.
+            # arith-basic on an 8B model) are still recorded + surfaced
+            # in failure_reason for visibility, but their failure alone
+            # doesn't flip passed=False. This avoids burning repair
+            # budget on model-quality limitations that no framework
+            # change can fix.
             total = len(final_cases)
             passed = sum(1 for c in final_cases if c.judge_verdict == "pass")
-            failed_cases = [c for c in final_cases if c.judge_verdict != "pass"]
-            all_passed = total > 0 and passed == total
+            hard_cases = [c for c in final_cases if c.gating != "soft"]
+            soft_cases = [c for c in final_cases if c.gating == "soft"]
+            hard_failed = [c for c in hard_cases if c.judge_verdict != "pass"]
+            soft_failed = [c for c in soft_cases if c.judge_verdict != "pass"]
+            hard_total = len(hard_cases)
+            hard_passed = len(hard_cases) - len(hard_failed)
+            # All HARD cases pass (and at least one exists) → oracle
+            # passes. Soft failures are noted in `reason` for visibility.
+            all_passed = hard_total > 0 and len(hard_failed) == 0
 
             # Perf: average first-token-ish latency (rough proxy)
             avg_latency = (sum(c.elapsed_s for c in final_cases) / total) if total else 0.0
@@ -235,12 +265,35 @@ class InferFrameworkOracle(Oracle):
                 "oracle_avg_http_latency_ms": round(avg_latency * 1000, 2),
                 "oracle_cases_total": float(total),
                 "oracle_cases_passed": float(passed),
+                "oracle_hard_total": float(hard_total),
+                "oracle_hard_passed": float(hard_passed),
+                "oracle_soft_total": float(len(soft_cases)),
+                "oracle_soft_passed": float(len(soft_cases) - len(soft_failed)),
             }
 
+            # Build failure_reason. Hard failures gate the verdict; soft
+            # failures are surfaced as an advisory tail so the user sees
+            # model-quality limitations without the oracle failing on them.
             reason = None
             if not all_passed:
-                bits = [f"{c.case_id}={c.judge_verdict}" for c in failed_cases[:5]]
-                reason = f"{len(failed_cases)}/{total} cases failed: {', '.join(bits)}"
+                hard_bits = [f"{c.case_id}={c.judge_verdict}"
+                             for c in hard_failed[:5]]
+                reason = (
+                    f"{len(hard_failed)}/{hard_total} hard cases failed: "
+                    f"{', '.join(hard_bits)}"
+                )
+            if soft_failed:
+                soft_bits = [f"{c.case_id}={c.judge_verdict}"
+                             for c in soft_failed[:5]]
+                advisory = (
+                    f"{len(soft_failed)}/{len(soft_cases)} soft cases "
+                    f"failed (advisory only, model-quality probe, does NOT "
+                    f"block the verdict): {', '.join(soft_bits)}"
+                )
+                if reason:
+                    reason = reason + "; " + advisory
+                else:
+                    reason = advisory
 
             result = OracleResult(
                 passed=all_passed,
@@ -293,12 +346,7 @@ def _run_build_check(
     extra_env: Optional[Dict[str, str]] = None,
     timeout_s: int = 900,
 ) -> Tuple[bool, Optional[str]]:
-    """Run the C++ build before booting serve.sh.
-
-    Keeping this in the immutable oracle gives the agent a clear failure
-    class: compile/link errors are reported as build failures, not as a
-    vague server-health timeout.
-    """
+    """Run the C++ build before booting serve.sh."""
     out_path = report_dir / "cpp-build.stdout.log"
     err_path = report_dir / "cpp-build.stderr.log"
     env = dict(os.environ)
@@ -341,7 +389,7 @@ def _start_server(
     # oracle, etc.) can leave model weights stranded in VRAM; our serve.sh
     # then OOMs at load time and the C step fails with a confusing "out
     # of memory" that has nothing to do with the agent's code.
-    from ....gpu_preflight import preflight_gpu
+    from metainfer.orchestrator.gpu_preflight import preflight_gpu
     preflight_gpu(label="c-oracle")
 
     log_fp = open(report_dir / "server.stdout.log", "wb")

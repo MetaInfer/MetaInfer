@@ -8,7 +8,7 @@ hands control to the ABCDEF iteration loop in :mod:`.pipeline`.
 The shared PID / signal / process-name / SubAgentManager machinery lives
 in :mod:`metainfer.orchestrator._bootstrap` — every orchestrator package
 uses the same lifecycle. This file holds only the gen-cpp-infer-framework-
-specific bits: the ``code/`` + ``logs/`` + ``iterations/`` subdir
+specific bits: the separate generated-code workspace and metadata/log
 schema, the OrchestratorConfig wiring, and the iteration-loop entry.
 """
 
@@ -18,16 +18,16 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from ..._bootstrap import (
+from metainfer.orchestrator._bootstrap import (
     clear_pid_file,
     install_subagent_shutdown_handlers,
     make_subagent_manager,
     set_process_name,
     write_pid_file,
 )
-from ...paths import notebooks_dir as _notebooks_dir
-from ...paths import repo_root as _repo_root
-from ...state import StateStore
+from metainfer.orchestrator.paths import repo_root as _repo_root
+from metainfer.orchestrator.state import StateStore
+from metainfer.orchestrator.token_budget import TokenBudget
 from .pipeline import Orchestrator, OrchestratorConfig
 
 
@@ -35,38 +35,36 @@ from .pipeline import Orchestrator, OrchestratorConfig
 # placeholder and can grow its own hardware, build, and profiling contracts
 # without mixing them into the Python-oriented inference task's notebooks.
 _NOTEBOOKS_DIR = Path(__file__).resolve().parent.parent / "notebooks"
+
+
 # --------------------------------------------------------------------------- #
 # Per-task state_dir layout for the gen-cpp-infer-framework task type
 # --------------------------------------------------------------------------- #
 #
-#   <state_dir>/
-#   ├── requirements.json       # frozen inputs (read at start)
-#   ├── orchestrator.pid        # PID of the running orchestrator (or last)
-#   ├── orchestrator.log        # stdout+stderr, for debugging
-#   ├── run.json                # RunStatus (live phase / iteration / outcome)
-#   ├── timeline.jsonl          # append-only event log
+#   <state_dir>/               # hidden metadata owned by the server
+#   ├── requirements.json
+#   ├── orchestrator.{pid,log}
+#   ├── run.json / timeline.jsonl / agents.json
 #   ├── iterations/<n>.json     # per-iteration records
-#   ├── agents.json             # SubAgentManager snapshot (live agents)
-#   ├── code/                   # iteration CODE root (visible to user)
-#   │   ├── 001/
-#   │   └── 002/
-#   └── logs/                   # per-iteration agent/oracle/server logs
-#       ├── 001/
-#       └── 002/
+#   └── logs/<NNN>/             # prompts, transcripts, oracle logs
+#
+#   <workspace_dir>/           # visible generated artifacts
+#   ├── 001/
+#   └── 002/
 
 
-def _task_subdirs(state_dir: Path) -> Dict[str, Path]:
-    """Return the canonical sub-paths under ``state_dir``. All directories
-    are created on first call."""
+def _task_subdirs(state_dir: Path, workspace_dir: Path) -> Dict[str, Path]:
+    """Return the canonical metadata and generated-artifact paths."""
     state_dir.mkdir(parents=True, exist_ok=True)
-    code = state_dir / "code"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
     logs = state_dir / "logs"
     iterations_state = state_dir / "iterations"
-    for p in (code, logs, iterations_state):
+    for p in (logs, iterations_state):
         p.mkdir(parents=True, exist_ok=True)
     return {
         "state_dir": state_dir,
-        "code_root": code,
+        "workspace_dir": workspace_dir,
+        "code_root": workspace_dir,
         "logs_root": logs,
         "iterations_state": iterations_state,
         "requirements": state_dir / "requirements.json",
@@ -82,6 +80,7 @@ def run_with_requirements(
     requirements_path: Path,
     *,
     state_dir: Optional[Path] = None,
+    workspace_dir: Optional[Path] = None,
     claude_bin: str = "ccb",
     model: Optional[str] = None,
     permission_mode: str = "bypassPermissions",
@@ -96,8 +95,8 @@ def run_with_requirements(
     ``requirements_path`` is the same file), runs the ABCDEF loop to
     completion, and exits.
 
-    All artifacts go under ``state_dir`` (or a default location derived
-    from CWD if not provided — kept for ad-hoc CLI debugging).
+    Metadata and logs go under ``state_dir``; generated iteration trees go
+    under the parallel ``workspace_dir``. The WebUI passes both explicitly.
     """
     if not requirements_path.exists():
         raise FileNotFoundError(f"requirements file not found: {requirements_path}")
@@ -112,12 +111,13 @@ def run_with_requirements(
     # truncates to 15 chars anyway; this is already 14).
     set_process_name("metainfer-orch")
 
-    # Resolve state_dir. Default: <cwd>/.metainfer/tasks/<task_id>/ — keeps
-    # ad-hoc CLI usage working without the WebUI. The WebUI always passes
-    # an explicit state_dir under ~/.metainfer/tasks/<id>/.
-    if state_dir is None:
-        state_dir = Path.cwd() / ".metainfer" / "tasks" / task_id
-    paths = _task_subdirs(state_dir)
+    if state_dir is None or workspace_dir is None:
+        from metainfer.server import paths as _server_paths
+        if state_dir is None:
+            state_dir = _server_paths.task_dir(task_id)
+        if workspace_dir is None:
+            workspace_dir = _server_paths.workspace_dir(task_id)
+    paths = _task_subdirs(state_dir, workspace_dir)
 
     # Copy requirements into state_dir if invoked from elsewhere so the
     # task is fully self-contained (WebUI re-reads it from there).
@@ -132,7 +132,7 @@ def run_with_requirements(
     write_pid_file(paths["pid_file"], task_id)
 
     repo_root = _repo_root()
-    notebooks_dir = _notebooks_dir()
+    notebooks_dir = _NOTEBOOKS_DIR
     logs_root = paths["logs_root"]
     iterations_root = paths["code_root"]
 
@@ -151,24 +151,65 @@ def run_with_requirements(
         extra_claude_args=list(extra_claude_args or []),
     )
 
+    # Build the per-task token/cost budget. Reads ``token_budget`` block
+    # from requirements.json (e.g. {"max_cost_usd": 50.0}); env override
+    # METAINFER_TOKEN_BUDGET_COST_USD wins over both. When no limit is
+    # set, budget is None and the circuit breaker is inert.
+    budget = _build_budget(state_dir, req)
+    if budget is not None:
+        # Mirror every record into timeline.jsonl so the WebUI can draw
+        # a live cost-over-time graph without re-parsing events.jsonl.
+        # We attach this AFTER construction (the budget may already have
+        # loaded historical records from disk; those don't fire the
+        # callback, only new records do).
+        store_for_cb = store
+        budget._on_recorded = lambda rec, snap: store_for_cb.append_timeline(
+            "token_usage",
+            {
+                "agent": rec.agent,
+                "source": rec.source,
+                "phase": rec.phase,
+                "input_tokens": rec.input_tokens,
+                "output_tokens": rec.output_tokens,
+                "cache_read_input_tokens": rec.cache_read_input_tokens,
+                "cost_usd": rec.total_cost_usd,
+                "running_total_cost_usd": snap.total_cost_usd,
+                "running_total_input_tokens": snap.total_input_tokens,
+                "running_total_output_tokens": snap.total_output_tokens,
+                "agent_count": snap.agent_count,
+                "exhausted": snap.exhausted,
+            },
+        )
+
     manager = make_subagent_manager(
         claude_bin=claude_bin,
         model=model,
         permission_mode=permission_mode,
         effort=effort,
         # Sub-agent prompts reference these paths outside the iteration dir:
-        #   - notebooks/: read-only knowledge base every prompt tells agents
-        #     to consult
+        #   - notebooks_dir: the shared inference-framework knowledge base,
+        #     which every prompt tells agents to consult
         #   - repo_root: so prompts can reference paths under the install
+        #   - workspace_dir: where generated iteration source trees live
         #   - logs_root: where reviewer writes review.md and where the
         #     prev-iter diagnostic snapshot lives
-        extra_add_dirs=[notebooks_dir, repo_root, logs_root],
+        extra_add_dirs=[notebooks_dir, repo_root, workspace_dir, logs_root],
         snapshot_file=paths["agents_file"],
+        budget=budget,
     )
-    orch = Orchestrator(req=req, store=store, cfg=cfg, manager=manager)
+    # Wire the hard-exhausted callback NOW that the manager exists.
+    # When the hard threshold is crossed, every in-flight agent gets
+    # SIGTERM'd via the manager's process-group kill (soft-abort policy
+    # for the soft threshold; hard threshold = "stop bleeding right
+    # now"). The callback fires exactly once per task lifetime.
+    if budget is not None and budget.max_cost_usd_hard is not None:
+        budget._on_hard = lambda: manager.shutdown()
+    orch = Orchestrator(req=req, store=store, cfg=cfg, manager=manager,
+                        budget=budget)
 
     print(f"[metainfer] task_id        = {task_id}")
     print(f"[metainfer] state dir      = {state_dir}")
+    print(f"[metainfer] workspace dir  = {workspace_dir}")
     print(f"[metainfer] code dir       = {iterations_root}")
     print(f"[metainfer] logs dir       = {logs_root}")
     print(f"[metainfer] notebooks      = {notebooks_dir}")
@@ -203,3 +244,58 @@ def _extract_max_iter(req: Dict[str, Any], default: int = 20) -> int:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def _build_budget(state_dir: Path, req: Dict[str, Any]) -> Optional[TokenBudget]:
+    """Construct the per-task :class:`TokenBudget` from req + env.
+
+    Resolution order for the soft cost limit (first match wins):
+      1. ``METAINFER_TOKEN_BUDGET_COST_USD`` env var
+      2. ``requirements.json::token_budget.max_cost_usd`` (nested object —
+         direct requirements.json edit)
+      3. ``requirements.json::token_budget_max_cost_usd`` (flat scalar —
+         what the WebUI new-task form writes when the user fills the
+         "Cost cap" field)
+      4. None — budget circuit breaker disabled
+
+    Hard limit follows the same cascade with the ``_hard`` suffix.
+    """
+    import os
+
+    tb_cfg = (req.get("token_budget")
+              or req.get("answers", {}).get("token_budget")
+              or {})
+    if not isinstance(tb_cfg, dict):
+        tb_cfg = {}
+
+    def _resolve_float(env_key: str, conf_key: str,
+                       flat_key: Optional[str] = None) -> Optional[float]:
+        env_v = os.environ.get(env_key)
+        if env_v:
+            try:
+                return float(env_v)
+            except ValueError:
+                pass
+        # nested object first
+        v = tb_cfg.get(conf_key)
+        if v is None and flat_key:
+            v = req.get(flat_key)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    soft = _resolve_float("METAINFER_TOKEN_BUDGET_COST_USD", "max_cost_usd",
+                          flat_key="token_budget_max_cost_usd")
+    hard = _resolve_float("METAINFER_TOKEN_BUDGET_COST_USD_HARD",
+                          "max_cost_usd_hard",
+                          flat_key="token_budget_max_cost_usd_hard")
+    if soft is None and hard is None:
+        return None
+    return TokenBudget(
+        state_dir,
+        max_cost_usd=soft,
+        max_cost_usd_hard=hard,
+    )

@@ -111,7 +111,7 @@ class RequestResult:
     """One HTTP request's outcome."""
     case_id: str
     elapsed_s: float
-    http_status: Optional[int]
+    http_status: Optional[int] = None
     output_text: str = ""
     output_tokens: int = 0
     input_tokens: int = 0
@@ -234,7 +234,7 @@ def _start_server(
     # Kill any orphan process holding GPU VRAM before booting. The perf
     # sweep loads the model once and stresses it; any leftover allocation
     # from a previous run causes spurious OOM or skewed throughput numbers.
-    from ....gpu_preflight import preflight_gpu
+    from metainfer.orchestrator.gpu_preflight import preflight_gpu
     preflight_gpu(label="e-oracle")
 
     log_fp = open(report_dir / "perf-server.stdout.log", "wb")

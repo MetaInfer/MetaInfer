@@ -1,14 +1,14 @@
 """CLI for the gen-cpp-infer-framework orchestrator subprocess.
 
 The orchestrator runs as a child of the WebUI server (see
-:mod:`metainfer.web.launcher`). One orchestrator per task, spawned when
+:mod:`metainfer.server.launcher`). One orchestrator per task, spawned when
 the user submits a new task via the web form, exits when the task
 completes or stops.
 
 Direct CLI usage (for debugging without the WebUI):
 
-    python -m metainfer.orchestrator.tasks.gen_cpp_infer_framework.cli run requirements.json
-    python -m metainfer.orchestrator.tasks.gen_cpp_infer_framework.cli run requirements.json --state-dir /path/to/task
+    python -m metainfer.tasks.gen_cpp_infer_framework.orchestrator.cli run requirements.json
+    python -m metainfer.tasks.gen_cpp_infer_framework.orchestrator.cli run requirements.json --state-dir /path/to/state --workspace-dir /path/to/workspace
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ DEFAULT_CLAUDE_BIN = "ccb"
 
 # Claude Code permission mode for sub-agents. Sub-agents are non-interactive
 # (`-p` with stdin), so `default` mode hangs on every Edit/Write prompt.
-# See the longer rationale in metainfer.web.forms / SKILL docs.
+# See the longer rationale in metainfer.server.forms / task docs.
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 _VALID_PERMISSION_MODES = ("default", "acceptEdits", "plan", "bypassPermissions", "auto")
 
@@ -81,9 +81,17 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help=(
-            "Where to put all task artifacts (state, code, logs). Default: "
-            "<cwd>/.metainfer/tasks/<task_id>/. The WebUI passes an "
-            "explicit --state-dir under ~/.metainfer/tasks/<id>/."
+            "Metadata dir (run.json, timeline.jsonl, logs, iteration records). "
+            "The WebUI passes this explicitly."
+        ),
+    )
+    run_p.add_argument(
+        "--workspace-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Generated-artifacts dir containing iteration trees (001, 002, ...). "
+            "The WebUI passes this explicitly."
         ),
     )
     run_p.add_argument(
@@ -125,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_with_requirements(
             requirements_path=args.requirements,
             state_dir=args.state_dir,
+            workspace_dir=args.workspace_dir,
             claude_bin=_resolve_claude_bin(args.claude_bin),
             permission_mode=_resolve_permission_mode(args.permission_mode),
             model=args.model,

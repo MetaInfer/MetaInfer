@@ -16,10 +16,6 @@ Failures never enter a terminal Fail state — every failure either
 retries in place, consumes the iteration, or routes back to A_plan. The
 only terminal phase is ``finished``.
 
-This package intentionally copies the ABCDEF loop instead of sharing the
-Python-focused task's implementation; the C++ contracts can diverge freely
-while keeping the same phase names and WebUI graph.
-
 Oracle layout::
 
     oracles/
@@ -32,7 +28,7 @@ Oracle layout::
 The pipeline imports these directly. No global oracle registry.
 """
 
-from .. import register
+from metainfer.orchestrator.tasks import register
 from .plugin import PLUGIN
 
 register(PLUGIN)
