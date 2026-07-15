@@ -39,15 +39,11 @@
   default: "Use CMake; no network downloads; prefer system libraries or small self-contained code."
 
 - key: features
-  question: "Which features must the C++ framework support?"
-  header: "Features"
+  question: "Which optional runtime features must the C++ framework support?"
+  header: "Optional"
   required: false
   multi: true
   options:
-    - label: "Native C++ HTTP server"
-      description: "serve.sh launches a C++ server binary"
-    - label: "CMake build"
-      description: "build.sh configures and builds with CMake"
     - label: "Paged KV cache"
       description: "Block-based KV management"
     - label: "Continuous batching"

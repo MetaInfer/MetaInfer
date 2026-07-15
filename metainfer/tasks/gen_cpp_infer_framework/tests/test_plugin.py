@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from metainfer.orchestrator.tasks import get_task
 from metainfer.tasks.gen_cpp_infer_framework.server._qa import (
@@ -31,6 +32,22 @@ from metainfer.tasks.gen_cpp_infer_framework.orchestrator.hardware import (
     resolve_hardware_profile,
 )
 from metainfer.server.registry import get as _get_web_plugin
+
+
+def test_feature_picker_only_contains_optional_runtime_capabilities():
+    form_path = Path(__file__).parents[1] / "form.yaml"
+    fields = yaml.safe_load(form_path.read_text(encoding="utf-8"))
+    features = next(field for field in fields if field["key"] == "features")
+    labels = {option["label"] for option in features["options"]}
+
+    assert "Native C++ HTTP server" not in labels
+    assert "CMake build" not in labels
+    assert labels == {
+        "Paged KV cache",
+        "Continuous batching",
+        "Tensor parallelism",
+        "Speculative decoding",
+    }
 
 
 def test_task_plugin_registered():
