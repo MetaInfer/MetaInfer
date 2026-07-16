@@ -71,15 +71,19 @@ _CPP_PHASE_NOTEBOOKS = {
         "00_contracts/cpp/cpp_framework_contracts.md",
         "00_contracts/cpp/cpp_engine_contracts.md",
         "00_contracts/cpp/cpp_memory_contracts.md",
+        "00_contracts/cpp/cpp_attention_kv_contracts.md",
         "00_contracts/cpp/cpp_qwen3_runtime_contracts.md",
         "00_contracts/cpp/dtk_hip_backend_contracts.md",
         "00_contracts/cpp/tensor_parallel_contracts.md",
+        "00_contracts/cpp/cpp_tp_communication_contracts.md",
+        "00_contracts/cpp/cpp_profiling_contracts.md",
         "00_contracts/cpp/native_service_contracts.md",
     ],
     "perf": [
         "00_contracts/cpp/dtk_hip_backend_contracts.md",
         "00_contracts/cpp/tensor_parallel_contracts.md",
-        "00_contracts/profiling_contracts.md",
+        "00_contracts/cpp/cpp_tp_communication_contracts.md",
+        "00_contracts/cpp/cpp_profiling_contracts.md",
         "09_cpp_inference/06_hip_operators.md",
         "09_cpp_inference/07_paged_kv_cache.md",
         "09_cpp_inference/08_continuous_batching.md",
@@ -114,7 +118,7 @@ def _notebooks_hint(req: Dict[str, Any], phase: str) -> str:
     features = {str(item).strip().lower() for item in raw_features}
     if "paged kv cache" in features:
         components.extend([
-            "00_contracts/attention_kv_contracts.md",
+            "00_contracts/cpp/cpp_attention_kv_contracts.md",
             "09_cpp_inference/07_paged_kv_cache.md",
         ])
     if "continuous batching" in features:
@@ -125,7 +129,7 @@ def _notebooks_hint(req: Dict[str, Any], phase: str) -> str:
     if "tensor parallelism" in features:
         components.extend([
             "00_contracts/cpp/tensor_parallel_contracts.md",
-            "00_contracts/tp_communication_contracts.md",
+            "00_contracts/cpp/cpp_tp_communication_contracts.md",
             "09_cpp_inference/09_tensor_parallelism.md",
         ])
     if "streaming responses" in features:
@@ -425,8 +429,9 @@ TERM path pays for itself on the next iteration.
 # the perf planner is blind — it can only guess at bottlenecks from
 # aggregate throughput numbers.
 #
-# The contract is fully specified in notebooks/00_contracts/profiling_contracts.md
-# and notebooks/06_profiling/01_pytorch_profiler.md. The implementer is
+# The legacy Python contract is fully specified in the sibling task package at
+# metainfer/tasks/gen_infer_framework/notebooks/00_contracts/profiling_contracts.md
+# and its 06_profiling/01_pytorch_profiler.md guide. The implementer is
 # REQUIRED to read those before writing the profile hook.
 PROFILING_INTERFACE_MANDATE = """# MANDATORY: reserve a profiling interface (gen-infer-framework)
 Your framework MUST honor a small set of `METAINFER_PROFILE*` env vars so
@@ -435,8 +440,8 @@ Without this hook, the F-step perf planner has no kernel-level visibility
 and can only guess at bottlenecks.
 
 Read the contract before writing the hook:
-  - `notebooks/00_contracts/profiling_contracts.md`
-  - `notebooks/06_profiling/01_pytorch_profiler.md`
+  - `metainfer/tasks/gen_infer_framework/notebooks/00_contracts/profiling_contracts.md`
+  - `metainfer/tasks/gen_infer_framework/notebooks/06_profiling/01_pytorch_profiler.md`
 
 Required behavior (summarized — the contract is authoritative):
 
@@ -508,6 +513,9 @@ binary."""
 
 
 CPP_PROFILING_INTERFACE_MANDATE = """# MANDATORY: native C++ profiling interface
+Read `00_contracts/cpp/cpp_profiling_contracts.md` before implementing this
+interface; it is the source of truth for signal safety, artifacts, and ranges.
+
 The E-step perf oracle sets `METAINFER_PROFILE=1` and
 `METAINFER_PROFILE_OUTDIR=<dir>`. The native runtime MUST honor these
 variables without introducing a Python serving process.

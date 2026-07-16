@@ -1,6 +1,6 @@
 # 原生 Profiling 与性能证据
 
-先读共享的 `00_contracts/profiling_contracts.md`。其中 Region 语义适用，但 Python/PyTorch Profiler 指令不适用于 C++ 卡片。
+先读 `00_contracts/cpp/cpp_profiling_contracts.md`。该契约定义原生 ROCTX/NVTX、内部 Trace、GPU Event、外部工具、Signal 和 Artifact 行为。
 
 ## 1. 稳定的环境接口
 

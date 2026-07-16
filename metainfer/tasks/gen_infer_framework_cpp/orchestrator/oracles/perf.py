@@ -284,16 +284,14 @@ def _start_server(
     if model_dir:
         env["MODEL_DIR"] = str(model_dir)
     env.setdefault("PYTHONHASHSEED", "0")
-    # Enable the in-framework profiler hook. The contract in
-    # notebooks/00_contracts/profiling_contracts.md REQUIRES the framework
-    # to honor these vars. We set duration to a large value as a backstop;
-    # the real stop trigger is the SIGTERM we send at the end of the sweep
-    # (the framework MUST call profiler.stop() + export on SIGTERM).
+    # Enable the in-framework profiler hook. The native contract in
+    # 00_contracts/cpp/cpp_profiling_contracts.md requires the framework to
+    # honor these vars. Duration is a backstop; normal shutdown is triggered
+    # by SIGTERM, which the signal handler relays to the main loop for flush.
     if profile_dir is not None:
         env["METAINFER_PROFILE"] = "1"
         env["METAINFER_PROFILE_OUTDIR"] = str(profile_dir)
         env.setdefault("METAINFER_PROFILE_DURATION_S", str(profile_duration_s))
-        env.setdefault("METAINFER_PROFILE_ACTIVITIES", "CPU,CUDA")
     else:
         # Explicitly disable in case the user had it set in their shell env.
         env["METAINFER_PROFILE"] = "0"

@@ -1,6 +1,6 @@
 # 原生 Tensor Parallel 实现指南
 
-先读：`00_contracts/cpp/tensor_parallel_contracts.md` 和共享的 `00_contracts/tp_*_contracts.md`。
+先读：`00_contracts/cpp/tensor_parallel_contracts.md` 和 `00_contracts/cpp/cpp_tp_communication_contracts.md`。前者定义权重切分，后者定义原生 Rank、Collective、Stream 和失败传播。
 
 TP 改变的是权重存储、算子输入输出和通信拓扑，不改变模型语义。必须先得到稳定的 TP=1 Logits/Token，TP=N 才有 Reference。
 

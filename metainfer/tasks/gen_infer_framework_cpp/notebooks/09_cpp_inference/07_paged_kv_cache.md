@@ -1,6 +1,6 @@
 # Paged KV Cache 原生实现
 
-先读：`00_contracts/cpp/cpp_memory_contracts.md`、共享的 `00_contracts/attention_kv_contracts.md`。共享文档提供 Attention/KV 语义，具体 C++ 所有权以本目录 Contract 为准。
+先读：`00_contracts/cpp/cpp_memory_contracts.md` 和 `00_contracts/cpp/cpp_attention_kv_contracts.md`。前者定义通用所有权，后者定义 Attention/KV 的 Shape、Block、Stream 和生命周期硬约束。
 
 Paged KV 的核心是把“请求逻辑 Token 位置”映射到“设备物理 Block”，并在分配失败、取消、TP Rank 失败时保持事务一致。
 

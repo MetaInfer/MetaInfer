@@ -25,6 +25,18 @@ from metainfer.server.registry import get as get_web_plugin
 
 TASK_TYPE = "gen-infer-framework-cpp"
 
+NATIVE_CPP_CONTRACTS = (
+    "cpp_attention_kv_contracts.md",
+    "cpp_profiling_contracts.md",
+    "cpp_tp_communication_contracts.md",
+)
+
+REMOVED_PYTHON_CONTRACTS = (
+    "attention_kv_contracts.md",
+    "profiling_contracts.md",
+    "tp_communication_contracts.md",
+)
+
 
 def _requirements():
     return {
@@ -49,6 +61,22 @@ class CppFrameworkTaskTest(unittest.TestCase):
         }
         for path in routed:
             self.assertTrue((notebooks / path).is_file(), path)
+
+    def test_native_contracts_do_not_embed_python_implementations(self):
+        notebooks = Path(__file__).resolve().parents[1] / "notebooks"
+        cpp_contracts = notebooks / "00_contracts" / "cpp"
+
+        for filename in NATIVE_CPP_CONTRACTS:
+            text = (cpp_contracts / filename).read_text(encoding="utf-8")
+            self.assertNotIn("```python", text, filename)
+            self.assertNotIn("import torch", text, filename)
+            self.assertNotIn("torch.", text, filename)
+            self.assertGreaterEqual(text.count("```cpp"), 3, filename)
+
+        for filename in REMOVED_PYTHON_CONTRACTS:
+            self.assertFalse(
+                (notebooks / "00_contracts" / filename).exists(), filename
+            )
 
     def test_card_schema_and_validation(self):
         task_ids = [entry["id"] for entry in list_task_types()]
@@ -151,6 +179,9 @@ class CppFrameworkTaskTest(unittest.TestCase):
         self.assertNotIn('python3 -c "import server"', implement)
         self.assertIn("Python runtime substitution", review)
         self.assertIn("cmake --build build --parallel", repair)
+        self.assertIn(
+            "00_contracts/cpp/cpp_profiling_contracts.md", perf_plan
+        )
 
     def test_cpp_notebook_route_and_hardware_contract_are_deterministic(self):
         req = _requirements()
@@ -178,6 +209,10 @@ class CppFrameworkTaskTest(unittest.TestCase):
         self.assertIn("COMPONENT guides", prompt)
         self.assertIn("read only the 2-5 files", prompt)
         self.assertIn("00_contracts/cpp/hardware_profile_contracts.md", prompt)
+        self.assertIn("00_contracts/cpp/cpp_attention_kv_contracts.md", prompt)
+        self.assertIn(
+            "00_contracts/cpp/cpp_tp_communication_contracts.md", prompt
+        )
         self.assertIn("09_cpp_inference/07_paged_kv_cache.md", prompt)
         self.assertIn("09_cpp_inference/08_continuous_batching.md", prompt)
         self.assertIn("09_cpp_inference/09_tensor_parallelism.md", prompt)
