@@ -1,0 +1,231 @@
+/* Task-specific CSS for knowledge-evolution.
+ *
+ * Phase pill colors matching phases.py constants.
+ * Do NOT edit the shell's sys_shell/static/styles.css;
+ * put task-specific CSS here.
+ */
+
+/* ---- Phase pills ---- */
+.phase-A_attempt_pure {
+    background: #dbeafe;
+    color: #1e40af;
+}
+.phase-B_enrich {
+    background: #fef3c7;
+    color: #92400e;
+}
+.phase-C_consolidate {
+    background: #ede9fe;
+    color: #5b21b6;
+}
+.phase-D_verify_final {
+    background: #fce7f3;
+    color: #9d174d;
+}
+.phase-finished {
+    background: #d1fae5;
+    color: #065f46;
+}
+.phase-idle {
+    background: #e5e7eb;
+    color: #374151;
+}
+
+/* ---- Mode bar ---- */
+.ke-mode-bar {
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    background: var(--bg-elev, #161b22);
+    border: 1px solid var(--border, #2a323d);
+    border-radius: 6px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.ke-mode-label {
+    font-weight: 600;
+}
+
+/* ---- Grid overrides: equal columns + 3-row layout (2+2+2) ---- */
+.task-grid {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: auto auto auto;
+}
+/* Row 3: Knowledge gained (left) + Event timeline (right) instead of full-width */
+.task-grid .panel:nth-child(5) { grid-row: 3; grid-column: 1; }
+.task-grid .panel:nth-child(6) { grid-row: 3; grid-column: 2; }
+
+/* ---- Knowledge gained panel ---- */
+.knowledge-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.knowledge-entry {
+    border: 1px solid var(--border, #2a323d);
+    border-radius: 6px;
+    padding: 10px 12px;
+}
+.knowledge-entry-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+.knowledge-iter {
+    font-weight: 600;
+    font-size: 13px;
+}
+.knowledge-summary {
+    font-size: 13px;
+    color: var(--muted, #7d8794);
+    margin: 4px 0;
+}
+.knowledge-files {
+    margin: 4px 0 0 0;
+    padding-left: 20px;
+    font-size: 12px;
+}
+.knowledge-file-link {
+    color: var(--accent, #58a6ff);
+    cursor: pointer;
+}
+.knowledge-file-link:hover {
+    text-decoration: underline;
+}
+.knowledge-file-link code {
+    font-size: 12px;
+}
+
+/* ---- Log viewer ---- */
+.log-viewer {
+    margin-top: 12px;
+    border: 1px solid var(--border, #2a323d);
+    border-radius: 6px;
+    overflow: hidden;
+}
+.log-viewer-header {
+    padding: 8px 12px;
+    background: var(--bg-elev, #161b22);
+    border-bottom: 1px solid var(--border, #2a323d);
+    font-size: 13px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+/* ---- Timeline panel scrolling ---- */
+.timeline-panel .timeline {
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.log-content {
+    max-height: 400px;
+    overflow-y: auto;
+    margin: 0;
+    padding: 12px;
+    background: #0d1117;
+    color: #c9d1d9;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+/* ---- Iterations table ---- */
+.iter-table {
+    overflow-x: auto;
+}
+.iter-table table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+.iter-table th {
+    text-align: left;
+    padding: 6px 10px;
+    border-bottom: 2px solid var(--border, #2a323d);
+    font-weight: 600;
+    color: var(--muted, #7d8794);
+    white-space: nowrap;
+}
+.iter-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border, #2a323d);
+    vertical-align: middle;
+}
+.iter-table tr:hover {
+    background: var(--bg-elev, #161b22);
+}
+.iter-table tr.selected {
+    background: rgba(88, 166, 255, 0.12);
+}
+.fail-reason {
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--err, #f85149);
+    font-size: 12px;
+}
+
+/* ---- Oracle summary table ---- */
+.ke-oracle-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin-top: 8px;
+}
+.ke-oracle-table th {
+    text-align: left;
+    padding: 4px 8px;
+    border-bottom: 2px solid var(--border, #2a323d);
+    font-weight: 600;
+    color: var(--muted, #7d8794);
+}
+.ke-oracle-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border, #2a323d);
+    vertical-align: middle;
+}
+.ke-oracle-table tr:hover {
+    background: var(--bg-elev, #161b22);
+}
+.ke-oracle-table .ke-link {
+    font-weight: 600;
+    cursor: pointer;
+    color: var(--accent, #58a6ff);
+}
+.ke-oracle-table .ke-link:hover {
+    text-decoration: underline;
+}
+
+/* ---- Mini-chart tiles (Chart.js) ---- */
+.charts-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 8px;
+    padding: 8px 0;
+}
+.mini-chart {
+    background: var(--bg-elev, #161b22);
+    border: 1px solid var(--border, #2a323d);
+    border-radius: 6px;
+    padding: 8px 12px;
+}
+.mini-chart h3 {
+    margin: 0 0 4px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted, #7d8794);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.chart-box-small {
+    height: 180px;
+    position: relative;
+}
+.charts-panel .muted {
+    padding: 8px 0;
+}
