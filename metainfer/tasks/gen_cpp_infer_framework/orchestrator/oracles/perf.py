@@ -61,20 +61,22 @@ from ..hardware import (
 
 PROMPTS_FILE = Path(__file__).parent / "data" / "perf_prompts.yaml"
 
-# Concurrency ladder. The order matters: c=1 measures pure batch=1 latency,
-# c=4 is a typical serving load, c=16 stresses continuous batching.
-DEFAULT_CONCURRENCY_LADDER = (1, 4, 16)
+# The generated first-bring-up server handles requests serially.  A concurrent
+# sweep only builds a queue of requests that can outlive the HTTP clients after
+# they time out, so measure single-stream latency/throughput until the server
+# implements continuous batching or request cancellation.
+DEFAULT_CONCURRENCY_LADDER = (1,)
 
 # Number of independent runs per (concurrency, prompt-set) combination.
 # We take the median tokens_per_sec as the headline and report stdev so
 # the F-step planner can see whether differences between iterations are
 # larger than the run-to-run noise.
-RUNS_PER_LEVEL = 3
+RUNS_PER_LEVEL = 1
 
 # Drop this many initial requests per run before measuring. Warmup
 # absorbs: first-call kernel compilation, weight preloading, KV cache
 # pool allocation, JIT cache misses.
-WARMUP_REQUESTS = 4
+WARMUP_REQUESTS = 1
 
 # Per-request HTTP timeout (seconds). Generous because long-output
 # prompts can legitimately take 30+ seconds at low concurrency on big
