@@ -22,14 +22,15 @@ A/D/E/F infra failures retry in place (same folder,
 ``consume_iteration=False``) up to :data:`MAX_PHASE_ATTEMPTS`, after which
 they close the current iteration as failed and start a fresh one back at
 ``A_plan`` (carrying the failure reason forward so the new planner can
-re-plan around it). The run only stops at the iteration cap
-(``cfg.max_iterations``). B_implement failures are special: they consume
+re-plan around it). The run stops at the iteration cap, task wall-clock cap,
+the correctness-only target, or a measured throughput target. B_implement
+failures are special: they consume
 the iteration immediately and route to A_plan for a fresh plan
 (SubAgentManager already did internal retries; piling more in-place
 retries on top traps the agent in a --resume spiral on the same failing
-approach). C's outcome always consumes the iteration on success or logic
-fail (matching the original spec: pass → next iter starts at D, fail →
-next iter starts at B).
+approach). C always continues to D in the same iteration so review can use
+the actual oracle result. D then routes a C-pass to E, or closes a C-failed
+iteration and starts a fresh A plan with the failure and review carried.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ from .prompts import (
     implement_prompt,
     implement_redo_prompt,
     perf_plan_prompt,
+    perf_review_prompt,
     perf_test_prompt,
     plan_prompt,
     retrospective_prompt,
@@ -64,6 +66,12 @@ from metainfer.orchestrator.state import StateStore
 from metainfer.orchestrator.subagent_manager import AgentSpec, SubAgentManager
 from metainfer.orchestrator.token_budget import TokenBudget
 from .iteration_record import IterationRecord
+from .implementation_gate import (
+    execute_native_build_gate,
+    source_fingerprint,
+    validate_implementation,
+)
+from .plan_gate import resolve_plan_gate_context, validate_plan
 
 
 # StateStore treats iteration records as opaque dicts; gf wraps each
@@ -126,6 +134,10 @@ class IterationContext:
     # iteration's A_plan / B_implement so the next cycle executes the plan.
     # Carries the optimization targets that drive the next iteration's work.
     perf_plan: Optional[str] = None
+    # Machine-readable diagnostics from the most recent rejected A output.
+    # Kept only within the current iteration so an in-place A retry can fix
+    # the artifacts without polluting later successful planning cycles.
+    plan_gate_feedback: Optional[str] = None
     # phase-id -> attempts in the current iteration folder; reset on folder open
     phase_attempts: Dict[str, int] = field(default_factory=dict)
     # ccb session UUID of the most recent B_implement turn in the current
@@ -158,9 +170,15 @@ class OrchestratorConfig:
     # ``<cwd>/<task_id>/<NNN>/``.
     logs_root: Optional[Path] = None
     max_iterations: int = 20
+    max_wall_time_s: Optional[int] = None
+    execution_mode: str = "optimize"
     # agent tuning
     plan_timeout_s: int = 1800
     impl_timeout_s: int = 3600
+    # C repair is deliberately shorter than a full implementation turn.
+    # The debugger edits one diagnosed root cause; architectural work must
+    # return to A rather than occupy three one-hour internal retries.
+    c_repair_timeout_s: int = 1200
     review_timeout_s: int = 1800
     optimize_timeout_s: int = 3600
     stuck_timeout_s: int = 600
@@ -173,10 +191,10 @@ class OrchestratorConfig:
     # a debugger sub-agent try to fix the code in the SAME iteration folder
     # and re-runs the test, up to this many times. Only after the budget is
     # exhausted does C route forward to D_review with LOGIC_FAIL (which then
-    # loops back to B for a full redo). Infra failures bypass this loop and
+    # routes to a fresh A plan). Infra failures bypass this loop and
     # surface immediately. 3 = "try twice as hard before giving up an
     # iteration" — empirically most fixable bugs are caught in 1-2 retries;
-    # deeper architectural issues need a fresh B pass with reviewer context.
+    # deeper architectural issues need a fresh plan with reviewer context.
     max_c_retries: int = 3
     claude_bin: str = "ccb"
     model: Optional[str] = None
@@ -231,6 +249,7 @@ class Orchestrator:
             diagnostic_globs=PLUGIN.diagnostic_globs,
         )
         self._stop = False
+        self._wall_deadline_epoch: Optional[float] = None
         # Set when run() no-ops because the task was already finished.
         # Caller (orchestrator.py) reads this to decide whether keepalive
         # makes sense — keeping the WebUI up for a run that did nothing
@@ -252,9 +271,19 @@ class Orchestrator:
 
     def run(self) -> None:
         task_id = self.req.get("task_id", "task")
-        _, is_resume = self.store.init_or_resume(
+        run_status, is_resume = self.store.init_or_resume(
             task_id=task_id, task_type=self.req.get("task_type", "unknown"),
         )
+
+        if self.cfg.max_wall_time_s is not None:
+            # A live resume keeps the original task deadline. An explicit
+            # restart of a finished task starts a new bounded run window.
+            base = (
+                time.time()
+                if is_resume and run_status.finished
+                else float(run_status.created_at or time.time())
+            )
+            self._wall_deadline_epoch = base + self.cfg.max_wall_time_s
 
         resume_from: Optional[Dict[str, Any]] = None
         if is_resume:
@@ -352,7 +381,7 @@ class Orchestrator:
             prev_rec = _load_iter(self.store, iter_num - 1) if iter_num > 1 else None
             if prev_rec is not None:
                 last_outcome = prev_rec.outcome
-                if start_phase == "B_implement" and prev_rec.outcome != P.OK:
+                if prev_rec.outcome != P.OK:
                     carried_failure = prev_rec.failure_reason
         else:
             # All existing iterations complete → start a fresh next one
@@ -363,9 +392,7 @@ class Orchestrator:
             start_phase = self._phase_after(prev_rec)
             carried_failure = (
                 prev_rec.failure_reason
-                if prev_rec is not None
-                and start_phase == "B_implement"
-                and prev_rec.outcome != P.OK
+                if prev_rec is not None and prev_rec.outcome != P.OK
                 else None
             )
             last_outcome = prev_rec.outcome if prev_rec is not None else None
@@ -385,24 +412,59 @@ class Orchestrator:
         In the 6-phase flow:
         - C passed → D ran → E ran → F ran → next iter starts at A (the
           cycle always re-plans from scratch using F's perf_plan.md).
-        - C failed → D ran → routed back to B → next iter starts at B
-          (skip planning, the previous plan + D's review guide the redo).
+        - C failed → D ran → next iter starts at A so the planner can
+          redesign around the concrete failure and D's review.
 
         The iteration's recorded ``outcome`` is C's outcome (the iteration
         terminates after F on the happy path or after D on the fail path).
         """
         if rec is None:
             return "A_plan"
-        if rec.outcome == P.OK:
-            # C passed → next iter starts fresh from A (F's perf_plan.md
-            # feeds into A via ctx.review_feedback).
-            return "A_plan"
-        # C failed → next iter starts at B (skip A; previous plan + D's
-        # review.md guide the redo).
-        return "B_implement"
+        # Both successful optimization cycles and failed correctness cycles
+        # start from a fresh plan. Failure details and review.md are carried
+        # into A so architectural mistakes do not get trapped in patch-only
+        # B turns.
+        return "A_plan"
 
     def stop(self) -> None:
         self._stop = True
+
+    def _remaining_wall_time_s(self) -> Optional[int]:
+        deadline = self._wall_deadline_epoch
+        if deadline is None:
+            return None
+        return max(0, int(deadline - time.time()))
+
+    def _bounded_timeout(self, requested_s: int) -> int:
+        remaining = self._remaining_wall_time_s()
+        if remaining is None:
+            return max(1, int(requested_s))
+        return max(1, min(int(requested_s), remaining))
+
+    def _wall_time_exhausted(self) -> bool:
+        remaining = self._remaining_wall_time_s()
+        return remaining is not None and remaining <= 0
+
+    def _wall_time_reason(self) -> str:
+        return (
+            "task wall-clock budget exhausted: "
+            f"limit={self.cfg.max_wall_time_s}s"
+        )
+
+    def _throughput_target_met(
+        self, perf: Optional[Dict[str, float]],
+    ) -> Optional[Dict[str, float]]:
+        raw = self.req.get("target_tokens_per_sec")
+        if raw in (None, "") or not perf:
+            return None
+        try:
+            target = float(raw)
+            measured = float(perf.get("tokens_per_sec", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if target <= 0 or measured < target:
+            return None
+        return {"target_tokens_per_sec": target, "tokens_per_sec": measured}
 
     # ------------------------------------------------------------------ #
     # Main loop — phase at a time, transition-table driven
@@ -429,12 +491,26 @@ class Orchestrator:
         final_status: Optional[str] = None
 
         while not self._stop and not P.is_terminal(phase):
+            if self._wall_time_exhausted():
+                reason = self._wall_time_reason()
+                if iter_rec is not None:
+                    self._close_iteration(
+                        iter_rec, status="failed", failure=reason,
+                        perf=ctx.this_iter_perf, outcome=P.ABORTED,
+                        write_retrospective=False,
+                    )
+                self.store.append_timeline(
+                    "wall_time_exhausted",
+                    {"iteration": iter_num, "phase": phase, "reason": reason},
+                )
+                final_status = "stopped"
+                phase = "finished"
+                break
             # ---- open a fresh iteration folder if needed ------------------ #
             if iter_dir is None:
                 if iter_num >= max_iters:
-                    # Iteration budget exhausted — this is the ONLY normal
-                    # stopping point. The system explored until the budget
-                    # ran out; it did NOT give up. Record as "stopped" if
+                    # Iteration budget exhausted. The system explored until
+                    # the configured cap. Record as "stopped" if
                     # the last attempt didn't happen to land on OK, but
                     # never as "failed" — there is no Fail state.
                     final_status = "success" if ctx.last_outcome == P.OK else "stopped"
@@ -453,6 +529,7 @@ class Orchestrator:
                 # the prior iter's B/C sessions would only confuse the
                 # agent with stale file contents.
                 ctx.b_session_id = None
+                ctx.plan_gate_feedback = None
                 # Reset the per-iteration perf accumulator so we don't
                 # inherit the prior iteration's perf when this iteration
                 # never produces any of its own (see this_iter_perf docs).
@@ -486,6 +563,21 @@ class Orchestrator:
                 phase_rec["failure"] = failure
             if perf:
                 phase_rec["perf"] = perf
+
+            if self._wall_time_exhausted():
+                reason = self._wall_time_reason()
+                self._close_iteration(
+                    iter_rec, status="failed", failure=reason,
+                    perf=ctx.this_iter_perf, outcome=P.ABORTED,
+                    write_retrospective=False,
+                )
+                self.store.append_timeline(
+                    "wall_time_exhausted",
+                    {"iteration": iter_num, "phase": phase, "reason": reason},
+                )
+                final_status = "stopped"
+                phase = "finished"
+                break
 
             # ---- token-budget circuit breaker ------------------------------ #
             # After every phase, check whether the task's cost budget has
@@ -528,6 +620,50 @@ class Orchestrator:
                 final_status = "aborted"
                 phase = "finished"
                 break
+
+            if (
+                phase == "D_review"
+                and outcome == P.OK
+                and self.cfg.execution_mode == "correctness_only"
+            ):
+                self.store.append_timeline(
+                    "correctness_target_reached",
+                    {"iteration": iter_num, "mode": self.cfg.execution_mode},
+                )
+                self._write_retrospective(
+                    n=iter_num,
+                    iter_dir=iter_dir,
+                    ctx=ctx,
+                    rec=iter_rec,
+                    this_perf=ctx.this_iter_perf,
+                    e_ok=True,
+                    e_error="performance phases skipped by correctness-only mode",
+                )
+                self._close_iteration(
+                    iter_rec, status="success", failure=None,
+                    perf=ctx.this_iter_perf, outcome=P.OK,
+                )
+                final_status = "success"
+                phase = "finished"
+                break
+
+            if phase == "G_perf_review" and outcome == P.OK:
+                target_result = self._throughput_target_met(
+                    perf or ctx.last_perf or ctx.this_iter_perf,
+                )
+                if target_result is not None:
+                    self.store.append_timeline(
+                        "performance_target_reached",
+                        {"iteration": iter_num, **target_result},
+                    )
+                    self._close_iteration(
+                        iter_rec, status="success", failure=None,
+                        perf=perf or ctx.last_perf or ctx.this_iter_perf,
+                        outcome=P.OK,
+                    )
+                    final_status = "success"
+                    phase = "finished"
+                    break
 
             # ---- escalation: too many attempts at this phase in this folder #
             # Instead of aborting the whole run, close this iteration as
@@ -669,6 +805,8 @@ class Orchestrator:
             return self._do_review(iter_num, iter_dir, ctx)
         if phase == "E_perf_test":
             return self._do_perf_test(iter_num, iter_dir, ctx, rec)
+        if phase == "G_perf_review":
+            return self._do_perf_review(iter_num, iter_dir, ctx, rec)
         if phase == "F_perf_plan":
             return self._do_perf_plan(iter_num, iter_dir, ctx)
         raise ValueError(f"no handler for phase {phase!r}")
@@ -678,6 +816,13 @@ class Orchestrator:
     def _do_plan(
         self, n: int, iter_dir: Path, ctx: IterationContext,
     ) -> Tuple[P.Outcome, Optional[Dict[str, float]], Optional[str]]:
+        previous = _load_iter(self.store, n - 1) if n > 1 else None
+        gate_context = resolve_plan_gate_context(
+            iter_dir,
+            self.req,
+            n,
+            previous.to_dict() if previous is not None else None,
+        )
         ok, err, mode, _sid = self._run_agent(
             name=f"iter{n}-planner", role="planner", iteration=n, iter_dir=iter_dir,
             prompt=plan_prompt(
@@ -687,12 +832,45 @@ class Orchestrator:
                 review_feedback=ctx.review_feedback,
                 perf_plan=ctx.perf_plan,
                 logs_dir=self._logs_dir_for(n),
+                plan_gate_feedback=ctx.plan_gate_feedback,
+                plan_gate_context=gate_context,
             ),
             timeout=self.cfg.plan_timeout_s,
         )
-        if ok:
+        if not ok:
+            return _failure_outcome(mode), None, err
+
+        gate = validate_plan(iter_dir, self.req, n, gate_context)
+        attempt = ctx.phase_attempts.get("A_plan", 0) + 1
+        report = {
+            **gate.to_dict(),
+            "iteration": n,
+            "attempt": attempt,
+        }
+        report_path = self._logs_dir_for(n) / "plan-gate-report.json"
+        try:
+            report_path.write_text(
+                json.dumps(report, indent=2, sort_keys=True), encoding="utf-8",
+            )
+        except OSError as exc:
+            return P.INFRA_FAIL, None, f"cannot write Plan Gate report: {exc}"
+        event = "plan_gate_passed" if gate.passed else "plan_gate_rejected"
+        self.store.append_timeline(event, {
+            "iteration": n,
+            "attempt": attempt,
+            "errors": list(gate.errors),
+            "report": str(report_path),
+            "gate_mode": gate.context.mode,
+            "baseline_iteration": gate.context.baseline_iteration,
+        })
+        if gate.passed:
+            ctx.plan_gate_feedback = None
             return P.OK, None, None
-        return _failure_outcome(mode), None, err
+
+        ctx.plan_gate_feedback = gate.diagnostics()
+        return P.LOGIC_FAIL, None, (
+            "Plan Gate rejected the A-stage artifacts:\n" + gate.diagnostics()
+        )
 
     # ---- B: implement --------------------------------------------------- #
     # The reviewer no longer runs inside B. It runs AFTER C (see
@@ -742,6 +920,51 @@ class Orchestrator:
             ctx.b_session_id = sid
         if not ok:
             return _failure_outcome(mode), None, f"B (implement) failed: {err}"
+        gate = validate_implementation(iter_dir, n)
+        gate_path = self._logs_dir_for(n) / "implementation-gate-report.json"
+        try:
+            gate_path.write_text(gate.diagnostics(), encoding="utf-8")
+        except OSError as exc:
+            return P.INFRA_FAIL, None, (
+                f"cannot write Implementation Gate report: {exc}"
+            )
+        self.store.append_timeline(
+            "implementation_gate_passed" if gate.passed
+            else "implementation_gate_rejected",
+            {
+                "iteration": n,
+                "errors": list(gate.errors),
+                "expected_files": list(gate.expected_files),
+                "changed_files": list(gate.changed_files),
+                "report": str(gate_path),
+            },
+        )
+        if not gate.passed:
+            return P.LOGIC_FAIL, None, (
+                "Implementation Gate rejected the B-stage delivery:\n"
+                + gate.diagnostics()
+            )
+        native_gate = execute_native_build_gate(
+            iter_dir,
+            self._logs_dir_for(n),
+            build_type=str(self.req.get("build_type") or "Release"),
+            timeout_s=self._bounded_timeout(min(self.cfg.impl_timeout_s, 900)),
+        )
+        self.store.append_timeline(
+            "implementation_native_gate_passed" if native_gate.passed
+            else "implementation_native_gate_rejected",
+            {
+                "iteration": n,
+                "errors": list(native_gate.errors),
+                "steps": list(native_gate.steps),
+                "report": native_gate.report_path,
+            },
+        )
+        if not native_gate.passed:
+            return P.LOGIC_FAIL, None, (
+                "Independent native build gate rejected the B-stage tree:\n"
+                + native_gate.diagnostics()
+            )
         # On clean pass, drop the session — the next B (if any) will be a
         # new iteration's fresh start, not a redo of this one.
         ctx.b_session_id = None
@@ -757,7 +980,7 @@ class Orchestrator:
     # D's "outcome" is DERIVED from C's outcome (not from whether the reviewer
     # agent itself succeeded). The transition table maps:
     #   (D_review, OK)         → E_perf_test   [meaning: C had passed]
-    #   (D_review, LOGIC_FAIL) → B_implement   [meaning: C had failed]
+    #   (D_review, LOGIC_FAIL) → A_plan        [meaning: C had failed]
     # So we set D's outcome to OK iff ctx.last_outcome (C's outcome) was OK.
 
     def _do_review(
@@ -798,11 +1021,13 @@ class Orchestrator:
              "reviewer_agent_ok": ok},
         )
         # D's outcome drives the next-phase routing. C passed → OK → E.
-        # C failed (any flavor) → LOGIC_FAIL → B (new iter). Reviewer agent
+        # C failed (any flavor) → LOGIC_FAIL → A (new iter). Reviewer agent
         # failure does NOT change the routing — D is advisory.
         if c_outcome == P.OK:
             return P.OK, None, None
-        return P.LOGIC_FAIL, None, None
+        return P.LOGIC_FAIL, None, (
+            c_failure or f"C_test ended with {c_outcome or P.LOGIC_FAIL}"
+        )
 
     # ---- E: perf test (only on C-pass) ---------------------------------- #
 
@@ -840,14 +1065,6 @@ class Orchestrator:
             # numbers as this step's perf so F can use them.
             perf = self._read_perf_report(n, iter_dir)
 
-        # Always produce a retrospective after E runs (success or fail).
-        # It's non-gating: a retro-agent failure is logged but doesn't
-        # change E's outcome.
-        self._write_retrospective(
-            n=n, iter_dir=iter_dir, ctx=ctx, rec=rec,
-            this_perf=perf, e_ok=ok, e_error=e_error,
-        )
-
         if not ok:
             return _failure_outcome(mode), None, f"E (perf test) failed: {err}"
         return P.OK, perf, None
@@ -875,14 +1092,10 @@ class Orchestrator:
                 report_dir=logs_dir,
                 iteration=n,
                 prev_perf=prev_perf,
-                timeout_s=self.cfg.optimize_timeout_s,
+                timeout_s=self._bounded_timeout(self.cfg.optimize_timeout_s),
             )
         except Exception as e:  # noqa: BLE001 — oracle crash shouldn't kill the run
             err = f"perf oracle crashed: {e!r}"
-            self._write_retrospective(
-                n=n, iter_dir=iter_dir, ctx=ctx, rec=rec,
-                this_perf=None, e_ok=False, e_error=err,
-            )
             return P.INFRA_FAIL, None, f"E (perf oracle) crashed: {err}"
 
         # The oracle writes perf_report.json; reuse the existing parser.
@@ -893,11 +1106,6 @@ class Orchestrator:
             e_ok = False
         e_error = None if e_ok else (report.notes or "perf oracle produced no usable data")
 
-        self._write_retrospective(
-            n=n, iter_dir=iter_dir, ctx=ctx, rec=rec,
-            this_perf=perf, e_ok=e_ok, e_error=e_error,
-        )
-
         if not e_ok:
             # Treat as INFRA_FAIL rather than a logic failure — a perf
             # oracle that can't get numbers usually means the server
@@ -905,6 +1113,68 @@ class Orchestrator:
             # as a crashed C step. Don't burn a C-repair slot on it.
             return P.INFRA_FAIL, perf, f"E (perf oracle): {e_error}"
         return P.OK, perf, None
+
+    # ---- G: measured performance review -------------------------------- #
+
+    def _do_perf_review(
+        self, n: int, iter_dir: Path, ctx: IterationContext, rec: IterationRecord,
+    ) -> Tuple[P.Outcome, Optional[Dict[str, float]], Optional[str]]:
+        """Review E's measured report before F proposes another optimization.
+
+        G is advisory.  A reviewer failure never discards valid benchmark
+        data or blocks F, but any produced report is carried into F and the
+        next iteration's A/B prompts.
+        """
+        logs_dir = self._logs_dir_for(n)
+        ok, err, mode, _sid = self._run_agent(
+            name=f"iter{n}-perf-reviewer", role="perf_reviewer",
+            iteration=n, iter_dir=iter_dir,
+            prompt=perf_review_prompt(
+                req=self.req,
+                iter_dir=iter_dir,
+                notebooks_dir=self.cfg.notebooks_dir,
+                iteration=n,
+                measured_perf=ctx.last_perf or ctx.this_iter_perf,
+                correctness_review=ctx.review_feedback,
+                logs_dir=logs_dir,
+            ),
+            timeout=self.cfg.review_timeout_s,
+            max_retries=0,
+        )
+        review_path = logs_dir / "perf-review.md"
+        feedback: Optional[str] = None
+        if review_path.is_file():
+            try:
+                feedback = review_path.read_text(
+                    encoding="utf-8", errors="replace",
+                )
+                if len(feedback) > 8192:
+                    feedback = feedback[:8160] + "\n...[truncated]..."
+            except OSError:
+                feedback = None
+        if feedback:
+            prefix = ctx.review_feedback or ""
+            ctx.review_feedback = (
+                prefix + "\n\n# Measured performance review\n" + feedback
+            ).strip()
+        self.store.append_timeline("perf_review_done", {
+            "iteration": n,
+            "agent_ok": ok,
+            "feedback_captured": feedback is not None,
+            "measured_perf": ctx.last_perf or ctx.this_iter_perf,
+            "error": err,
+            "failure_mode": mode,
+        })
+        self._write_retrospective(
+            n=n,
+            iter_dir=iter_dir,
+            ctx=ctx,
+            rec=rec,
+            this_perf=ctx.last_perf or ctx.this_iter_perf,
+            e_ok=True,
+            e_error=None,
+        )
+        return P.OK, ctx.last_perf or ctx.this_iter_perf, None
 
     def _write_retrospective(
         self,
@@ -1009,7 +1279,8 @@ class Orchestrator:
             # Walk in phase order so we pick the FURTHEST reached phase
             # that has a non-OK outcome.
             for phase_id in ("A_plan", "B_implement", "C_test",
-                              "D_review", "E_perf_test", "F_perf_plan"):
+                              "D_review", "E_perf_test", "G_perf_review",
+                              "F_perf_plan"):
                 info = rec.phases.get(phase_id)
                 if not info:
                     continue
@@ -1132,7 +1403,7 @@ class Orchestrator:
         # a debugger sub-agent is dispatched in the SAME iteration folder to
         # fix the code, and the test is re-run. After the budget is exhausted
         # the final LOGIC_FAIL is returned and the transition table routes
-        # to D_review → B_implement (new iter). INFRA_FAIL and PERF_REGRESSION
+        # to D_review → A_plan (new iter). INFRA_FAIL and PERF_REGRESSION
         # surface immediately without consuming repair attempts (the former
         # is an environment issue, the latter is a perf-only signal where the
         # code is already correct).
@@ -1264,6 +1535,7 @@ class Orchestrator:
             })
             dbg_name = f"iter{n}-c-debugger.attempt{attempt}"
             t_repair_start = time.time()
+            source_before = source_fingerprint(iter_dir)
             # First repair turn: full bootstrap prompt (knowledge base
             # hints, framework rules, deliverable contract, etc.) +
             # fresh ccb session. Subsequent turns: short follow-up that
@@ -1288,8 +1560,9 @@ class Orchestrator:
                 role="c_debugger",
                 iteration=n, iter_dir=iter_dir,
                 prompt=prompt,
-                timeout=self.cfg.impl_timeout_s,
+                timeout=getattr(self.cfg, "c_repair_timeout_s", 1200),
                 resume_session_id=c_session_id,
+                max_retries=0,
             )
             # Capture the session id from the first turn so later turns
             # can resume. If the turn somehow returned a different id
@@ -1313,6 +1586,12 @@ class Orchestrator:
             except Exception:  # noqa: BLE001
                 pass
 
+            source_after = source_fingerprint(iter_dir)
+            changed_paths = sorted(
+                path for path in set(source_before) | set(source_after)
+                if source_before.get(path) != source_after.get(path)
+            )
+
             if not ok:
                 self.store.append_timeline("c_test_repair_agent_fail", {
                     "iteration": n, "attempt": attempt,
@@ -1328,11 +1607,37 @@ class Orchestrator:
                 debugger_mode=mode, debugger_final=dbg_final,
                 test_outcome=None, test_perf=None, test_failure=None,
                 duration_s=repair_duration,
+                changed_files=changed_paths,
                 note="debugger crashed" if not ok else "debugger done, re-run pending",
             )
 
+            requested_replan = bool(
+                repair_md and "REPLAN_REQUIRED:" in repair_md
+            )
+            if requested_replan:
+                last_failure = (
+                    (failure or "C correctness failure")
+                    + "\nC debugger classified this as an architecture gap and "
+                      "requested a fresh A plan."
+                )
+                self.store.append_timeline("c_test_replan_requested", {
+                    "iteration": n, "attempt": attempt,
+                    "changed_files": changed_paths,
+                })
+                break
+            if not changed_paths:
+                last_failure = (
+                    (failure or "C correctness failure")
+                    + "\nC debugger produced no source diff; fail-fast to a "
+                      "fresh A plan instead of repeating the same diagnosis."
+                )
+                self.store.append_timeline("c_test_no_source_diff", {
+                    "iteration": n, "attempt": attempt,
+                })
+                break
+
         # Budget exhausted: return the last LOGIC_FAIL. Transition table
-        # routes (C_test, LOGIC_FAIL) → D_review → B_implement (new iter).
+        # routes (C_test, LOGIC_FAIL) → D_review → A_plan (new iter).
         return last_outcome or P.LOGIC_FAIL, last_perf, last_failure
 
     def _append_repair_record(
@@ -1351,6 +1656,7 @@ class Orchestrator:
         test_perf: Optional[Dict[str, float]],
         test_failure: Optional[str],
         duration_s: float,
+        changed_files: Optional[List[str]] = None,
         note: str = "",
     ) -> None:
         """Append one structured record to ``<logs_dir>/c-repairs.jsonl``.
@@ -1381,6 +1687,7 @@ class Orchestrator:
                 "perf": test_perf,
                 "failure": (test_failure or "")[:2000] if test_failure else None,
             } if test_outcome is not None else None,
+            "changed_files": sorted(set(changed_files or [])),
             "note": note,
         }
         # Embed the agent-written repair markdown verbatim (truncated) so
@@ -1411,7 +1718,8 @@ class Orchestrator:
         try:
             result = oracle.run(
                 iter_dir=iter_dir, req=self.req, report_dir=report_dir,
-                timeout_s=self.cfg.impl_timeout_s, manager=self.manager,
+                timeout_s=self._bounded_timeout(self.cfg.impl_timeout_s),
+                manager=self.manager,
             )
         except Exception as exc:  # noqa: BLE001
             err = f"oracle exception: {exc!r}"
@@ -1525,6 +1833,7 @@ class Orchestrator:
         *,
         resume_session_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        max_retries: int = 2,
     ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
         """Launch one sub-agent.
 
@@ -1542,14 +1851,18 @@ class Orchestrator:
         logs_dir.mkdir(parents=True, exist_ok=True)
         prompt_file = logs_dir / f"{name}.prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
+        effective_timeout = self._bounded_timeout(timeout)
+        if self._wall_time_exhausted():
+            return False, self._wall_time_reason(), "infra", None
         spec = AgentSpec(
             name=name,
             role=role,
             prompt_file=prompt_file,
             workdir=iter_dir,
             log_dir=logs_dir,
-            timeout_s=timeout,
-            stuck_timeout_s=self.cfg.stuck_timeout_s,
+            timeout_s=effective_timeout,
+            stuck_timeout_s=min(self.cfg.stuck_timeout_s, effective_timeout),
+            max_retries=max_retries,
             extra_args=list(self.cfg.extra_claude_args),
             session_id=session_id,
             resume_session_id=resume_session_id,
@@ -1611,6 +1924,7 @@ class Orchestrator:
         failure: Optional[str],
         perf: Optional[Dict[str, float]],
         outcome: Optional[P.Outcome],
+        write_retrospective: bool = True,
     ) -> None:
         rec.ended_at = time.time()
         rec.duration_s = rec.ended_at - rec.started_at
@@ -1623,7 +1937,7 @@ class Orchestrator:
         # retro was written), spawn a failure postmortem BEFORE persisting.
         # Skip when a retro path is already set (covers the rare case where
         # E ran, failed, and already produced a retro).
-        if status == "failed" and not rec.retrospective_path:
+        if status == "failed" and write_retrospective and not rec.retrospective_path:
             try:
                 iter_dir = self.workspace.iter_dir(rec.iteration)
                 self._write_failure_retrospective(rec.iteration, iter_dir, rec)
@@ -1684,7 +1998,7 @@ class Orchestrator:
                     env=env,
                     stdout=subprocess.PIPE,
                     stderr=logf,
-                    timeout=self.cfg.impl_timeout_s,
+                    timeout=self._bounded_timeout(self.cfg.impl_timeout_s),
                     text=True,
                 )
         except subprocess.TimeoutExpired:

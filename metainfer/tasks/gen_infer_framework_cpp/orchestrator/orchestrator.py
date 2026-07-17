@@ -31,9 +31,11 @@ from metainfer.orchestrator.token_budget import TokenBudget
 from .hardware_discovery import (
     configure_assigned_devices,
     discover_hardware_profile,
+    normalize_assigned_devices,
     prompt_hardware_summary,
     write_hardware_profile,
 )
+from .capabilities import request_validation_errors
 from .pipeline import Orchestrator, OrchestratorConfig
 from .task_types import is_cpp_framework_task
 
@@ -131,6 +133,9 @@ def run_with_requirements(
             f"'gen-infer-framework-cpp', got {task_type!r}"
         )
     task_id = req.get("task_id", "task")
+    capability_errors = request_validation_errors(req)
+    if capability_errors:
+        raise ValueError("; ".join(capability_errors))
 
     # Stamp the kernel task name ASAP so process scans pick us up even
     # if we hang during initialization. Format: "metainfer-orch" (kernel
@@ -159,6 +164,9 @@ def run_with_requirements(
     if is_cpp_framework_task(req.get("task_type", "")):
         # This is pure environment validation and must happen before the PID
         # stamp so an invalid direct-CLI value cannot leave stale task state.
+        req["assigned_devices"] = normalize_assigned_devices(
+            req.get("assigned_devices")
+        )
         configure_assigned_devices(req)
 
     # Stamp PID before the bounded hardware commands so the WebUI sees the
@@ -193,6 +201,8 @@ def run_with_requirements(
         logs_root=logs_root,
         state_dir=state_dir,
         max_iterations=max_iterations or _extract_max_iter(req, default=20),
+        max_wall_time_s=_extract_max_wall_time_s(req),
+        execution_mode=_extract_execution_mode(req),
         claude_bin=claude_bin,
         model=model,
         permission_mode=permission_mode,
@@ -269,6 +279,8 @@ def run_with_requirements(
     print(f"[metainfer] code dir       = {iterations_root}")
     print(f"[metainfer] logs dir       = {logs_root}")
     print(f"[metainfer] notebooks      = {notebooks_dir}")
+    print(f"[metainfer] execution mode = {cfg.execution_mode}")
+    print(f"[metainfer] wall limit     = {cfg.max_wall_time_s or 'unlimited'}s")
     if is_cpp_framework_task(req.get("task_type", "")):
         validation = req["hardware_profile"].get("validation", {})
         print(f"[metainfer] hardware       = {paths['hardware_profile']}")
@@ -308,6 +320,46 @@ def _extract_max_iter(req: Dict[str, Any], default: int = 20) -> int:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def _extract_max_wall_time_s(req: Dict[str, Any]) -> Optional[int]:
+    """Resolve the task wall-clock limit from env or requirements."""
+    import os
+
+    raw_seconds = os.environ.get("METAINFER_MAX_WALL_TIME_S")
+    if raw_seconds:
+        try:
+            value = int(float(raw_seconds))
+            return value if value > 0 else None
+        except (TypeError, ValueError):
+            pass
+    value = req.get("max_wall_time_minutes")
+    if value is None:
+        value = req.get("answers", {}).get("max_wall_time_minutes")
+    if value in (None, ""):
+        return None
+    try:
+        minutes = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(1, int(minutes * 60)) if minutes > 0 else None
+
+
+def _extract_execution_mode(req: Dict[str, Any]) -> str:
+    value = req.get("execution_mode")
+    if value is None:
+        value = req.get("answers", {}).get("execution_mode")
+    # Requirements created before this field existed followed the full
+    # optimization loop. Preserve that behavior on resume; the new WebUI form
+    # explicitly writes its correctness-only default for new tasks.
+    if value is None:
+        return "optimize"
+    normalized = str(value).strip().casefold()
+    if normalized in {
+        "correctness + optimization", "correctness+optimization", "optimize",
+    }:
+        return "optimize"
+    return "correctness_only"
 
 
 def _build_budget(state_dir: Path, req: Dict[str, Any]) -> Optional[TokenBudget]:

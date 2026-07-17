@@ -21,6 +21,8 @@
       description: "Qwen3-8B/14B/32B 等 Dense Decoder 模型"
     - label: "Qwen3 MoE"
       description: "Qwen3 混合专家模型，需要原生 Router 和 Expert 执行"
+    - label: "Qwen3.5 / Qwen3.6 Hybrid"
+      description: "混合 Attention/GatedDeltaNet 等层类型，必须按配置能力验证"
     - label: "Other / Custom"
       description: "在备注中描述模型契约"
 
@@ -53,6 +55,26 @@
       description: "使用 BF16 存储 KV"
     - label: "FP16"
       description: "使用 FP16 存储 KV"
+
+- key: quantization_format
+  question: "Checkpoint量化/容器格式；Auto必须从元数据识别，未知格式明确拒绝："
+  header: "量化格式"
+  required: false
+  multi: false
+  default: "Auto-detect"
+  options:
+    - label: "Auto-detect"
+      description: "从Checkpoint元数据解析Full Precision、AWQ、GPTQ或其他格式"
+    - label: "None / full precision"
+      description: "要求普通BF16/FP16/FP32权重"
+    - label: "AWQ"
+      description: "仅在Descriptor、Loader和DTK Kernel均验证后支持"
+    - label: "GPTQ"
+      description: "仅在Packing、Group和DTK Kernel均验证后支持"
+    - label: "GGUF"
+      description: "必须识别具体GGUF量化类型，不把GGUF视为单一DType"
+    - label: "Other / custom quantization"
+      description: "在备注中提供完整量化Descriptor"
 
 - key: target_hardware
   question: "主要部署目标硬件："
@@ -134,8 +156,6 @@
       description: "运行中请求的连续批处理调度"
     - label: "Tensor parallelism"
       description: "C++ 原生多卡通信与权重切分"
-    - label: "Speculative decoding"
-      description: "Draft/Verify 推测解码"
     - label: "Streaming responses"
       description: "OpenAI-compatible SSE Token 流式响应"
 
@@ -169,24 +189,56 @@
     - label: "Memory"
       description: "最小化加速器显存占用"
 
+- key: execution_mode
+  question: "通过完整C正确性Oracle后是否继续进入性能优化循环："
+  header: "执行模式"
+  required: false
+  multi: false
+  default: "Correctness only"
+  options:
+    - label: "Correctness only"
+      description: "C通过且D完成后结束，适合首次框架生成和流程诊断"
+    - label: "Correctness + optimization"
+      description: "C通过后继续执行E/G/F并进入后续优化迭代"
+
 - key: perf_budget
   question: "性能验收目标（例如吞吐达到某个明确 Tokens/s）："
   header: "性能门槛"
   required: false
   form: text
 
+- key: target_tokens_per_sec
+  question: "吞吐目标Tokens/s；E测量达到后，G完成复核并结束任务："
+  header: "吞吐停止值"
+  required: false
+  form: number
+  default: ""
+
 - key: max_iterations
-  question: "ABCDEF 优化流程的最大迭代次数："
+  question: "ABCDEGF 流程的最大迭代次数："
   header: "最大迭代"
   required: false
   multi: false
   options:
+    - label: "1"
+      description: "一次完整交付或失败复盘"
+    - label: "3"
+      description: "允许少量重新规划和修复"
+    - label: "5"
+      description: "中等长度诊断或优化"
     - label: "10"
       description: "快速原生原型"
     - label: "20"
       description: "平衡实现与优化"
     - label: "50"
       description: "深度优化"
+
+- key: max_wall_time_minutes
+  question: "任务墙钟时间上限（分钟）；到期后保存当前证据并停止："
+  header: "时间上限"
+  required: false
+  form: number
+  default: "165"
 
 - key: token_budget_max_cost_usd
   question: "本任务允许使用的 Agent 成本上限（美元）；留空表示不限制："

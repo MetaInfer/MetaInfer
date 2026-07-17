@@ -9,8 +9,10 @@ module declared in :data:`plugin.PLUGIN` via the registry.
 
 Pipeline shape::
 
-    A_plan → B_implement → C_test → D_review ──┬─ C ok  → E_perf_test → F_perf_plan → A_plan (new iter)
-                                                └─ C fail → B_implement (new iter)
+    A_plan → B_implement → C_test → D_review ──┬─ C ok → E_perf_test
+                                                │          → G_perf_review
+                                                │          → F_perf_plan → A_plan
+                                                └─ C fail → A_plan (new iter)
 
 Failures never enter a terminal Fail state — every failure either
 retries in place, consumes the iteration, or routes back to A_plan. The

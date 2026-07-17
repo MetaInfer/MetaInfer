@@ -26,6 +26,7 @@ class GpuSamples:
     device_count: int = 0
     backend: Optional[str] = None
     device_peaks: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    device_samples: Dict[int, List[Dict[str, float]]] = field(default_factory=dict)
 
     def aggregate(self) -> Dict[str, Any]:
         if not self.samples:
@@ -69,12 +70,36 @@ class GpuSamples:
             for index, values in sorted(self.device_peaks.items())
         ]
         aggregate["per_device_peaks"] = per_device
-        aggregate["active_device_count"] = sum(
-            1
+        active_indices = {
+            int(device["index"])
             for device in per_device
             if device.get("memory_used_mib", 0.0) >= 128.0
             or device.get("utilization_gpu", 0.0) > 0.0
-        )
+        }
+        aggregate["active_device_count"] = len(active_indices)
+
+        per_device_stats: List[Dict[str, Any]] = []
+        for index, samples in sorted(self.device_samples.items()):
+            stats: Dict[str, Any] = {
+                "index": index,
+                "sample_count": len(samples),
+                "active": index in active_indices,
+            }
+            for key in keys:
+                values = [sample[key] for sample in samples if key in sample]
+                stats.update(_summarize_metric(key, values))
+            per_device_stats.append(stats)
+        aggregate["per_device_stats"] = per_device_stats
+
+        active_util_means = [
+            float(device["utilization_gpu_mean"])
+            for device in per_device_stats
+            if device.get("active") and "utilization_gpu_mean" in device
+        ]
+        if active_util_means:
+            aggregate["active_device_utilization_gpu_mean"] = round(
+                statistics.mean(active_util_means), 2,
+            )
         return aggregate
 
 
@@ -252,12 +277,27 @@ class GpuTelemetry:
             for key in keys
         })
         for index, values in devices.items():
+            self._samples.device_samples.setdefault(index, []).append(dict(values))
             peaks = self._samples.device_peaks.setdefault(index, {})
             for key, value in values.items():
                 peaks[key] = max(peaks.get(key, value), value)
 
     def aggregate(self) -> Dict[str, Any]:
         return self._samples.aggregate()
+
+
+def _summarize_metric(key: str, values: List[float]) -> Dict[str, float]:
+    if not values:
+        return {}
+    ordered = sorted(values)
+    result = {
+        f"{key}_mean": round(statistics.mean(values), 2),
+        f"{key}_max": round(max(values), 2),
+        f"{key}_p50": round(_percentile(ordered, 0.50), 2),
+    }
+    if len(values) >= 10:
+        result[f"{key}_p99"] = round(_percentile(ordered, 0.99), 2)
+    return result
 
 
 def _find_rocm_smi() -> Optional[str]:

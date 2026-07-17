@@ -81,14 +81,14 @@ def _requires_accelerator_telemetry(req: Dict[str, Any]) -> bool:
 
 
 def _expected_active_devices(req: Dict[str, Any]) -> int:
-    raw_tp = str(req.get("tensor_parallel_size") or "Auto").strip()
-    if raw_tp.isdigit():
-        return max(1, int(raw_tp))
     raw_features = req.get("features") or []
     if isinstance(raw_features, str):
         raw_features = [raw_features]
     if "tensor parallelism" not in {str(item).lower() for item in raw_features}:
         return 1
+    raw_tp = str(req.get("tensor_parallel_size") or "Auto").strip()
+    if raw_tp.isdigit():
+        return max(1, int(raw_tp))
     assigned = str(req.get("assigned_devices") or "").strip()
     if assigned:
         return max(1, len([item for item in assigned.split(",") if item.strip()]))
@@ -285,7 +285,7 @@ def _start_server(
         env["MODEL_DIR"] = str(model_dir)
     env.setdefault("PYTHONHASHSEED", "0")
     # Enable the in-framework profiler hook. The native contract in
-    # 00_contracts/cpp/cpp_profiling_contracts.md requires the framework to
+    # 00_contracts/profiling_contracts.md requires the framework to
     # honor these vars. Duration is a backstop; normal shutdown is triggered
     # by SIGTERM, which the signal handler relays to the main loop for flush.
     if profile_dir is not None:
@@ -768,6 +768,24 @@ class PerfOracle:
                     or device.get("utilization_gpu", 0.0) > 0.0
                 )
                 expected_indices = _expected_device_indices(req)
+                per_device_stats = list(
+                    report.hardware.get("per_device_stats") or []
+                )
+                assigned_stats = [
+                    device for device in per_device_stats
+                    if not expected_indices
+                    or int(device.get("index", -1)) in expected_indices
+                ]
+                report.hardware["assigned_device_stats"] = assigned_stats
+                assigned_utilization = [
+                    float(device["utilization_gpu_mean"])
+                    for device in assigned_stats
+                    if "utilization_gpu_mean" in device
+                ]
+                if assigned_utilization:
+                    report.hardware[
+                        "assigned_device_utilization_gpu_mean"
+                    ] = round(statistics.mean(assigned_utilization), 2)
                 assigned_devices_active = (
                     set(expected_indices).issubset(active_indices)
                     if expected_indices else True

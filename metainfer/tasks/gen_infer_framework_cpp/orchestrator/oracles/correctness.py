@@ -35,6 +35,7 @@ the MetaInfer package, never inside ``iter_dir/``. Agents cannot edit it.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import signal
@@ -46,6 +47,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from ..capabilities import normalize_features
 
 import yaml
 
@@ -247,6 +250,11 @@ class InferFrameworkOracle(Oracle):
                 else:
                     final_cases.append(entry)
 
+            # Protocol/parameter semantics are framework correctness, not
+            # model knowledge, so they are evaluated deterministically by
+            # the oracle rather than delegated to the LLM judge.
+            final_cases.extend(_run_protocol_checks(port, req))
+
             # Aggregate — SOFT-GATE POLICY:
             # Only HARD cases gate the pass verdict. SOFT cases (e.g.
             # arith-basic on an 8B model) are still recorded + surfaced
@@ -307,7 +315,11 @@ class InferFrameworkOracle(Oracle):
                 failure_reason=reason,
                 perf=perf,
                 cases=final_cases,
-                notes=f"server on port {port}; judge_mode={judge_mode}",
+                notes=(
+                    f"server on port {port}; judge_mode={judge_mode}; "
+                    "protocol checks include deterministic and seeded "
+                    "stochastic decoding"
+                ),
                 judge_mode=judge_mode,
                 report_path=str(report_dir / "oracle-report.json"),
             )
@@ -512,6 +524,10 @@ def _send_request(
         "temperature": float(cfg.get("temperature", 0.0)),
         "stream": False,
     }
+    if "top_p" in cfg:
+        payload["top_p"] = float(cfg["top_p"])
+    if "seed" in cfg:
+        payload["seed"] = int(cfg["seed"])
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=body,
@@ -560,6 +576,262 @@ def _extract_text(raw_body: str) -> str:
     if isinstance(first.get("text"), str):
         return first["text"]
     return ""
+
+
+def _run_protocol_checks(port: int, req: Dict[str, Any]) -> List[OracleCaseResult]:
+    checks = [
+        _deterministic_repeat_check(port),
+        _seeded_sampling_check(port),
+    ]
+    features = set(normalize_features(req.get("features")))
+    if "paged kv cache" in features:
+        checks.append(_paged_kv_boundary_check(port))
+    if "continuous batching" in features:
+        checks.append(_continuous_batching_check(port))
+    if "streaming responses" in features:
+        checks.append(_streaming_check(port))
+    return checks
+
+
+def _paged_kv_boundary_check(port: int) -> OracleCaseResult:
+    # Long enough to cross ordinary KV block sizes while remaining bounded on
+    # the small checkpoint used by diagnostic runs. This validates external
+    # block-boundary semantics; E owns memory-efficiency evidence.
+    prompt = " ".join(["alpha beta gamma delta"] * 96)
+    cfg = {
+        "prompt": prompt,
+        "max_tokens": 8,
+        "temperature": 0.0,
+        "seed": 17,
+    }
+    text, status, elapsed, error = _send_request(port, cfg, timeout_s=120)
+    passed = error is None and status == 200 and bool(text)
+    return OracleCaseResult(
+        case_id="protocol-paged-kv-boundary",
+        prompt="bounded repeated-token long-context probe",
+        response=text,
+        judge_verdict="pass" if passed else "fail",
+        judge_reason=(
+            "a bounded long-context request crossed KV block boundaries"
+            if passed else
+            "the selected Paged KV feature failed a bounded long-context request"
+        ),
+        elapsed_s=elapsed,
+        http_status=status,
+        error=error,
+        gating="hard",
+    )
+
+
+def _continuous_batching_check(port: int) -> OracleCaseResult:
+    cfg = {
+        "prompt": "Give one short sentence about a lighthouse.",
+        "max_tokens": 24,
+        "temperature": 0.0,
+        "seed": 29,
+    }
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(_send_request, port, cfg, 120)
+            for _ in range(4)
+        ]
+        observations = [future.result() for future in futures]
+    texts = [item[0] for item in observations]
+    errors = [item[3] for item in observations if item[3]]
+    passed = (
+        not errors
+        and all(item[1] == 200 for item in observations)
+        and bool(texts[0])
+        and len(set(texts)) == 1
+    )
+    return OracleCaseResult(
+        case_id="protocol-continuous-batching-isolation",
+        prompt=cfg["prompt"],
+        response=texts[0] if texts else "",
+        judge_verdict="pass" if passed else "fail",
+        judge_reason=(
+            "four concurrent deterministic requests completed with isolated, identical output"
+            if passed else
+            "concurrent deterministic requests failed, were empty, or contaminated one another"
+        ),
+        elapsed_s=time.time() - t0,
+        http_status=observations[-1][1] if observations else None,
+        error="; ".join(str(error) for error in errors) or None,
+        gating="hard",
+    )
+
+
+def _deterministic_repeat_check(port: int) -> OracleCaseResult:
+    cfg = {
+        "prompt": "Give one short sentence about a compass.",
+        "max_tokens": 32,
+        "temperature": 0.0,
+        "seed": 123,
+    }
+    observations = [_send_request(port, cfg, timeout_s=60) for _ in range(3)]
+    texts = [item[0] for item in observations]
+    errors = [item[3] for item in observations if item[3]]
+    passed = not errors and bool(texts[0]) and len(set(texts)) == 1
+    return OracleCaseResult(
+        case_id="protocol-deterministic-repeat",
+        prompt=cfg["prompt"],
+        response=texts[0] if texts else "",
+        judge_verdict="pass" if passed else "fail",
+        judge_reason=(
+            "temperature=0 with a fixed seed produced three byte-identical responses"
+            if passed else
+            "temperature=0/fixed-seed responses were empty, failed, or not identical"
+        ),
+        elapsed_s=sum(item[2] for item in observations),
+        http_status=observations[-1][1] if observations else None,
+        error="; ".join(str(error) for error in errors) or None,
+        gating="hard",
+    )
+
+
+def _seeded_sampling_check(port: int) -> OracleCaseResult:
+    base = {
+        "prompt": (
+            "Write a vivid two-sentence description of an imaginary city at dawn."
+        ),
+        "max_tokens": 64,
+        "temperature": 1.2,
+        "top_p": 0.95,
+    }
+    seeds = (101, 101, 202, 303)
+    observations = [
+        _send_request(port, {**base, "seed": seed}, timeout_s=60)
+        for seed in seeds
+    ]
+    narrow_top_p = _send_request(
+        port, {**base, "seed": seeds[0], "top_p": 0.01}, timeout_s=60,
+    )
+    texts = [item[0] for item in observations]
+    errors = [item[3] for item in [*observations, narrow_top_p] if item[3]]
+    same_seed_reproducible = len(texts) >= 2 and texts[0] == texts[1] and bool(texts[0])
+    different_seed_varies = len(set(texts[1:])) >= 2
+    top_p_changes_output = bool(narrow_top_p[0]) and narrow_top_p[0] != texts[0]
+    passed = (
+        not errors
+        and same_seed_reproducible
+        and different_seed_varies
+        and top_p_changes_output
+    )
+    reason = (
+        "same seed reproduced exactly, different seeds changed stochastic output, "
+        "and a narrow top_p changed the same-seed output"
+        if passed else
+        "sampling parameters appear ignored or unseeded: expected same-seed "
+        "reproducibility, at least two outputs across different seeds, and a "
+        "different output when top_p narrows from 0.95 to 0.01"
+    )
+    return OracleCaseResult(
+        case_id="protocol-seeded-stochastic-sampling",
+        prompt=base["prompt"],
+        response=texts[0] if texts else "",
+        judge_verdict="pass" if passed else "fail",
+        judge_reason=reason,
+        elapsed_s=sum(item[2] for item in observations) + narrow_top_p[2],
+        http_status=narrow_top_p[1],
+        error="; ".join(str(error) for error in errors) or None,
+        gating="hard",
+    )
+
+
+def _streaming_check(port: int) -> OracleCaseResult:
+    prompt = "Reply with five words about the moon."
+    text, status, elapsed, error, content_type, done, content_chunks = (
+        _send_stream_request(
+            port,
+            {
+                "prompt": prompt,
+                "max_tokens": 24,
+                "temperature": 0.0,
+                "seed": 7,
+            },
+            timeout_s=60,
+        )
+    )
+    passed = (
+        error is None
+        and status == 200
+        and "text/event-stream" in content_type.casefold()
+        and bool(text)
+        and content_chunks >= 2
+        and done
+    )
+    return OracleCaseResult(
+        case_id="protocol-sse-streaming",
+        prompt=prompt,
+        response=text,
+        judge_verdict="pass" if passed else "fail",
+        judge_reason=(
+            "stream=true returned multiple incremental SSE content chunks "
+            "followed by [DONE]"
+            if passed else
+            "stream=true did not return at least two non-empty incremental "
+            "text/event-stream chunks ending in [DONE]"
+        ),
+        elapsed_s=elapsed,
+        http_status=status,
+        error=error,
+        gating="hard",
+    )
+
+
+def _send_stream_request(
+    port: int, cfg: Dict[str, Any], timeout_s: int,
+) -> Tuple[str, Optional[int], float, Optional[str], str, bool, int]:
+    url = f"http://127.0.0.1:{port}/v1/chat/completions"
+    payload = {
+        "model": "default",
+        "messages": [{"role": "user", "content": cfg["prompt"]}],
+        "max_tokens": int(cfg.get("max_tokens", 64)),
+        "temperature": float(cfg.get("temperature", 0.0)),
+        "stream": True,
+        "seed": int(cfg.get("seed", 0)),
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+        method="POST",
+    )
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            content_type = response.headers.get("Content-Type", "")
+            chunks: List[str] = []
+            done = False
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    done = True
+                    break
+                try:
+                    obj = json.loads(data)
+                    choice = (obj.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        chunks.append(content)
+                except (ValueError, TypeError, IndexError, AttributeError):
+                    continue
+            return (
+                "".join(chunks), response.status, time.time() - t0,
+                None, content_type, done, len(chunks),
+            )
+    except urllib.error.HTTPError as exc:
+        return "", exc.code, time.time() - t0, f"HTTP {exc.code}", "", False, 0
+    except Exception as exc:  # noqa: BLE001
+        return (
+            "", None, time.time() - t0, f"{type(exc).__name__}: {exc}",
+            "", False, 0,
+        )
 
 
 # --------------------------------------------------------------------------- #

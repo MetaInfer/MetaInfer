@@ -11,7 +11,13 @@
 .pill.C_test,
 .pill.D_review,
 .pill.E_perf_test,
+.pill.G_perf_review,
 .pill.F_perf_plan {
   background: rgba(88, 166, 255, 0.15);
   color: #58a6ff;
+}
+
+.pill.paused {
+  background: rgba(210, 153, 34, 0.16);
+  color: #d29922;
 }

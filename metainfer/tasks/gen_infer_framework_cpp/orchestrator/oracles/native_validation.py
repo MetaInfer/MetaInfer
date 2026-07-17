@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set
 
+from ..capabilities import normalize_features
+
 
 _PYTHON_EXE_RE = re.compile(r"^python(?:\d+(?:\.\d+)*)?(?:\.exe)?$", re.IGNORECASE)
 _ACCELERATOR_LIBRARY_MARKERS = (
@@ -68,7 +70,14 @@ def hardware_validation_errors(req: Mapping[str, Any]) -> List[str]:
 def native_accelerator_errors(
     req: Mapping[str, Any], evidence: Mapping[str, Any],
 ) -> List[str]:
-    """Require the native server to load an accelerator runtime on GPU tasks."""
+    """Require concrete accelerator ownership in the native server process.
+
+    Merely mapping ``libhipblas``/``libcuda`` is not execution evidence: a
+    CPU-only server can link those libraries and never initialize a device.
+    Conversely, an open render node without the selected runtime mapped does
+    not prove that model operators use the requested backend. GPU tasks must
+    show both signals, preferably on the same native process.
+    """
     target = str(req.get("target_hardware") or "").lower()
     backend = str(req.get("accelerator_backend") or "").lower()
     requires_accelerator = any(
@@ -80,12 +89,51 @@ def native_accelerator_errors(
     )
     if not requires_accelerator:
         return []
-    if evidence.get("loaded_accelerator_libraries") or evidence.get("gpu_device_fds"):
-        return []
-    return [
-        "native server process exposed neither an accelerator device FD nor a mapped "
-        "HIP/HSA/BLAS/CUDA runtime library"
-    ]
+
+    libraries = list(evidence.get("loaded_accelerator_libraries") or [])
+    device_fds = list(evidence.get("gpu_device_fds") or [])
+    errors: List[str] = []
+    if not libraries:
+        errors.append(
+            "native server process mapped no HIP/HSA/BLAS/CUDA runtime library"
+        )
+    if not device_fds:
+        errors.append(
+            "native server process opened no accelerator device FD "
+            "(/dev/kfd, render node, or /dev/nvidia*)"
+        )
+
+    processes = list(evidence.get("processes") or [])
+    if libraries and device_fds and processes:
+        active_native = [
+            proc for proc in processes
+            if proc.get("exe_in_iteration")
+            and not proc.get("is_python")
+            and proc.get("accelerator_libraries")
+            and proc.get("gpu_device_fds")
+        ]
+        if not active_native:
+            errors.append(
+                "accelerator library and device-FD evidence did not belong to "
+                "the same native server process"
+            )
+        features = set(normalize_features(req.get("features")))
+        if "tensor parallelism" in features:
+            raw_tp = str(req.get("tensor_parallel_size") or "Auto").strip()
+            if raw_tp.isdigit():
+                expected_ranks = max(2, int(raw_tp))
+            else:
+                assigned = str(req.get("assigned_devices") or "")
+                expected_ranks = max(
+                    2, len([item for item in assigned.split(",") if item.strip()]),
+                )
+            if len(active_native) < expected_ranks:
+                errors.append(
+                    "Tensor parallelism requested "
+                    f"{expected_ranks} native ranks but process evidence found "
+                    f"{len(active_native)}"
+                )
+    return errors
 
 
 def collect_native_process_evidence(root_pid: int, iter_dir: Path) -> Dict[str, Any]:

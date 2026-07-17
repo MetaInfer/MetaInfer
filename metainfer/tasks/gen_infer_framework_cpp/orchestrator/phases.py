@@ -38,6 +38,7 @@ Phase = Literal[
     "C_test",
     "D_review",
     "E_perf_test",
+    "G_perf_review",
     "F_perf_plan",
     "finished",
 ]
@@ -104,14 +105,14 @@ class Transition:
 # --------------------------------------------------------------------------- #
 #
 # Flow:
-#   A_plan → B_implement → C_test → D_review ──┬─ C ok  → E_perf_test → F_perf_plan → A_plan (new iter)
-#                                                └─ C fail → B_implement (new iter)
+#   A → B → C → D correctness review ──┬─ C ok → E perf → G perf review → F plan → A
+#                                       └─ C fail → A (new iter, failure carried)
 #   B_implement fail → A_plan (new iter, replan with failure carried forward)
 #
 # D_review ALWAYS runs after C (regardless of C outcome). Its egress routing
-# (→ E vs → B) is encoded in D's outcome, which the orchestrator derives from
+# (→ E vs → A) is encoded in D's outcome, which the orchestrator derives from
 # C's outcome (see _do_review in pipeline.py). E and F only run on the happy
-# path; if C failed, D routes the iteration back to B for a redo.
+# path; if C failed, D closes the iteration and requests a fresh plan.
 #
 # B_implement failures (either INFRA or LOGIC) do NOT retry in place —
 # they consume the iteration and route back to A_plan for a fresh plan.
@@ -122,16 +123,22 @@ class Transition:
 #
 PHASES: List[PhaseMeta] = [
     PhaseMeta("idle",        "idle",     "not started"),
-    PhaseMeta("A_plan",      "A: Plan",  "planner writes plan.md + test_spec.md"),
+    PhaseMeta("A_plan",      "A: Plan + Gate",
+              "planner writes full architecture + minimum E2E plan; "
+              "deterministic gate must pass"),
     PhaseMeta("B_implement", "B: Implement",
               "implementer writes code + smoke-tests serve.sh"),
     PhaseMeta("C_test",      "C: Correctness Test",
               "run immutable oracle (or test.sh) for correctness only"),
-    PhaseMeta("D_review",    "D: Review + Retro",
-              "post-test reviewer writes review.md; advisory, does NOT gate. "
-              "Routes to E on C-pass, back to B on C-fail"),
+    PhaseMeta("D_review",    "D: Correctness Review",
+              "correctness/code reviewer writes review.md; advisory, does NOT "
+              "make performance claims before E. "
+              "Routes to E on C-pass, fresh A plan on C-fail"),
     PhaseMeta("E_perf_test", "E: Perf Test",
               "agent writes + runs perf.sh (heavier load) → perf_report.json"),
+    PhaseMeta("G_perf_review", "G: Perf Review",
+              "review measured E results and code changes; writes "
+              "perf-review.md before the next perf plan"),
     PhaseMeta("F_perf_plan", "F: Perf Plan",
               "agent reads perf_report.json + review.md, writes perf_plan.md; "
               "no code changes; next iteration's A executes the plan"),
@@ -143,7 +150,8 @@ PHASES: List[PhaseMeta] = [
 # Left-to-right display order for the graph. Phases not in this list
 # (idle / finished / failed) are rendered as status badges, not graph nodes.
 PHASE_ORDER: List[Phase] = [
-    "A_plan", "B_implement", "C_test", "D_review", "E_perf_test", "F_perf_plan",
+    "A_plan", "B_implement", "C_test", "D_review", "E_perf_test",
+    "G_perf_review", "F_perf_plan",
 ]
 
 
@@ -157,7 +165,7 @@ PHASE_ORDER: List[Phase] = [
 # D_review's outcome is set by the orchestrator based on what C's outcome was
 # (NOT on whether the reviewer agent itself succeeded — D is advisory). So:
 #   (D_review, OK)         → E_perf_test   [meaning: C had passed]
-#   (D_review, LOGIC_FAIL) → B_implement   [meaning: C had failed]
+#   (D_review, LOGIC_FAIL) → A_plan        [meaning: C had failed]
 # --------------------------------------------------------------------------- #
 
 TRANSITIONS: Dict[Tuple[Phase, Outcome], Transition] = {
@@ -169,19 +177,23 @@ TRANSITIONS: Dict[Tuple[Phase, Outcome], Transition] = {
     ("C_test",       OK):              Transition("C_test",  OK, "D_review",
                                                   label="pass",   carry_failure=False, consume_iteration=False),
     ("C_test",       LOGIC_FAIL):      Transition("C_test",  LOGIC_FAIL, "D_review",
-                                                  label="fail",   carry_failure=False, consume_iteration=False),
+                                                  label="fail",   carry_failure=True, consume_iteration=False),
     ("C_test",       INFRA_FAIL):      Transition("C_test",  INFRA_FAIL, "D_review",
-                                                  label="infra",  carry_failure=False, consume_iteration=False),
+                                                  label="infra",  carry_failure=True, consume_iteration=False),
     ("C_test",       PERF_REGRESSION): Transition("C_test",  PERF_REGRESSION, "D_review",
-                                                  label="regress", carry_failure=False, consume_iteration=False),
+                                                  label="regress", carry_failure=True, consume_iteration=False),
     ("D_review",     OK):              Transition("D_review", OK, "E_perf_test",
                                                   label="C ok → perf",
                                                   carry_failure=False, consume_iteration=False),
-    ("D_review",     LOGIC_FAIL):      Transition("D_review", LOGIC_FAIL, "B_implement",
-                                                  label="C fail → redo",
+    ("D_review",     LOGIC_FAIL):      Transition("D_review", LOGIC_FAIL, "A_plan",
+                                                  label="C fail → replan",
+                                                  carry_failure=True,
                                                   consume_iteration=True),
-    ("E_perf_test",  OK):              Transition("E_perf_test", OK, "F_perf_plan",
+    ("E_perf_test",  OK):              Transition("E_perf_test", OK, "G_perf_review",
                                                   label="ok", carry_failure=False,
+                                                  carry_perf=True, consume_iteration=False),
+    ("G_perf_review", OK):              Transition("G_perf_review", OK, "F_perf_plan",
+                                                  label="reviewed", carry_failure=False,
                                                   carry_perf=True, consume_iteration=False),
     ("F_perf_plan",  OK):              Transition("F_perf_plan", OK, "A_plan",
                                                   label="new iter",
@@ -206,6 +218,9 @@ TRANSITIONS: Dict[Tuple[Phase, Outcome], Transition] = {
     # F_perf_plan: short (no GPU). Retry in place is fine.
     ("F_perf_plan",  INFRA_FAIL): Transition("F_perf_plan",  INFRA_FAIL, "F_perf_plan",
                                              label="retry", carry_failure=False, consume_iteration=False),
+    ("G_perf_review", INFRA_FAIL): Transition("G_perf_review", INFRA_FAIL, "F_perf_plan",
+                                             label="advisory fail", carry_failure=False,
+                                             consume_iteration=False),
 
     # ---- B_implement failures: advance to a fresh iteration --------------- #
     # Design choice (Plan A): a B failure — whether INFRA_FAIL (timeout, GPU

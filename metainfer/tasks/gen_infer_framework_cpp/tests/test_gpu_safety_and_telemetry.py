@@ -73,6 +73,27 @@ class SharedHostGpuSafetyTest(unittest.TestCase):
         self.assertEqual(parsed[0]["memory_used_mib"], 12000.0)
         self.assertEqual(parsed[1]["power_draw_w"], 0.0)
 
+    def test_active_device_mean_is_not_divided_by_idle_visible_devices(self):
+        telemetry = GpuTelemetry()
+        telemetry._record_devices({
+            0: {"utilization_gpu": 80.0, "memory_used_mib": 4000.0},
+            1: {"utilization_gpu": 0.0, "memory_used_mib": 2.0},
+            2: {"utilization_gpu": 0.0, "memory_used_mib": 2.0},
+            3: {"utilization_gpu": 0.0, "memory_used_mib": 2.0},
+        })
+        aggregate = telemetry.aggregate()
+
+        self.assertEqual(aggregate["utilization_gpu_mean"], 20.0)
+        self.assertEqual(aggregate["active_device_count"], 1)
+        self.assertEqual(
+            aggregate["active_device_utilization_gpu_mean"], 80.0,
+        )
+        device0 = next(
+            item for item in aggregate["per_device_stats"]
+            if item["index"] == 0
+        )
+        self.assertEqual(device0["utilization_gpu_mean"], 80.0)
+
     def test_preferred_backend_does_not_mix_management_tools(self):
         with (
             patch("shutil.which", return_value="/usr/bin/nvidia-smi"),

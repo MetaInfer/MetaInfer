@@ -45,10 +45,79 @@ class CppNativeValidationTest(unittest.TestCase):
         self.assertTrue(native_accelerator_errors(
             gpu_req, {"loaded_accelerator_libraries": []},
         ))
-        self.assertEqual(native_accelerator_errors(
+        library_only = native_accelerator_errors(
             gpu_req,
             {"loaded_accelerator_libraries": ["/opt/dtk/lib/libamdhip64.so"]},
+        )
+        self.assertTrue(any("device FD" in item for item in library_only))
+
+        fd_only = native_accelerator_errors(
+            gpu_req, {"gpu_device_fds": ["/dev/kfd"]},
+        )
+        self.assertTrue(any("runtime library" in item for item in fd_only))
+
+        self.assertEqual(native_accelerator_errors(
+            gpu_req,
+            {
+                "loaded_accelerator_libraries": ["/opt/dtk/lib/libamdhip64.so"],
+                "gpu_device_fds": ["/dev/kfd"],
+            },
         ), [])
+
+    def test_accelerator_evidence_must_belong_to_same_native_process(self):
+        gpu_req = {
+            "target_hardware": "Hygon Z200SM",
+            "accelerator_backend": "Hygon DTK / HIP",
+        }
+        split_evidence = {
+            "loaded_accelerator_libraries": ["/opt/dtk/lib/libamdhip64.so"],
+            "gpu_device_fds": ["/dev/kfd"],
+            "processes": [
+                {
+                    "exe_in_iteration": True,
+                    "is_python": False,
+                    "accelerator_libraries": ["/opt/dtk/lib/libamdhip64.so"],
+                    "gpu_device_fds": [],
+                },
+                {
+                    "exe_in_iteration": False,
+                    "is_python": False,
+                    "accelerator_libraries": [],
+                    "gpu_device_fds": ["/dev/kfd"],
+                },
+            ],
+        }
+        errors = native_accelerator_errors(gpu_req, split_evidence)
+        self.assertTrue(any("same native server process" in item for item in errors))
+
+        split_evidence["processes"][0]["gpu_device_fds"] = ["/dev/kfd"]
+        self.assertEqual(native_accelerator_errors(gpu_req, split_evidence), [])
+
+    def test_tensor_parallelism_requires_native_rank_processes(self):
+        req = {
+            "target_hardware": "Hygon Z200SM",
+            "accelerator_backend": "Hygon DTK / HIP",
+            "features": ["Tensor parallelism"],
+            "tensor_parallel_size": "2",
+            "assigned_devices": "0,1",
+        }
+        process = {
+            "exe_in_iteration": True,
+            "is_python": False,
+            "accelerator_libraries": ["/opt/dtk/lib/libamdhip64.so"],
+            "gpu_device_fds": ["/dev/kfd", "/dev/dri/renderD128"],
+        }
+        evidence = {
+            "loaded_accelerator_libraries": ["/opt/dtk/lib/libamdhip64.so"],
+            "gpu_device_fds": ["/dev/kfd", "/dev/dri/renderD128"],
+            "processes": [process],
+        }
+
+        errors = native_accelerator_errors(req, evidence)
+
+        self.assertTrue(any("requested 2 native ranks" in item for item in errors))
+        evidence["processes"].append(dict(process))
+        self.assertEqual(native_accelerator_errors(req, evidence), [])
 
 
 if __name__ == "__main__":

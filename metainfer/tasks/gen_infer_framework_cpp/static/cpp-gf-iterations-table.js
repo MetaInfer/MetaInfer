@@ -18,8 +18,8 @@ function perfCell(rec) {
 
 export function IterationsTable({ iterations, selectedN, onSelect }) {
   const rows = (iterations || []).map((r) => {
-    const statusLabel = r.interrupted ? "interrupted" : r.status;
-    const statusCls = r.interrupted ? "interrupted" : r.status;
+    const statusLabel = r.paused ? "paused" : (r.interrupted ? "interrupted" : r.status);
+    const statusCls = r.paused ? "paused" : (r.interrupted ? "interrupted" : r.status);
     const cls = r.iteration === selectedN ? "selected" : "";
     return html`
       <tr key=${r.iteration} class=${cls}

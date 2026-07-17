@@ -14,6 +14,7 @@ tasks, extraction back into a shared helper is fine.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -42,12 +43,38 @@ def read_iterations(state_dir: Path) -> List[Dict[str, Any]]:
     for p in sorted(iters_dir.glob("*.json")):
         data = _load_json(p, None)
         if data is not None:
-            out.append(data)
+            out.append(_overlay_paused_status(state_dir, data))
     return out
 
 
 def read_iteration(state_dir: Path, n: int) -> Optional[Dict[str, Any]]:
-    return _load_json(state_dir / "iterations" / f"{n:03d}.json", None)
+    data = _load_json(state_dir / "iterations" / f"{n:03d}.json", None)
+    return _overlay_paused_status(state_dir, data) if data is not None else None
+
+
+def _overlay_paused_status(state_dir: Path, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Present a stopped mid-flight iteration as paused without mutating it.
+
+    The shared signal handler owns durable state and lives outside this task
+    package.  Until that layer is changed, the C++ card can still reconcile
+    its view from the cleared PID file instead of displaying a stale
+    ``running`` badge indefinitely.
+    """
+    result = dict(data)
+    if result.get("status") != "running":
+        return result
+    pid_state = _load_json(state_dir / "orchestrator.pid", {}) or {}
+    if pid_state.get("pid") is not None or pid_state.get("finished_at") is None:
+        return result
+    finished_at = float(pid_state.get("finished_at") or time.time())
+    started_at = float(result.get("started_at") or finished_at)
+    result["status"] = "paused"
+    result["paused"] = True
+    result["ended_at"] = result.get("ended_at") or finished_at
+    result["duration_s"] = result.get("duration_s") or max(
+        0.0, finished_at - started_at,
+    )
+    return result
 
 
 def read_charts(state_dir: Path) -> Dict[str, Any]:
@@ -105,7 +132,12 @@ def read_retrospective(state_dir: Path, n: int) -> Dict[str, Any]:
                 markdown = ""
     if not has:
         status = rec.get("status")
-        if status == "running":
+        if status == "paused":
+            reason = (
+                "This iteration was paused before its close path completed; "
+                "no retrospective has been produced yet."
+            )
+        elif status == "running":
             reason = ("This iteration is still running — no retrospective "
                       "has been produced yet.")
         elif status == "failed":

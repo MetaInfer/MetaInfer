@@ -25,6 +25,14 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .plan_gate import (
+    CORE_CAPABILITIES,
+    FULL_GATE,
+    INCREMENTAL_GATE,
+    PlanGateContext,
+    frozen_requirements,
+)
+from .capabilities import normalize_features
 from .task_types import is_cpp_framework_task, is_http_framework_task
 
 
@@ -47,53 +55,50 @@ Read it EFFICIENTLY:
 
 _CPP_PHASE_NOTEBOOKS = {
     "plan": [
-        "00_contracts/cpp/hardware_profile_contracts.md",
-        "00_contracts/cpp/cpp_framework_contracts.md",
-        "00_contracts/cpp/cpp_engine_contracts.md",
-        "00_contracts/cpp/cpp_qwen3_runtime_contracts.md",
-        "09_cpp_inference/00_overview.md",
-        "09_cpp_inference/05_qwen3_native_runtime.md",
+        "00_overview/README.md",
+        "00_contracts/hardware_profile_contracts.md",
+        "00_contracts/framework_contracts.md",
+        "00_contracts/engine_contracts.md",
+        "00_contracts/qwen3_model_contracts.md",
+        "01_framework_design/01_architecture.md",
     ],
     "implement": [
-        "00_contracts/cpp/cpp_framework_contracts.md",
-        "00_contracts/cpp/cpp_memory_contracts.md",
-        "00_contracts/cpp/cpp_qwen3_runtime_contracts.md",
-        "09_cpp_inference/01_cmake_dtk_toolchain.md",
-        "09_cpp_inference/12_testing_and_validation.md",
+        "00_contracts/testing_contracts.md",
+        "00_contracts/weight_loading_contracts.md",
+        "00_contracts/operator_contracts.md",
+        "00_contracts/memory_contracts.md",
+        "01_framework_design/04_model_runner.md",
+        "01_framework_design/10_cmake_dtk_toolchain.md",
     ],
     "repair": [
-        "00_contracts/cpp/cpp_framework_contracts.md",
-        "00_contracts/cpp/cpp_qwen3_runtime_contracts.md",
-        "09_cpp_inference/12_testing_and_validation.md",
+        "00_contracts/testing_contracts.md",
+        "00_contracts/engine_contracts.md",
+        "00_contracts/qwen3_model_contracts.md",
+        "01_framework_design/07_request_lifecycle.md",
     ],
     "review": [
-        "00_contracts/cpp/hardware_profile_contracts.md",
-        "00_contracts/cpp/cpp_framework_contracts.md",
-        "00_contracts/cpp/cpp_engine_contracts.md",
-        "00_contracts/cpp/cpp_memory_contracts.md",
-        "00_contracts/cpp/cpp_attention_kv_contracts.md",
-        "00_contracts/cpp/cpp_qwen3_runtime_contracts.md",
-        "00_contracts/cpp/dtk_hip_backend_contracts.md",
-        "00_contracts/cpp/tensor_parallel_contracts.md",
-        "00_contracts/cpp/cpp_tp_communication_contracts.md",
-        "00_contracts/cpp/cpp_profiling_contracts.md",
-        "00_contracts/cpp/native_service_contracts.md",
+        "00_contracts/testing_contracts.md",
+        "00_contracts/framework_contracts.md",
+        "00_contracts/engine_contracts.md",
+        "00_contracts/memory_contracts.md",
+        "00_contracts/operator_contracts.md",
+        "00_contracts/native_service_contracts.md",
     ],
     "perf": [
-        "00_contracts/cpp/dtk_hip_backend_contracts.md",
-        "00_contracts/cpp/tensor_parallel_contracts.md",
-        "00_contracts/cpp/cpp_tp_communication_contracts.md",
-        "00_contracts/cpp/cpp_profiling_contracts.md",
-        "09_cpp_inference/06_hip_operators.md",
-        "09_cpp_inference/07_paged_kv_cache.md",
-        "09_cpp_inference/08_continuous_batching.md",
-        "09_cpp_inference/09_tensor_parallelism.md",
-        "09_cpp_inference/11_profiling.md",
+        "00_contracts/profiling_contracts.md",
+        "06_profiling/00_overview.md",
+        "06_profiling/01_native_trace.md",
+        "06_profiling/03_gpu_event_benchmark.md",
+        "03_operators/05_hip_blas_backend.md",
+        "07_improvementPlan/04_hip_operator_optimization.md",
+        "07_improvementPlan/08_profiling_and_benchmarking.md",
     ],
     "retrospective": [
-        "00_contracts/cpp/cpp_framework_contracts.md",
-        "09_cpp_inference/00_overview.md",
-        "09_cpp_inference/12_testing_and_validation.md",
+        "00_overview/README.md",
+        "00_contracts/testing_contracts.md",
+        "06_experience/README.md",
+        "07_improvementPlan/README.md",
+        "08_issues/README.md",
     ],
 }
 
@@ -105,47 +110,106 @@ def _notebooks_hint(req: Dict[str, Any], phase: str) -> str:
 
     required = list(_CPP_PHASE_NOTEBOOKS.get(phase, _CPP_PHASE_NOTEBOOKS["implement"]))
     components: List[str] = []
+    model_family = str(req.get("model_family") or "").strip().lower()
+    if phase in ("plan", "implement", "repair", "review"):
+        components.extend([
+            "02_model_specifics/02_qwen3/README.md",
+            "02_model_specifics/02_qwen3/04_model_loader.md",
+        ])
+        if "hybrid" in model_family or "3.5" in model_family or "3.6" in model_family:
+            components.append(
+                "02_model_specifics/02_qwen3/03_qwen3_5_hybrid.md"
+            )
+        elif "moe" in model_family:
+            components.append("02_model_specifics/02_qwen3/02_moe.md")
+        else:
+            components.append("02_model_specifics/02_qwen3/01_dense.md")
+    if phase == "plan":
+        components.extend([
+            "07_improvementPlan/00_sources_and_governance.md",
+            "07_improvementPlan/01_sampling_and_generation.md",
+            "07_improvementPlan/09_model_compatibility_and_loader.md",
+        ])
     if phase in ("implement", "repair"):
         components.extend([
-            "09_cpp_inference/03_tensor_and_memory_ownership.md",
-            "09_cpp_inference/04_qwen3_model_loader.md",
-            "09_cpp_inference/05_qwen3_native_runtime.md",
-            "09_cpp_inference/06_hip_operators.md",
+            "01_framework_design/08_tensor_ownership.md",
+            "01_framework_design/05_sampler.md",
+            "03_operators/04_sampling_ops.md",
+            "05_inference_service/02_openai_http_api.md",
         ])
-    raw_features = req.get("features") or []
-    if isinstance(raw_features, str):
-        raw_features = [raw_features]
-    features = {str(item).strip().lower() for item in raw_features}
+    features = set(normalize_features(req.get("features")))
     if "paged kv cache" in features:
         components.extend([
-            "00_contracts/cpp/cpp_attention_kv_contracts.md",
-            "09_cpp_inference/07_paged_kv_cache.md",
+            "00_contracts/attention_kv_contracts.md",
+            "01_framework_design/03_kv_cache.md",
+            "03_operators/01_attention_ops.md",
         ])
+        if phase in ("plan", "perf"):
+            components.append(
+                "07_improvementPlan/03_paged_kv_and_prefix_cache.md"
+            )
     if "continuous batching" in features:
         components.extend([
             "01_framework_design/07_request_lifecycle.md",
-            "09_cpp_inference/08_continuous_batching.md",
+            "01_framework_design/02_scheduler.md",
         ])
-    if "tensor parallelism" in features:
+        if phase in ("plan", "perf"):
+            components.append("07_improvementPlan/02_continuous_batching.md")
+    try:
+        tp_size = int(req.get("tensor_parallel_size") or 1)
+    except (TypeError, ValueError):
+        tp_size = 1
+    if "tensor parallelism" in features or tp_size > 1:
         components.extend([
-            "00_contracts/cpp/tensor_parallel_contracts.md",
-            "00_contracts/cpp/cpp_tp_communication_contracts.md",
-            "09_cpp_inference/09_tensor_parallelism.md",
+            "00_contracts/tp_communication_contracts.md",
+            "04_parallel_strategies/01_tensor_parallel.md",
+            "04_parallel_strategies/02_qwen_dense_tp.md",
+            "04_parallel_strategies/04_rccl_collectives.md",
         ])
+        if "moe" in model_family:
+            components.append("04_parallel_strategies/03_qwen_moe_tp.md")
+        if phase in ("plan", "perf"):
+            components.append("07_improvementPlan/05_tensor_parallel_rccl.md")
     if "streaming responses" in features:
         components.extend([
-            "00_contracts/cpp/native_service_contracts.md",
-            "09_cpp_inference/10_cpp_http_server.md",
+            "00_contracts/native_service_contracts.md",
+            "05_inference_service/02_openai_http_api.md",
+            "05_inference_service/03_sse_streaming.md",
+            "05_inference_service/04_process_lifecycle.md",
         ])
-    if "moe" in str(req.get("model_family") or "").lower():
-        components.append("09_cpp_inference/13_qwen3_moe_runtime.md")
+        if phase == "plan":
+            components.append("07_improvementPlan/07_native_service_streaming.md")
+    quantization_policy = str(req.get("quantization_format") or "").strip().lower()
+    dtype_policy = " ".join((
+        str(req.get("weight_dtype") or ""),
+        str(req.get("kv_cache_dtype") or ""),
+        quantization_policy,
+    )).lower()
+    if (
+        phase in ("plan", "perf")
+        and (
+            quantization_policy not in ("", "none / full precision")
+            or any(token in dtype_policy for token in (
+                "int4", "int8", "fp8", "quant", "awq", "gptq", "gguf",
+            ))
+        )
+    ):
+        components.append(
+            "07_improvementPlan/06_quantization_and_weight_formats.md"
+        )
     backend = str(req.get("accelerator_backend") or "").lower()
     hardware = str(req.get("target_hardware") or "").lower()
     if any(token in f"{backend} {hardware}" for token in ("hip", "dtk", "hygon", "amd")):
         components.extend([
-            "00_contracts/cpp/dtk_hip_backend_contracts.md",
-            "09_cpp_inference/02_hardware_discovery.md",
+            "03_operators/05_hip_blas_backend.md",
+            "01_framework_design/09_hardware_discovery.md",
+            "01_framework_design/10_cmake_dtk_toolchain.md",
+            "06_profiling/02_roctx_rocprof.md",
         ])
+        if phase == "plan":
+            components.append(
+                "07_improvementPlan/04_hip_operator_optimization.md"
+            )
 
     # Preserve order while preventing phase + feature duplicates.
     required = list(dict.fromkeys(required))
@@ -173,11 +237,11 @@ architecture plan; B/C must not consume context on untouched components:
 
 {component_rendered}
 
-Existing non-C++ notebooks are shared semantic evidence only; Python/PyTorch
-code in them is not an implementation template for this native task. More
-reading is not progress: extract exact interfaces/invariants/tests, then
-implement and run a focused proof. Do not substitute Python when a C++ guide
-is incomplete."""
+This C++ knowledge base is self-contained. Do not inspect sibling task
+notebooks to fill a gap, and do not substitute Python when a C++ guide is
+incomplete. More reading is not progress: extract exact interfaces,
+invariants, ownership rules, and tests, then implement and run a focused
+proof."""
 
 
 # Subdirectory (relative to iter_dir/.metainfer-logs/) where the previous
@@ -187,53 +251,70 @@ is incomplete."""
 PREV_ITER_LOGS_SUBDIR = "prev-iter"
 
 
-# Hard prohibition on reading / referencing existing inference-framework
-# source code. Past iterations were wasting time exploring vLLM / SGLang /
-# TensorRT-LLM internals and producing derivative work; this rule keeps the
-# implementer honest and the iterations fast.
-#
-# The ONLY exception is calling an operator (kernel) from such a library —
-# e.g. `torch.nn.functional.softmax`, `flash_attn_func`, a CUTLASS op — as
-# a leaf primitive. Anything that resembles a scheduler, KV cache manager,
-# paged-attention allocator, block manager, request queue, ContinuousBatching
-# loop, tokenizer-detokenizer stream, or HTTP server must be written from
-# scratch inside the iteration directory.
-NO_FRAMEWORK_REFERENCE_RULE = """# CRITICAL: no reading or copying from existing inference frameworks
-You are building a framework FROM SCRATCH. The following are STRICTLY FORBIDDEN:
+# C++-specific source and dependency boundary.  This deliberately does not
+# reuse the sibling Python card's rule: allowing Torch/FastAPI in a native
+# task contradicts the language contract, while forbidding every path outside
+# the iteration prevents the implementer from reading the checkpoint and SDK
+# that the user explicitly placed in scope.
+CPP_REFERENCE_AND_ACCESS_RULE = """# CRITICAL: native C++ source and access boundary
+You are building a native C++ inference framework from scratch.
 
-1. **Do not read, browse, grep, cat, or open** the source code of any
-   existing inference engine — this includes (but is not limited to)
-   vLLM, SGLang, TensorRT-LLM, TGI, ExLlamaV2, llama.cpp, LightLLM,
-   DeepSpeed-MII, Aphrodite, OpenLLM, LMCache, or any of their forks.
-   This applies whether the code is on disk, in a pip-installed package,
-   on GitHub, or anywhere outside the current iteration directory.
-2. **Do not import or call** non-operator code from those frameworks.
-   No `from vllm import ...`, no `import sglang`, no copying their files
-   into the iteration directory. The ONLY allowed dependency surface is
-   - torch / numpy / scipy (the numerical primitives)
-   - kernel libraries used as **leaf operators** (e.g. `flash_attn`,
-     `xformers.ops`, a single CUTLASS / Triton kernel) — called directly
-     for a math op, never extended or subclassed
-   - HTTP server primitives (e.g. `fastapi`, `uvicorn`, `http.server`)
-     — used as transport, not copied
-3. **Everything non-operator must be your own work**: the scheduler,
-   the KV cache manager, the paged-attention allocator / block table,
-   the request queue + continuous-batching loop, tokenizer-detokenizer
-   streaming, the OpenAI-compatible request/response shaping, the weight
-   loader, the dtype / quantization packaging. All of it — written from
-   scratch inside the iteration directory.
-4. **Stay inside the iteration directory and the notebooks/ knowledge base.**
-   Do NOT read files outside the working directory. In particular, do NOT
-   enumerate `/usr/lib/python*`, `site-packages/vllm/`, `site-packages/sglang/`,
-   `~/.cache/`, or any third-party project tree. The ONLY reference material
-   you may consult is:
-     - the `notebooks/` directory pointed to below
-     - files inside the current iteration directory
+## Allowed read-only inputs
 
-If you find yourself wanting to "see how vLLM does it" — STOP. That is
-plagiarism. Re-read the relevant entry in `notebooks/` instead; if none
-exists, design the component yourself from first principles. A clean,
-slower, original implementation is always preferred over a fast copy."""
+- the exact checkpoint directory from the frozen requirements, including
+  config, tokenizer metadata, weight indexes, and weight bytes;
+- the routed `notebooks/` files listed in this prompt;
+- the detected hardware profile and diagnostic logs explicitly named by the
+  orchestrator;
+- system compiler, CMake, SDK headers, shared-library metadata, and bounded
+  tool output needed to compile/link/probe the selected backend;
+- files already present inside the current iteration directory.
+
+These permissions are for inspection and bounded probes only. Do not modify
+the checkpoint, system SDK, hardware profile, notebooks, or prior logs. Write
+all generated source, build output, tests, and reports inside the current
+iteration directory.
+
+## Forbidden framework references
+
+1. Do not read, browse, grep, open, copy, import, link, or invoke scheduler,
+   KV-cache, model-engine, serving, tokenizer, or runtime source from vLLM,
+   SGLang, TensorRT-LLM, TGI, ExLlamaV2, llama.cpp, LightLLM, DeepSpeed-MII,
+   Aphrodite, OpenLLM, LMCache, or forks of those projects. This applies to
+   local checkouts, installed packages, caches, and online sources.
+2. Do not embed CPython or use Torch, NumPy, SciPy, Triton, FastAPI, Uvicorn,
+   or `http.server` in the production server or inference path. Short-lived
+   offline test-data/diagnostic tools remain subject to the separate language
+   contract and `LANGUAGE_BOUNDARY.md` disclosure.
+3. Do not copy an existing framework's files and do not wrap/proxy an existing
+   model server. Scheduler, KV allocator, request lifecycle, model runner,
+   sampler, weight loader, and HTTP serving loop are this deliverable's work.
+
+## Allowed native dependency surface
+
+- the C++ standard library, OS/POSIX primitives, and CMake;
+- the selected platform runtime and leaf math/collective libraries that pass
+  local compile/link/runtime probes (for example HIP/DTK, a vendor BLAS, or a
+  compatible collective library);
+- focused C/C++ parsing or transport libraries only when already available,
+  license-compatible, recorded in the build manifest, and not an inference
+  framework.
+
+If a required platform capability is unavailable, report Unsupported with the
+probe evidence. Never replace it with Python, CPU model execution, a mock
+response, or an unrequested backend. Use the self-contained notebook design
+instead of consulting an existing inference engine implementation."""
+
+
+def _reference_and_access_rule(req: Dict[str, Any]) -> str:
+    if is_cpp_framework_task(req.get("task_type", "")):
+        return CPP_REFERENCE_AND_ACCESS_RULE
+    # Compatibility only: the C++ task package should not define the sibling
+    # Python card's dependency policy. Its own prompts remain authoritative.
+    return """# Framework source boundary
+Do not read or copy an existing inference framework implementation. Use this
+task's routed knowledge base and write the requested framework in the current
+iteration directory."""
 
 # Self-test mandate for the implementer (gen-infer-framework only).
 # Past iterations declared "done" with broken serve.sh scripts that crashed
@@ -429,10 +510,9 @@ TERM path pays for itself on the next iteration.
 # the perf planner is blind — it can only guess at bottlenecks from
 # aggregate throughput numbers.
 #
-# The legacy Python contract is fully specified in the sibling task package at
-# metainfer/tasks/gen_infer_framework/notebooks/00_contracts/profiling_contracts.md
-# and its 06_profiling/01_pytorch_profiler.md guide. The implementer is
-# REQUIRED to read those before writing the profile hook.
+# The profiling contract is owned by this task package.  Keeping the reference
+# local prevents the C++ card from depending on the sibling Python knowledge
+# base when prompts are assembled through a compatibility path.
 PROFILING_INTERFACE_MANDATE = """# MANDATORY: reserve a profiling interface (gen-infer-framework)
 Your framework MUST honor a small set of `METAINFER_PROFILE*` env vars so
 the E-step perf oracle can capture a Chrome tracing artifact per iteration.
@@ -440,8 +520,8 @@ Without this hook, the F-step perf planner has no kernel-level visibility
 and can only guess at bottlenecks.
 
 Read the contract before writing the hook:
-  - `metainfer/tasks/gen_infer_framework/notebooks/00_contracts/profiling_contracts.md`
-  - `metainfer/tasks/gen_infer_framework/notebooks/06_profiling/01_pytorch_profiler.md`
+  - `metainfer/tasks/gen_infer_framework_cpp/notebooks/00_contracts/profiling_contracts.md`
+  - `metainfer/tasks/gen_infer_framework_cpp/notebooks/06_profiling/00_overview.md`
 
 Required behavior (summarized — the contract is authoritative):
 
@@ -500,11 +580,19 @@ occupancy but never evict unregistered processes."""
 CPP_SERVER_SMOKE_TEST_MANDATE = """# MANDATORY: native server smoke test
 After the CMake build and focused native tests pass:
 1. Choose a free ephemeral localhost port; never reuse the WebUI port 8765.
-2. Start `bash serve.sh <port>` in the background and capture its exact PID.
+   Assign it in the parent shell on its own line. Do NOT background an
+   `PORT=$(...) && ...` command list: that loses `$PORT` in the polling shell.
+2. Start `bash serve.sh <port>` in the background and capture the actual
+   native server PID, not a transient wrapper/subshell PID.
 3. Poll `/v1/models`, then send one deterministic `/v1/chat/completions`
    request and verify `choices[0].message.content` is a string.
-4. On failure, inspect the native server stderr and fix the C++ root cause.
-5. SIGTERM only the PID you started, wait for cleanup/profile flush, and
+4. Exercise a GET request, a POST whose body arrives in multiple writes, and
+   a client that disconnects before reading the response. The server must
+   honor `Content-Length`, loop over partial read/write, and survive SIGPIPE.
+5. Verify chat messages are rendered with the checkpoint's tokenizer/chat
+   template and special-token IDs, never ad-hoc `user:`/`assistant:` text.
+6. On failure, inspect the native server stderr and fix the C++ root cause.
+7. SIGTERM only the PID you started, wait for cleanup/profile flush, and
    remove temporary PID files. Do not leave a server or GPU context running.
 
 No Python import test applies to this task. Python or curl may be used as a
@@ -513,7 +601,7 @@ binary."""
 
 
 CPP_PROFILING_INTERFACE_MANDATE = """# MANDATORY: native C++ profiling interface
-Read `00_contracts/cpp/cpp_profiling_contracts.md` before implementing this
+Read `00_contracts/profiling_contracts.md` before implementing this
 interface; it is the source of truth for signal safety, artifacts, and ranges.
 
 The E-step perf oracle sets `METAINFER_PROFILE=1` and
@@ -548,6 +636,27 @@ def _language_contract(req: Dict[str, Any]) -> str:
     model_family = req.get("model_family") or "Auto-detect from config.json"
     weight_dtype = req.get("weight_dtype") or "Auto"
     kv_cache_dtype = req.get("kv_cache_dtype") or "Auto"
+    accelerator_clause = ""
+    if str(backend).strip().lower() != "cpu":
+        accelerator_clause = f"""
+
+# NON-NEGOTIABLE accelerator execution boundary
+The selected backend is **{backend}**, so linking an accelerator library or
+compiling a device probe is not sufficient. The production server MUST:
+- initialize the assigned device before reporting model readiness;
+- keep model weights in device memory in the resolved checkpoint dtype;
+- execute Q/K/V, attention, output projection, MLP, KV-cache operations, and
+  LM-head projection through native accelerator kernels/vendor BLAS;
+- retain an accelerator device FD for the healthy server lifetime and show
+  non-zero device memory while the model is loaded;
+- keep scalar/host reference kernels test-only and out of the serving hot path.
+
+Forbidden serving implementations include full-checkpoint `std::vector<float>`
+expansion, nested-loop CPU GEMM, copying device weights back to the host per
+request, and a startup manifest that claims a dtype/backend different from the
+actual storage/execution path. The immutable oracle checks process device FDs;
+the perf oracle additionally checks device memory and activity.
+"""
     hardware = json.dumps(
         req.get("hardware_profile") or {"validation": {"status": "not-probed"}},
         indent=2,
@@ -565,6 +674,7 @@ manifest.
 The following production runtime components MUST be implemented in C++ (and
 CUDA/HIP/native kernel files where appropriate):
 - model/config and weight loading
+- tokenizer metadata, special-token IDs, and exact checkpoint chat-template rendering
 - tensor and device-memory ownership
 - scheduler and continuous batching
 - logical KV cache and physical memory/block pool
@@ -591,6 +701,7 @@ reasonably implementable in C++, and its justification must be recorded in
 
 Every phase must preserve this boundary. A fix that makes tests pass by moving
 runtime work into Python is a correctness failure for this task.
+{accelerator_clause}
 
 # NON-NEGOTIABLE detected hardware contract
 Full read-only evidence: `{hardware_path}`
@@ -967,6 +1078,148 @@ def _render_req(req: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _plan_gate_feedback_section(feedback: Optional[str]) -> str:
+    if not feedback:
+        return ""
+    return f"""
+
+# Previous Plan Gate rejection (MUST FIX BEFORE B)
+The deterministic gate rejected your previous A-stage artifacts. Correct every
+error below in place; do not work around the schema and do not write code.
+
+```json
+{feedback}
+```
+"""
+
+
+def _plan_manifest_contract(
+    req: Dict[str, Any], iteration: int, context: PlanGateContext,
+) -> str:
+    features = frozen_requirements(req).get("features", [])
+    example: Dict[str, Any] = {
+        "schema_version": 2,
+        "task_type": "gen-infer-framework-cpp",
+        "iteration": iteration,
+        "gate_mode": context.mode,
+        "architecture": {"file": "architecture.md", "complete": True},
+        "test_spec": {"file": "test_spec.md", "oracle": "immutable_full_c"},
+        "requirements": frozen_requirements(req),
+        "requested_features": {
+            str(feature): {
+                "architecture": "covered",
+                "delivery": "now",
+                "reason": "REPLACE_WITH_REASON_OR_EMPTY_STRING",
+            }
+            for feature in features
+        },
+        "delivery_items": [{
+            "id": "REPLACE_WITH_STABLE_ITEM_ID",
+            "summary": "REPLACE_WITH_ONE_BOUNDED_IMPLEMENTATION_RESULT",
+            "files": ["REPLACE_WITH_RELATIVE_CHANGED_OR_CREATED_FILE"],
+            "tests": ["REPLACE_WITH_ASSERTION_BEARING_TEST_OR_COMMAND"],
+        }],
+        "deferred": [],
+    }
+    if context.mode == INCREMENTAL_GATE:
+        baseline = context.baseline_iteration
+        example.update({
+            "inherits_verified_iteration": baseline,
+            "plan": {
+                "file": "plan.md",
+                "goal": "incremental_change_ready_for_oracle",
+            },
+            "iteration_objective": {
+                "summary": "REPLACE_WITH_THIS_ITERATION_OBJECTIVE",
+                "source": "REPLACE_WITH_requirements_OR_failure_OR_review_OR_perf_plan_OR_maintenance",
+                "capabilities": ["REPLACE_WITH_CAPABILITY_CHANGED_THIS_ITERATION"],
+            },
+            "change_scope": {
+                "changed_files": ["REPLACE_WITH_RELATIVE_CHANGED_FILE"],
+                "test_files": ["REPLACE_WITH_RELATIVE_TEST_FILE"],
+                "affected_core_capabilities": ["target_device_execution"],
+                "regression_oracle": "immutable_full_c",
+            },
+            "core_capabilities": {
+                capability: {
+                    "status": "inherited_verified",
+                    "from_iteration": baseline,
+                }
+                for capability in CORE_CAPABILITIES
+            },
+        })
+        example["core_capabilities"]["target_device_execution"] = {
+            "status": "delivered_after_b",
+            "files": ["REPLACE_WITH_RELATIVE_CHANGED_FILE"],
+        }
+        mode_rules = f"""This is an INCREMENTAL manifest inheriting verified
+iteration {baseline}. Do not repeat the previous iteration's full file
+inventory. Mark unchanged core capabilities `inherited_verified` with
+`from_iteration: {baseline}`. List only genuinely affected core capabilities
+in `change_scope.affected_core_capabilities`; mark those `delivered_after_b`
+and name only their changed files. `changed_files` and `test_files` must be
+non-empty and appear in `plan.md` / `test_spec.md`."""
+    else:
+        example.update({
+            "plan": {
+                "file": "plan.md",
+                "goal": "minimum_end_to_end_ready_for_oracle",
+            },
+            "core_capabilities": {
+                capability: {
+                    "status": "delivered_after_b",
+                    "files": ["REPLACE_WITH_RELATIVE_PATH_FROM_PLAN"],
+                }
+                for capability in CORE_CAPABILITIES
+            },
+        })
+        mode_rules = """This is a FULL manifest. Every core capability must be
+`delivered_after_b`, with its non-empty relative file inventory also accounted
+for in `plan.md`. Core capabilities may not be inherited or deferred."""
+    return f"""`plan_manifest.json` is the deterministic Plan Gate input. Use
+this exact schema and replace every `REPLACE_...` value with real relative
+paths/reasons. Every file in the current delivery scope must also appear in
+`plan.md`.
+
+```json
+{json.dumps(example, indent=2, sort_keys=True)}
+```
+
+{mode_rules}
+
+`delivered_after_b` means the capability works when B exits. Core capabilities
+may never be deferred. Requested advanced features must all be covered by
+`architecture.md`; set their delivery to `now` or `deferred` with a reason.
+`delivery_items` is the machine-readable A-to-B checklist. Give every planned
+implementation result a stable id, concrete files, and an assertion-bearing
+test. Prefer each test entry in the form `P01-T01: assertion` (or another
+stable, non-prose test id), and reference the same test id on a line or Markdown
+table row associated with the delivery item id in `test_spec.md`; the assertion
+prose does not need to be duplicated verbatim. Their combined file lists must
+cover every `delivered_after_b` core
+file and, in incremental mode, every `change_scope.changed_files` and
+`change_scope.test_files` entry. B's `implementation_report.json` must account
+for the same ids with each id retaining its planned file and test mapping.
+Additional non-core deferrals may be listed in `deferred` as objects with
+`capability` and `reason`."""
+
+
+def _plan_gate_mode_section(context: PlanGateContext) -> str:
+    if context.mode == INCREMENTAL_GATE:
+        return f"""# Plan Gate mode: INCREMENTAL
+Iteration {context.baseline_iteration} is a durable, C-verified baseline.
+Preserve its complete architecture and verified capabilities. Plan only this
+iteration's objective and changed/test files; do not restate every inherited
+source file. The immutable full C Oracle remains the regression gate.
+Reason: {context.reason}
+"""
+    return f"""# Plan Gate mode: FULL
+No eligible C-verified baseline is available. Re-establish the complete native
+architecture and minimum end-to-end delivery before B.
+Reason: {context.reason}
+"""
+
+
 # --------------------------------------------------------------------------- #
 # A — Plan
 # --------------------------------------------------------------------------- #
@@ -981,14 +1234,49 @@ def plan_prompt(
     review_feedback: Optional[str] = None,
     perf_plan: Optional[str] = None,
     logs_dir: Optional[Path] = None,
+    plan_gate_feedback: Optional[str] = None,
+    plan_gate_context: Optional[PlanGateContext] = None,
 ) -> str:
     prev_snap = logs_dir / PREV_ITER_LOGS_SUBDIR if logs_dir is not None else None
+    context = plan_gate_context or PlanGateContext(
+        FULL_GATE, "no verified baseline context was supplied",
+    )
+    if context.mode == INCREMENTAL_GATE:
+        planning_job = """1. Preserve the COMPLETE architecture blueprint inherited from the verified baseline.
+2. Produce a focused incremental delivery plan for this iteration's objective,
+   naming only changed files, affected capabilities, and regression tests."""
+        plan_requirements = """- **Iteration objective** and its source (requirements, failure, review, perf plan, or maintenance)
+   - **Change scope**: changed files, affected core capabilities, and test files
+   - Concrete path/function work only for this delta; do not repeat inherited file inventories
+   - **Regression verification** using the immutable full C Oracle
+   - Risks and rollback/disable conditions for the proposed changes
+   - If `review_feedback` was provided: a **Review response** section
+   - If a perf-plan brief was provided: a **Perf plan response** section"""
+    else:
+        planning_job = """1. Maintain a COMPLETE architecture blueprint for the final requested native C++ inference framework.
+2. Produce this iteration's minimum end-to-end delivery plan. When B exits,
+   the real checkpoint must be ready for the FULL immutable C Oracle."""
+        plan_requirements = """- **Goal of this iteration** (1-2 sentences)
+   - **File-by-file work items** (path → what to create/modify, key APIs)
+   - The real native vertical path: OpenAI request → exact chat
+     template/tokenizer → real checkpoint loading → target-device forward →
+     deterministic greedy decode plus seeded stochastic sampling → detokenize
+     → `choices[0].message.content`
+   - **Test plan** matching the immutable full C Oracle
+   - **Performance targets** (only if this iteration includes perf work)
+   - **Risks** (anything that might block the implementer)
+   - If `review_feedback` was provided: a **Review response** section
+   - If a perf-plan brief was provided: a **Perf plan response** section"""
     return f"""You are the **PLANNER** for MetaInfer iteration #{iteration}.
 
-Your job: produce a concrete, file-level work plan for this iteration ONLY.
-Subsequent agents in this iteration (implementer) will follow your plan
-exactly, so be specific about file paths, function signatures, and test
-commands.
+Your job has two coupled parts:
+{planning_job}
+
+The implementer follows the validated artifacts, so use concrete relative file
+paths, native APIs, and commands. Later iterations may repair or optimize
+existing code, but their plan must preserve the complete serving path.
+
+{_plan_gate_mode_section(context)}
 
 # Task requirements (frozen)
 {_render_req(req)}
@@ -1001,7 +1289,7 @@ All code and artifacts you plan for must live INSIDE this directory.
 {_notebooks_hint(req, "plan")}
 Knowledge base path: {notebooks_dir}
 
-{NO_FRAMEWORK_REFERENCE_RULE}
+{_reference_and_access_rule(req)}
 
 {_language_contract(req)}
 
@@ -1010,28 +1298,33 @@ Knowledge base path: {notebooks_dir}
 {_prev_logs_section(prev_failures, prev_snap)}
 {_perf_plan_section(perf_plan)}
 {_review_feedback_section(review_feedback)}
+{_plan_gate_feedback_section(plan_gate_feedback)}
 
 # Deliverables
-Write exactly two files inside `{iter_dir}`:
+Write or update exactly these four planning artifacts inside `{iter_dir}`:
 
-1. `plan.md` — your work plan. Must contain:
-   - **Goal of this iteration** (1-2 sentences)
-   - **File-by-file work items** (path → what to create/modify, key APIs)
-   - **Test plan** (what `test.sh` should check; what "correct" means)
-   - **Performance targets** (only if this iteration includes perf work)
-   - **Risks** (anything that might block the implementer)
-   - If `review_feedback` was provided above: a **"Review response"** section
-     that says how the plan addresses each suggestion.
-   - If a perf plan brief was provided above: a **"Perf plan response"**
-     section mapping each planned optimization to a concrete file/function
-     in this iteration's work items.
+1. `architecture.md` — the complete final-system blueprint. It must cover the
+   native C++/CMake boundary, model/weight loading, exact tokenizer + chat
+   template handling, target-accelerator execution, scheduler, KV cache,
+   decode/sampler, OpenAI HTTP service, process lifecycle, every frozen
+   requested feature, and component boundaries.
 
-2. `test_spec.md` — the verification contract for this iteration.
-   {_plan_test_spec_contract(req)}
+2. `plan.md` — the work plan for the selected Gate mode. Must contain:
+   {plan_requirements}
 
-Do NOT write code. Do NOT run tests. Planning only. Be terse — a good
-plan fits in one screen. Do not over-explore the knowledge base; read
-only the 3-4 notebook files most relevant to this iteration's task.
+3. `test_spec.md` — the verification contract for this iteration.
+   {_plan_test_spec_contract(req)} It must explicitly cover foreground
+   `serve.sh`, the real checkpoint on the selected accelerator, deterministic
+   temperature=0 `/v1/chat/completions`, seeded `temperature>0` + `top_p`
+   sampling whose parameters affect generation,
+   `choices[0].message.content`, native process ownership, and cleanup.
+
+4. `plan_manifest.json` — structured proof that the plan is C-ready:
+   {_plan_manifest_contract(req, iteration, context)}
+
+Do NOT write code or run tests. Planning only. Be concise but do not omit any
+required architecture or end-to-end element. Read only the 3-4 notebook files
+most relevant to this iteration's task.
 """
 
 
@@ -1060,15 +1353,19 @@ def implement_prompt(
 # Working directory
 {iter_dir}  (everything you write goes here — visible code only)
 
-# Plan to follow
-Read `{iter_dir}/plan.md` and `{iter_dir}/test_spec.md` (written by the
-planner). Implement exactly what they specify — do not invent new scope.
+# Validated planning contract
+Read `{iter_dir}/architecture.md`, `{iter_dir}/plan.md`,
+`{iter_dir}/test_spec.md`, and `{iter_dir}/plan_manifest.json`. They passed the
+deterministic Plan Gate. Implement the planned scope without omitting any core
+capability marked `delivered_after_b`. If prose conflicts, frozen requirements
+and the manifest's full native end-to-end contract take precedence. Do not add
+unrelated scope.
 
 # Knowledge base
 {_notebooks_hint(req, "implement")}
 Knowledge base path: {notebooks_dir}
 
-{NO_FRAMEWORK_REFERENCE_RULE}
+{_reference_and_access_rule(req)}
 
 {_language_contract(req)}
 
@@ -1082,8 +1379,49 @@ If a previous failure is shown, your FIRST commit must address it.
 {_review_feedback_section(review_feedback)}
 
 # Deliverables
-1. The code described in the plan, inside `{iter_dir}`.
+1. The code described by the validated planning contract, inside `{iter_dir}`.
 {_deliverables_for_task(task_type, iter_dir, req)}
+
+3. Write `{iter_dir}/implementation_report.json` after all checks finish.
+   This report is consumed by a deterministic B-stage gate; prose in your
+   final answer is not a substitute. Use this schema:
+
+```json
+{json.dumps({
+    "schema_version": 1,
+    "iteration": iteration,
+    "status": "complete",
+    "plan_items": [{
+        "id": "stable-plan-item-id",
+        "status": "implemented",
+        "files": ["relative/source.cpp"],
+        "tests": ["exact command or test target that passed"],
+    }],
+    "verification": {
+        "build": {"passed": True, "command": "cmake --build build --parallel"},
+        "reference_differential": {
+            "passed": True,
+            "command": "the assertion-bearing differential test command",
+            "metrics": {"prefill_decode_cosine": 0.99},
+        },
+        "end_to_end": {"passed": True, "command": "native E2E command"},
+    },
+}, indent=2)}
+```
+
+Every `delivered_after_b` file and every incremental `change_scope` file from
+`plan_manifest.json` must appear in a `plan_items[].files` entry. Do not mark a
+planned item implemented unless its file exists and its named test passed.
+Use exactly the planned delivery-item ids, and keep every planned file/test
+under its corresponding id; moving evidence between ids does not satisfy the
+Implementation Gate.
+The reference differential test must FAIL non-zero when its cosine or token
+agreement threshold is missed; merely printing a metric is not verification.
+After your report passes the static checklist, the orchestrator independently
+runs `cmake -S . -B build`, `cmake --build build --parallel`, and
+`ctest --test-dir build --output-on-failure --no-tests=error`. Your JSON cannot
+override those exit codes, and a project with no registered CTest targets is
+rejected before C.
 
 {PROCESS_SAFETY_MANDATE}
 
@@ -1162,8 +1500,10 @@ def _deliverables_for_task(task_type: str, iter_dir: Path, req: Dict[str, Any]) 
      * `GET  /v1/models`           (recommended; used for health-check)
    - Must BLOCK in the foreground (no daemonize, no `&`) — the orchestrator's
      oracle owns process lifecycle and will SIGTERM/SIGKILL when done.
-   - Must honor deterministic decoding (temperature=0, fixed seed) where
-     the framework supports it; the oracle sends temperature=0 requests.
+   - Must implement both deterministic greedy decoding (`temperature=0`) and
+     genuine seeded stochastic sampling (`temperature>0`, `top_p`, `seed`).
+     Accepted request fields must affect generation; silently ignoring them
+     is a correctness failure.
    - Request/response bodies must follow the OpenAI schema. At minimum the
      chat completion response must contain
      `choices[0].message.content` as a string.
@@ -1305,7 +1645,9 @@ inherit through `ctx.review_feedback`.
 
 If C failed, the failure reason + diagnostic logs below tell you what went
 wrong. If C passed, focus on what's about to break next (perf cliffs, edge
-cases, correctness risks) and on what would speed the next iteration up.
+cases, correctness risks). **Do not claim that performance improved, regressed,
+or stayed flat:** E has not run yet. You may identify code-level performance
+risks, but measured performance conclusions belong to G after E.
 
 {logs_section}
 
@@ -1319,7 +1661,7 @@ Read `{iter_dir}/plan.md` and `{iter_dir}/test_spec.md` for context.
 {_notebooks_hint(req, "review")}
 Knowledge base path: {notebooks_dir}
 
-{NO_FRAMEWORK_REFERENCE_RULE}
+{_reference_and_access_rule(req)}
 
 {_language_contract(req)}
 
@@ -1347,6 +1689,62 @@ Write `{review_path}` with:
 - **Confidence**: 1-5
 
 Do NOT modify the implementation. Review only.
+"""
+
+
+def perf_review_prompt(
+    req: Dict[str, Any],
+    iter_dir: Path,
+    notebooks_dir: Path,
+    iteration: int,
+    measured_perf: Optional[Dict[str, float]],
+    correctness_review: Optional[str],
+    logs_dir: Path,
+) -> str:
+    """Prompt for G, which is the first phase allowed to judge performance."""
+    return f"""You are the **MEASURED PERFORMANCE REVIEWER** for MetaInfer
+iteration #{iteration}. E has finished. Review the actual immutable benchmark;
+do not reuse a previous iteration's number and do not infer a result from code
+inspection alone.
+
+# Frozen requirements
+{_render_req(req)}
+
+# Working tree
+{iter_dir}
+
+# Authoritative measured data
+- `{iter_dir}/perf_report.json`
+- `{logs_dir}/perf_report.json` (external copy, if present)
+- Parsed headline: {json.dumps(measured_perf, sort_keys=True) if measured_perf else "(missing)"}
+
+# Earlier D correctness/code review
+{correctness_review or "(none)"}
+
+# Rules
+1. Verify every arithmetic statement against `perf_report.json`.
+2. Separate concurrency-1 latency gains from aggregate batching gains.
+3. Use per-active-device telemetry; never interpret an average across idle
+   visible devices as the utilization of the assigned device.
+4. Attribute a gain only when measurement or profiling evidence supports it.
+   Mark guesses as hypotheses.
+5. Report benchmark errors/timeouts and whether comparisons are like-for-like.
+
+# Knowledge base
+{_notebooks_hint(req, "perf")}
+Knowledge base path: {notebooks_dir}
+
+{_language_contract(req)}
+
+# Deliverable
+Write `{logs_dir}/perf-review.md` with:
+- verified headline metrics and deltas,
+- correctness-preserving changes likely responsible,
+- unsupported hypotheses or contradictory earlier claims,
+- next profiling evidence needed,
+- confidence 1-5.
+
+Do not modify code or rewrite `perf_report.json`.
 """
 
 
@@ -1403,7 +1801,7 @@ def c_repair_prompt(
     orchestrator has already populated via copy-forward), and exits — the
     orchestrator re-runs the test itself. This is NOT a full re-implement
     pass; if the bug needs architectural rework, the repair budget will
-    exhaust and D will route back to B for a redo.
+    exhaust and D will close the iteration and route to A for a fresh plan.
 
     Key constraints (baked into the prompt below):
     * Edit existing files only — do not regenerate the tree.
@@ -1418,7 +1816,7 @@ def c_repair_prompt(
     remaining = max(0, max_attempts - attempt)
     return f"""You are the **C-STEP DEBUGGER** for MetaInfer iteration #{iteration},
 repair attempt {attempt} of {max_attempts} ({remaining} attempt(s) remaining
-after this one before the iteration gives up and routes back to B for a full redo).
+after this one before the iteration closes and routes to A for a fresh plan).
 
 The correctness test (C step) just FAILED with this reason:
 
@@ -1459,7 +1857,7 @@ the detail (exact prompt, response, judge verdict, http status, traceback).
 {_notebooks_hint(req, "repair")}
 Knowledge base path: {notebooks_dir}
 
-{NO_FRAMEWORK_REFERENCE_RULE}
+{_reference_and_access_rule(req)}
 
 {_language_contract(req)}
 
@@ -1473,6 +1871,10 @@ Knowledge base path: {notebooks_dir}
 3. **Minimal diff.** Use Edit, not Write. Do not rewrite whole functions
    unless the bug is structural. Do not touch files unrelated to the
    failure.
+4. **Escalate architecture gaps.** If the failure cannot be fixed by a
+   bounded local edit, do not make an unrelated change just to consume a
+   repair attempt. Write `REPLAN_REQUIRED: <reason>` in the repair log's
+   Root cause section and stop. The orchestrator will return to A.
 {_repair_verification_steps(req)}
 
 {PROCESS_SAFETY_MANDATE}
@@ -1562,12 +1964,15 @@ don't already have).
 Same discipline as before:
 1. Identify the ONE root cause the new failure points at.
 2. Make a minimal Edit (no rewrites of unrelated code).
-3. Smoke-check: `python3 -c "import server"` then a quick server-boot probe.
+3. Smoke-check with the native CMake target and a short `serve.sh` boot probe.
 4. **MANDATORY**: overwrite `{logs_dir}/c-repair-attempt{attempt}.md`
    with the same 5-section structure as before (Error reason / Root cause
    hypothesis / Fix applied / Verification / Expected next-step outcome).
 
 Be terse. Stop as soon as the smoke check passes and the .md is written.
+If the new failure proves the plan or architecture is incomplete, write
+`REPLAN_REQUIRED: <reason>` in the Root cause section and stop without an
+unrelated code edit.
 """
 
 
@@ -1611,7 +2016,7 @@ correctness oracle used.
 {_notebooks_hint(req, "perf")}
 Knowledge base path: {notebooks_dir}
 
-{NO_FRAMEWORK_REFERENCE_RULE}
+{_reference_and_access_rule(req)}
 
 {_review_feedback_section(review_feedback)}
 
@@ -1710,7 +2115,7 @@ Knowledge base path: {notebooks_dir}
 Look especially for kernel tuning notes, fused kernels, and memory layout tips
 relevant to the target hardware.
 
-{NO_FRAMEWORK_REFERENCE_RULE}
+{_reference_and_access_rule(req)}
 
 {_language_contract(req)}
 
@@ -1719,8 +2124,8 @@ relevant to the target hardware.
 
 # Files to read first
 - `{iter_dir}/perf_report.json`        — the numbers E just measured
-- `{iter_dir}/review.md`               — D's review (if any) — may already
-  flag perf cliffs
+- `{logs_dir}/review.md`               — D's correctness/code review
+- `{logs_dir}/perf-review.md`          — G's review of E's measured results
 {_prev_logs_section(None, prev_snap)}
 {_review_feedback_section(review_feedback)}
 
@@ -1903,7 +2308,7 @@ Read for context (do NOT dump them in the output, synthesize):
 {_notebooks_hint(req, "retrospective")}
 Knowledge base path: {notebooks_dir}
 
-{NO_FRAMEWORK_REFERENCE_RULE}
+{_reference_and_access_rule(req)}
 
 {_language_contract(req)}
 
@@ -2041,7 +2446,7 @@ whether the repair loop ran). Read what exists; skip what doesn't.
 {_notebooks_hint(req, "retrospective")}
 Knowledge base path: {notebooks_dir}
 
-{NO_FRAMEWORK_REFERENCE_RULE}
+{_reference_and_access_rule(req)}
 
 {_language_contract(req)}
 

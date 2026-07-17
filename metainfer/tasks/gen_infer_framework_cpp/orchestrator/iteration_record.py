@@ -19,17 +19,17 @@ from metainfer.orchestrator.state import Phase
 
 @dataclass
 class IterationRecord:
-    """One iteration of gf's ABCDEF pipeline.
+    """One iteration of the C++ task's ABCDEGF pipeline.
 
     Fields are gf-specific: ``goal`` is what plan.md promises this iter,
-    ``start_phase`` is which ABCDEF phase the iter resumes from, ``perf``
+    ``start_phase`` is which ABCDEGF phase the iter resumes from, ``perf``
     holds the E-step's metrics (tokens/s, ms/req, memory MB, etc.),
     ``outcome`` is the terminal transition of the C step, and
-    ``retrospective_path`` is the absolute path to the E-step retro .md.
+    ``retrospective_path`` is the absolute path to the post-review retro .md.
     """
     iteration: int
     goal: str = ""
-    start_phase: Phase = ""   # ABCDEF phase to resume from (default set by pipeline)
+    start_phase: Phase = ""   # ABCDEGF phase to resume from (default set by pipeline)
     started_at: float = 0.0
     ended_at: float = 0.0
     duration_s: float = 0.0

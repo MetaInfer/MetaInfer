@@ -154,6 +154,15 @@ class HardwareParserTest(unittest.TestCase):
         )
         self.assertEqual(applied["HIP_VISIBLE_DEVICES"], "0,2,3")
         self.assertEqual(env["ROCR_VISIBLE_DEVICES"], "0,2,3")
+        localized = configure_assigned_devices(
+            {
+                "assigned_devices": "0\uff0c 1\u30012",
+                "target_hardware": "Hygon Z200SM",
+                "accelerator_backend": "Hygon DTK / HIP",
+            },
+            {},
+        )
+        self.assertEqual(localized["HIP_VISIBLE_DEVICES"], "0,1,2")
         with self.assertRaises(ValueError):
             configure_assigned_devices({"assigned_devices": "0; rm -rf /"}, {})
         self.assertEqual(

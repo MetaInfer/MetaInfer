@@ -280,6 +280,18 @@ def _library_inventory(output: str) -> List[str]:
     return sorted(names)
 
 
+def normalize_assigned_devices(value: Any) -> str:
+    """Return a safe, canonical comma-separated device allocation."""
+    raw = str(value or "").strip().translate(
+        str.maketrans({"\uff0c": ",", "\u3001": ","})
+    )
+    if not raw:
+        return ""
+    if not re.fullmatch(r"\d+(?:\s*,\s*\d+)*", raw):
+        raise ValueError("assigned_devices must be a comma-separated list of non-negative integers")
+    return ",".join(part.strip() for part in raw.split(","))
+
+
 def configure_assigned_devices(
     req: Mapping[str, Any], environ: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
@@ -290,12 +302,9 @@ def configure_assigned_devices(
     process environment variable inherited by generated code.
     """
     env = environ if environ is not None else os.environ
-    raw = str(req.get("assigned_devices") or "").strip()
-    if not raw:
+    normalized = normalize_assigned_devices(req.get("assigned_devices"))
+    if not normalized:
         return {name: env[name] for name in _VISIBLE_DEVICE_VARS if name in env}
-    if not re.fullmatch(r"\d+(?:\s*,\s*\d+)*", raw):
-        raise ValueError("assigned_devices must be a comma-separated list of non-negative integers")
-    normalized = ",".join(part.strip() for part in raw.split(","))
     target = str(req.get("target_hardware") or "").lower()
     backend = str(req.get("accelerator_backend") or "").lower()
     if "nvidia" in target or "cuda" in backend:
@@ -727,6 +736,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "configure_assigned_devices",
     "discover_hardware_profile",
+    "normalize_assigned_devices",
     "parse_lspci",
     "parse_nvidia_smi",
     "parse_rocm_smi",
