@@ -45,14 +45,17 @@ def test_read_run_returns_defaults_when_missing(tmp_path):
 
 def test_read_run_merges_defaults_for_partial_file(tmp_path):
     """A run.json missing some keys should still produce a complete dict
-    so the frontend doesn't KeyError."""
+    so the frontend doesn't KeyError. ``task_type`` is intentionally NOT
+    in run.json — it lives in requirements.json. If a stale run.json
+    still has it, read_run drops it (single source of truth)."""
     (tmp_path / "run.json").write_text(
         json.dumps({"task_id": "abc", "task_type": "calc-theoretical-value"}),
         encoding="utf-8",
     )
     out = sr.read_run(tmp_path)
     assert out["task_id"] == "abc"
-    assert out["task_type"] == "calc-theoretical-value"
+    # task_type is dropped — not a run.json field anymore
+    assert "task_type" not in out
     # Defaults still present:
     assert "current_phase" in out and out["current_phase"] == "idle"
 
@@ -134,7 +137,7 @@ def test_reset_preserves_requirements_json(tmp_path):
     (workspace_dir / "step3").mkdir()
     (state_dir / "timeline.jsonl").write_text("", encoding="utf-8")
 
-    summary = sr.reset_state_dir(state_dir, workspace_dir, "tid-1", "calc-theoretical-value")
+    summary = sr.reset_state_dir(state_dir, workspace_dir, "tid-1")
 
     # requirements.json survived.
     assert sr.read_requirements(state_dir) == req
@@ -147,7 +150,8 @@ def test_reset_preserves_requirements_json(tmp_path):
     # Fresh run.json was written.
     run = sr.read_run(state_dir)
     assert run["task_id"] == "tid-1"
-    assert run["task_type"] == "calc-theoretical-value"
+    # task_type is NOT in run.json anymore — read from requirements.json.
+    assert "task_type" not in run
     assert run["current_iteration"] == 0
     assert run["current_phase"] == "idle"
     assert run["finished"] is False
@@ -165,7 +169,7 @@ def test_reset_stamps_task_reset_timeline_event(tmp_path):
     state_dir.mkdir()
     workspace_dir.mkdir()
     (state_dir / "requirements.json").write_text("{}", encoding="utf-8")
-    sr.reset_state_dir(state_dir, workspace_dir, "tid-2", "calc-theoretical-value")
+    sr.reset_state_dir(state_dir, workspace_dir, "tid-2")
     events = sr.read_timeline(state_dir)
     types = [e["type"] for e in events]
     assert "task_reset" in types
@@ -180,7 +184,7 @@ def test_reset_creates_state_dir_if_missing(tmp_path):
     """reset should be idempotent even on a never-started task dir."""
     sd = tmp_path / "doesnt_exist_yet"
     wd = tmp_path / "wd_doesnt_exist_yet"
-    sr.reset_state_dir(sd, wd, "tid-3", "calc-theoretical-value")
+    sr.reset_state_dir(sd, wd, "tid-3")
     assert (sd / "run.json").exists()
     assert (sd / "timeline.jsonl").exists()
     assert wd.exists()
@@ -197,7 +201,7 @@ def test_reset_default_keeps_only_requirements_when_others_absent(tmp_path):
         json.dumps({"task_type": "calc-theoretical-value"}),
         encoding="utf-8",
     )
-    summary = sr.reset_state_dir(state_dir, workspace_dir, "tid-4", "calc-theoretical-value")
+    summary = sr.reset_state_dir(state_dir, workspace_dir, "tid-4")
     assert summary["removed"] == []
     # The file we kept is unchanged.
     assert sr.read_requirements(state_dir) == {"task_type": "calc-theoretical-value"}

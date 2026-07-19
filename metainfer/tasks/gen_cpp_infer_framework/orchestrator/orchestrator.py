@@ -26,8 +26,9 @@ from metainfer.orchestrator._bootstrap import (
     write_pid_file,
 )
 from metainfer.orchestrator.paths import repo_root as _repo_root
+from metainfer.orchestrator.requirements import req_field_int
 from metainfer.orchestrator.state import StateStore
-from metainfer.orchestrator.token_budget import TokenBudget
+from metainfer.orchestrator.token_budget import TokenBudget, resolve_budget_limits
 from .pipeline import Orchestrator, OrchestratorConfig
 
 
@@ -228,70 +229,21 @@ def run_with_requirements(
 
 
 def _extract_max_iter(req: Dict[str, Any], default: int = 20) -> int:
-    """Read max_iterations from requirements, preferring top-level.
-
-    The interview writes ``max_iterations`` as a TOP-LEVEL field on
-    requirements.json (alongside ``target_model``, ``target_hardware``,
-    etc.). Top-level takes precedence; ``answers.`` is checked as a
-    back-compat fallback for older requirements files.
-    """
-    v = req.get("max_iterations")
-    if v is None:
-        v = req.get("answers", {}).get("max_iterations")
-    if v is None:
-        return default
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
+    """Read ``max_iterations`` via the shared helper. See
+    :mod:`metainfer.orchestrator.requirements`."""
+    return req_field_int(req, "max_iterations", default=default)
 
 
 def _build_budget(state_dir: Path, req: Dict[str, Any]) -> Optional[TokenBudget]:
-    """Construct the per-task :class:`TokenBudget` from req + env.
+    """Construct the per-task :class:`TokenBudget`.
 
-    Resolution order for the soft cost limit (first match wins):
-      1. ``METAINFER_TOKEN_BUDGET_COST_USD`` env var
-      2. ``requirements.json::token_budget.max_cost_usd`` (nested object —
-         direct requirements.json edit)
-      3. ``requirements.json::token_budget_max_cost_usd`` (flat scalar —
-         what the WebUI new-task form writes when the user fills the
-         "Cost cap" field)
-      4. None — budget circuit breaker disabled
-
-    Hard limit follows the same cascade with the ``_hard`` suffix.
+    Limit resolution is delegated to :func:`token_budget.resolve_budget_limits`
+    so all task types share one source of truth: ``token_budget.json::config``
+    wins over the ``requirements.json`` seed (which is only consulted on
+    first boot before the runtime file exists). See that helper's docstring
+    for the full cascade + the bug this prevents.
     """
-    import os
-
-    tb_cfg = (req.get("token_budget")
-              or req.get("answers", {}).get("token_budget")
-              or {})
-    if not isinstance(tb_cfg, dict):
-        tb_cfg = {}
-
-    def _resolve_float(env_key: str, conf_key: str,
-                       flat_key: Optional[str] = None) -> Optional[float]:
-        env_v = os.environ.get(env_key)
-        if env_v:
-            try:
-                return float(env_v)
-            except ValueError:
-                pass
-        # nested object first
-        v = tb_cfg.get(conf_key)
-        if v is None and flat_key:
-            v = req.get(flat_key)
-        if v is None:
-            return None
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
-
-    soft = _resolve_float("METAINFER_TOKEN_BUDGET_COST_USD", "max_cost_usd",
-                          flat_key="token_budget_max_cost_usd")
-    hard = _resolve_float("METAINFER_TOKEN_BUDGET_COST_USD_HARD",
-                          "max_cost_usd_hard",
-                          flat_key="token_budget_max_cost_usd_hard")
+    soft, hard = resolve_budget_limits(state_dir, req)
     if soft is None and hard is None:
         return None
     return TokenBudget(

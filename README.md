@@ -1,12 +1,18 @@
-<p align="center">
+<!-- <p align="center">
   <img src="https://raw.githubusercontent.com/MetaInfer/MetaInfer/main/docs/logo.png" alt="MetaInfer" width="200" onerror="this.style.display='none'">
-</p>
+</p> -->
 
 <h1 align="center">MetaInfer</h1>
 
-<p align="center">
-  <em>LLM-driven inference engineering — deterministic orchestration, immutable oracles.</em>
-</p>
+<h3 align="center">
+  <em>Let AI generate high-performance, compact, purpose-built LLM inference frameworks</em>
+  <p>
+  <em>Describe what you want — MetaInfer builds your optimized inference engine</em>
+</h3>
+
+<h4 align="center">
+  <em>(An LLM-powered AI Infra optimization toolkit)</em>
+</h3>
 
 <p align="center">
   <a href="https://github.com/MetaInfer/MetaInfer/actions/workflows/ci.yml">
@@ -24,9 +30,13 @@
 </p>
 
 <p align="center">
-  <a href="https://star-history.com/#MetaInfer/MetaInfer&Date">
-    <img src="https://api.star-history.com/svg?repos=MetaInfer/MetaInfer&type=Date" alt="Star History" width="600">
-  </a>
+ <a href="https://www.star-history.com/?type=date&repos=MetaInfer%2FMetaInfer">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&theme=dark&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+ </picture>
+</a>
 </p>
 
 ---
@@ -37,30 +47,46 @@
 
 ---
 
-## What is MetaInfer?
+## What is this? (Our vision)
 
-MetaInfer is a lightweight web application that runs LLM-driven inference
-engineering tasks. You describe what you want (a model-specific inference
-server, a theoretical FLOPs analysis), and MetaInfer spawns a
-deterministic Python orchestrator that drives Claude Code sub-agents
-through a structured pipeline.
+* ***Let AI generate simple, compact inference frameworks that match or surpass SOTA performance. (Killer app)***
 
-- **WebUI** — long-lived FastAPI main process with a Preact SPA frontend
-- **Orchestrator** — one short-lived subprocess per task; crashes never
-  take down the dashboard
-- **File-system state** — no database, no message queue; everything is
-  observable JSON on disk
+  * Today's SOTA inference frameworks are buckling under their own weight.
+    * The traditional approach — multi-layer abstractions to support every model, every hardware target, every parallelism strategy, every quantization scheme, every kernel optimization — no longer keeps pace with the pace of LLM innovation.
+    * The vast majority of code in an inference framework is unnecessary once your deployment constraints are fixed, yet that compatibility logic drags down performance.
+
+  * Tell MetaInfer what you need, and it writes a high-performance, purpose-built inference framework for your exact setup.
+    * Which model? What hardware? What parallelism? What quantization? Optimize for throughput or latency?
+
+* ***AI-assisted kernel optimization***
+  * Given a target kernel, the LLM drives an automated [optimize → benchmark] loop.
+
+* ***Model porting***
+  * New model unsupported on older GPUs? Point MetaInfer at the upstream framework code and let it backport to a lower-version target.
+
+* ***Embedded / edge inference***
+  * MetaInfer targets C/C++ and Rust as first-class output languages — laying the groundwork for edge computing and embodied AI.
+
+
 
 ### Built-in task types
 
-| Type | What it does |
+| Type | Description |
 |---|---|
 | **`gen-infer-framework`** | Build a model-specific inference server with an OpenAI-compatible HTTP API. An immutable oracle boots `serve.sh`, sends fixed prompts, and dispatches an LLM judge to verdict correctness. |
-| **`calc-theoretical-value`** | Compute theoretical FLOPs and memory-traffic for an LLM forward pass. Fully read-only deterministic pipeline: model inspection → memory modeling → compute graph → visualization. |
-| **`example`** | Canonical skeleton for building new task types. Copy, rename, uncomment `register()`, implement your pipeline — no shared code touched. |
+| **`calc-theoretical-value`** | Compute theoretical FLOPs and memory-traffic for a single forward pass of an LLM. Fully read-only deterministic pipeline: model inspection → memory modeling → compute graph → visualization. |
+| **`example`** | Canonical skeleton for new task types. Copy, rename, uncomment `register()`, implement your pipeline — no shared code touched. |
 
 ## Quick start
 
+### Step 1: Install ccb (MetaInfer currently uses the open-source Claude Code CLI; other coding agents are not yet supported — contributions welcome)
+
+Open-source ccb repository: https://github.com/claude-code-best/claude-code
+```
+npm i -g claude-code-best
+```
+
+### Step 2: Install MetaInfer
 ```bash
 git clone https://github.com/MetaInfer/MetaInfer.git
 cd MetaInfer
@@ -69,7 +95,7 @@ pip install -r requirements.txt
 ```
 
 Open [http://127.0.0.1:8765](http://127.0.0.1:8765), click **+ New Task**,
-pick a type, fill the form, and watch the dashboard come alive.
+pick a task type, fill in your requirements, and the LLM gets to work.
 
 ```bash
 # Other ways to start
@@ -78,132 +104,30 @@ METAINFER_PORT=9000 ./serve.py
 python -m metainfer.server.app
 ```
 
-> **No install required.** `serve.py` adds the repo root to `sys.path`.
-> Install `pip install -e .` only if you want the `metainfer-web` and
-> `metainfer-orchestrator` console scripts.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Browser (Preact + HTM, no build step)                   │
-│  Task tabs · live state graph · iterations · agents     │
-└────────────────────┬────────────────────────────────────┘
-                     │  HTTP + SSE
-┌────────────────────┴────────────────────────────────────┐
-│  WebUI Server (FastAPI, main process)                    │
-│  Form schemas · task registry · process lifecycle        │
-│  SSE: file watcher → browser push                        │
-└───┬──────────────────────────────────────┬──────────────┘
-    │ subprocess (LocalLauncher)           │ (future) HTTP
-┌───┴───────────────┐              ┌──────┴──────────────┐
-│ Orchestrator #1   │   ...        │ Remote Node          │
-│ Per-task child    │              │ RemoteLauncher       │
-│ Task pipeline     │              │ over HTTPS           │
-│ Sub-agent manager │              └─────────────────────┘
-└───────────────────┘
-```
-
-> **The Launcher Protocol** is the extension point for multi-machine
-> collaboration. Swap `LocalLauncher` for a `RemoteLauncher` that
-> dispatches spawn/kill over HTTPS — no other code changes.
-
-## How it works
-
-Each task gets **two parallel directories** under the current node:
-
-```text
-$METAINFER_ROOT/                  (defaults to cwd)
-└── nodes/
-    └── <node_id>/                (hostname; override with $METAINFER_NODE_ID)
-        ├── workspaces/
-        │   └── <task_id>/        ← generated artifacts
-        └── .metainfer/
-            ├── registry.json     ← global task list
-            └── tasks/<task_id>/  ← metadata, logs, timeline, iter records
-```
-
-The WebUI writes `requirements.json`, spawns the orchestrator, then
-**watches files** for changes — all panels derive from JSON on disk.
-No in-memory state, no IPC. Restart the WebUI and it picks up exactly
-where it left off.
-
-## Extending
-
-### New task type
-
-Copy the skeleton. It's fully annotated — form schema, pipeline,
-web routes, QA endpoints, static assets, tests.
-
-```bash
-cp -r metainfer/tasks/example metainfer/tasks/<your_task>
-# 1. Replace X-type-id / X / example with your own ids
-# 2. Uncomment register() in __init__.py, orchestrator/plugin.py, server/plugin.py
-# 3. Implement orchestrator/pipeline.py
-# 4. Add tests
-```
-
-**Nothing else in the repo needs to change.** See `metainfer/tasks/example/`
-for the complete annotated skeleton and `CLAUDE.md` for contract details.
-
-### New form fields
-
-Edit your task's `form.yaml`:
-
-```yaml
-- key: model_path
-  question: "Path to model weights?"
-  header: "Model"
-  required: true
-  form: text              # text | textarea | select | multiselect | file | number
-  options:                # only for select / multiselect
-    - label: "Option A"
-      description: "What it means"
-```
-
-### Knowledge base
-
-Drop markdown files into `metainfer/tasks/<pkg>/notebooks/`. Prompt
-templates already reference the notebooks directory — no code changes
-needed.
-
-## Repository
-
-```text
-MetaInfer/
-├── pyproject.toml
-├── serve.py
-├── README.md / README_CN.md
-│
-├── metainfer/
-│   ├── server/                WebUI backend (FastAPI)
-│   │   ├── app.py             create_app, plugin routing, static mount
-│   │   ├── launcher.py        LocalLauncher (Protocol → RemoteLauncher extension)
-│   │   ├── registry.py        registry.json CRUD with fcntl.flock
-│   │   ├── forms.py           form.yaml → frontend schema
-│   │   ├── state_reader.py    file → JSON (shell-level fields only)
-│   │   ├── sse.py             mtime watcher → SSE broadcast
-│   │   ├── reconcile.py       orphan orchestrator cleanup on startup
-│   │   └── qa.py / qa_routes.py  QA endpoint framework
-│   │
-│   ├── orchestrator/          per-task subprocess framework
-│   │   ├── state.py           cross-process-safe JSON StateStore
-│   │   ├── subagent_manager.py  Claude Code subprocess lifecycle
-│   │   ├── agent_pool.py      multi-agent concurrency
-│   │   ├── token_budget.py    token / cost tracking
-│   │   ├── gpu_preflight.py   GPU VRAM cleanup before oracle runs
-│   │   └── tasks/             TaskPlugin auto-discovery
-│   │
-│   └── tasks/                 one package per task type
-│       ├── example/           canonical skeleton (commented-out, ready to copy)
-│       ├── sys_shell/         shell UI + task lifecycle API
-│       ├── gen_infer_framework/
-│       └── calc_value/
-```
-
 ## License
 
 MIT
+
+## Academic Research
+
+The initial ideas and experimental data of MetaInfer are publicly available
+at https://arxiv.org/abs/2607.12875. The related code is on the `arxiv-paper` branch.
+
+Citation:
+
+```
+@misc{miao2026metainferknowledgellminference,
+      title={MetaInfer: A Knowledge Only LLM Inference Engine Generator SKILL Toolbox}, 
+      author={Zhenwen Miao and Honglin Wang and Mingheng Mi},
+      year={2026},
+      eprint={2607.12875},
+      archivePrefix={arXiv},
+      primaryClass={cs.MA},
+      url={https://arxiv.org/abs/2607.12875}, 
+}
+```
+
+## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture details, design
 principles, and how to add new task types.

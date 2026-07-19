@@ -55,7 +55,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 # --------------------------------------------------------------------------- #
@@ -235,9 +235,11 @@ class TokenBudget:
             "per_phase": self._per_phase,
             "records": [asdict(r) for r in self._records],
         }
+        from metainfer.server.filelock import lock_file
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        with lock_file(self.path):
+            tmp.replace(self.path)
 
     # ------------------------------------------------------------------ #
     # Mutators
@@ -467,6 +469,87 @@ class TokenBudget:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+
+def _read_runtime_config(state_dir: Path) -> Dict[str, Any]:
+    """Read ``token_budget.json::config`` if it exists. Returns ``{}`` on
+    any error so callers can treat the runtime file as optional."""
+    path = Path(state_dir) / "token_budget.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    cfg = data.get("config")
+    if not isinstance(cfg, dict):
+        return {}
+    return cfg
+
+
+def resolve_budget_limits(
+    state_dir: Path,
+    req: Dict[str, Any],
+) -> Tuple[Optional[float], Optional[float]]:
+    """Resolve (soft, hard) cost limits for a task — single source of truth.
+
+    Priority (first non-None wins):
+
+      1. ``METAINFER_TOKEN_BUDGET_COST_USD`` / ``..._HARD`` env var
+         (ops escape hatch — overrides everything).
+      2. ``token_budget.json::config.max_cost_usd`` — the RUNTIME
+         authoritative file. The WebUI updates this when the user raises
+         the budget mid-task. **This is the source of truth.**
+      3. ``requirements.json::token_budget.max_cost_usd`` (nested) or
+         ``requirements.json::token_budget_max_cost_usd`` (flat, what the
+         WebUI new-task form writes). Only consulted when the runtime
+         file does NOT yet have the field — i.e. first orchestrator boot
+         of a freshly-created task. After that, ``requirements.json`` is
+         a historical record of the form submission, not consulted.
+
+    Returns ``(None, None)`` when no limit is configured anywhere — the
+    caller should pass that as "budget disabled".
+
+    Rationale: before this helper existed, three orchestrators each had
+    their own copy of a cascade that put ``requirements.json`` ahead of
+    the runtime file. That made WebUI mid-task budget bumps silently
+    lost on the next orchestrator restart (the user raised 50 → 100, the
+    orchestrator came back, read 50 from requirements.json, aborted).
+    """
+    tb_cfg = req.get("token_budget")
+    if not isinstance(tb_cfg, dict):
+        tb_cfg = {}
+    runtime_cfg = _read_runtime_config(state_dir)
+
+    def _resolve(env_key: str, conf_key: str, flat_key: str) -> Optional[float]:
+        # 1. env var
+        env_v = os.environ.get(env_key)
+        if env_v:
+            try:
+                return float(env_v)
+            except ValueError:
+                pass
+        # 2. runtime file (token_budget.json::config) — authoritative
+        v = runtime_cfg.get(conf_key)
+        # 3. requirements.json seed (nested or flat) — only on first boot
+        if v is None:
+            v = tb_cfg.get(conf_key)
+        if v is None:
+            v = req.get(flat_key)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    soft = _resolve("METAINFER_TOKEN_BUDGET_COST_USD",
+                    "max_cost_usd", "token_budget_max_cost_usd")
+    hard = _resolve("METAINFER_TOKEN_BUDGET_COST_USD_HARD",
+                    "max_cost_usd_hard", "token_budget_max_cost_usd_hard")
+    return soft, hard
 
 
 def usage_from_result_event(

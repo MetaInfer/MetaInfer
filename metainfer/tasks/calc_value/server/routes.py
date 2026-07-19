@@ -85,7 +85,7 @@ def build_router(plugin) -> APIRouter:
         require_task_type(entry, PLUGIN_TYPE)
         wd = workspace_dir_for(entry)
         try:
-            return HTMLResponse(_readers.read_viz(wd))
+            return HTMLResponse(_readers.read_viz(wd, task_id))
         except FileNotFoundError as exc:
             raise HTTPException(404, str(exc))
 

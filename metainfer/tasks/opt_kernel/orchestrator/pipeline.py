@@ -125,9 +125,7 @@ class Orchestrator:
 
     def run(self) -> None:
         task_id = self.req.get("task_id", "task")
-        _, is_resume = self.store.init_or_resume(
-            task_id=task_id, task_type=self.req.get("task_type", "unknown"),
-        )
+        _, is_resume = self.store.init_or_resume(task_id=task_id)
 
         resume_from: Optional[Dict[str, Any]] = None
         if is_resume:
@@ -715,13 +713,8 @@ class Orchestrator:
         return None
 
     def _resolve_max_iterations(self) -> int:
-        v = self.req.get("max_iterations")
-        if v is None:
-            v = self.req.get("answers", {}).get("max_iterations")
-        try:
-            return int(v) if v is not None else self.cfg.max_iterations
-        except (TypeError, ValueError):
-            return self.cfg.max_iterations
+        from metainfer.orchestrator.requirements import req_field_int
+        return req_field_int(self.req, "max_iterations", self.cfg.max_iterations)
 
 
 # --------------------------------------------------------------------------- #

@@ -14,6 +14,7 @@ from metainfer.orchestrator._bootstrap import (
     write_pid_file,
 )
 from metainfer.orchestrator.paths import repo_root as _repo_root
+from metainfer.orchestrator.requirements import req_field_int
 from metainfer.orchestrator.state import StateStore
 from .pipeline import Orchestrator, OrchestratorConfig
 
@@ -123,12 +124,6 @@ def run_with_requirements(
 
 
 def _extract_max_iter(req: Dict[str, Any], default: int = 20) -> int:
-    v = req.get("max_iterations")
-    if v is None:
-        v = req.get("form", {}).get("max_iterations")
-    if v is None:
-        return default
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
+    """Read ``max_iterations`` via the shared helper. See
+    :mod:`metainfer.orchestrator.requirements`."""
+    return req_field_int(req, "max_iterations", default=default)

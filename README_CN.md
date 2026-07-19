@@ -1,12 +1,18 @@
-<p align="center">
+<!-- <p align="center">
   <img src="https://raw.githubusercontent.com/MetaInfer/MetaInfer/main/docs/logo.png" alt="MetaInfer" width="200" onerror="this.style.display='none'">
-</p>
+</p> -->
 
 <h1 align="center">MetaInfer</h1>
 
-<p align="center">
-  <em>LLM 驱动的推理工程 —— 确定性编排，不可变 Oracle。</em>
-</p>
+<h3 align="center">
+  <em>让AI自己生成 高性能、小巧、专一的大模型推理框架</em>
+  <p>
+  <em>大胆说出你的期望，MetaInfer帮你编写高性能专属推理框架</em>
+</h3>
+
+<h4 align="center">
+  <em>（也是一个LLM 驱动的 AI Infra 优化工具包）</em>
+</h3>
 
 <p align="center">
   <a href="https://github.com/MetaInfer/MetaInfer/actions/workflows/ci.yml">
@@ -24,9 +30,13 @@
 </p>
 
 <p align="center">
-  <a href="https://star-history.com/#MetaInfer/MetaInfer&Date">
-    <img src="https://api.star-history.com/svg?repos=MetaInfer/MetaInfer&type=Date" alt="Star History" width="600">
-  </a>
+  <a href="https://www.star-history.com/?type=date&repos=MetaInfer%2FMetaInfer">
+  <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&theme=dark&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+ </picture>
+</a>
 </p>
 
 ---
@@ -37,16 +47,27 @@
 
 ---
 
-## 这是什么？
+## 这是什么（我们的愿景）？
 
-MetaInfer 是一个轻量级 Web 应用，运行 LLM 驱动的推理工程任务。
-你描述想要什么（模型专属推理服务器、理论 FLOPs 分析），MetaInfer
-就启动一个确定性 Python 编排器，驱策 Claude Code 子 agent
-按结构化流水线完成工作。
+* ***让AI自己生成简单小巧，但性能持平甚至超越SOTA水平的推理框架。（杀手级应用）***
 
-- **WebUI** — FastAPI 长驻主进程 + Preact SPA 前端
-- **编排器** — 每任务一个短生命周期子进程；单个任务崩溃不会拖垮面板
-- **文件系统即状态** — 无数据库、无消息队列；所有状态都是磁盘上的 JSON
+  * 现有的SOTA推理框架已经不堪重负
+    * 传统软件工程中通过多层级抽象来适配多种模型、多种硬件、多种并行部署形式、多种量化方式、多种算子优化的方式已经不能满足当前大模型飞速发展的需要。
+    * 推理框架中绝大多数代码在部署条件确定后是不必要的，然而这些兼容逻辑拖慢了系统性能。
+  
+  * 只要告诉MetaInfer你的期望，MetaInfer帮你编写满足你要求的高性能专属推理框架。
+    * 模型类型是什么？在什么硬件上部署？并行方式是什么?使用了什么量化方式？优化吞吐还是优化延迟？
+
+* ***让AI辅助优化算子***
+  * 给定要优化的算子，大模型自动进行【优化-性能测试】组成的迭代循环
+
+* ***模型迁移***
+  * 新的模型在老旧GPU上还没有得到支持？给定高版本推理框架代码，由大模型帮助将其backport到低版本推理框架。
+
+* ***嵌入式平台推理***
+  * MetaInfer将C/C++、Rust也列为其支持目标。为未来边缘计算、具身智能场景提供支持。
+
+
 
 ### 内置任务类型
 
@@ -58,6 +79,14 @@ MetaInfer 是一个轻量级 Web 应用，运行 LLM 驱动的推理工程任务
 
 ## 快速开始
 
+### 第一步，安装ccb。（本项目目前使开源的claude code版本，暂不支持其他coding agent，欢迎贡献代码以支持更多coding agent）
+
+开源ccb项目地址：https://github.com/claude-code-best/claude-code
+```
+npm i -g claude-code-best
+```
+
+### 第二步，安装MetaInfer
 ```bash
 git clone https://github.com/MetaInfer/MetaInfer.git
 cd MetaInfer
@@ -66,7 +95,7 @@ pip install -r requirements.txt
 ```
 
 打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)，点击 **+ New Task**，
-选择类型，填写表单，面板随即实时更新。
+选择要做的任务，填写需求，大模型随即为您服务。
 
 ```bash
 # 其他启动方式
@@ -75,128 +104,26 @@ METAINFER_PORT=9000 ./serve.py
 python -m metainfer.server.app
 ```
 
-> **无需安装。** `serve.py` 自动将仓库根目录加入 `sys.path`。
-> 仅当需要 `metainfer-web` 和 `metainfer-orchestrator` 命令时才执行
-> `pip install -e .`。
-
-## 架构
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  浏览器 (Preact + HTM, 无构建步骤)                        │
-│  任务标签页 · 状态图 · 迭代记录 · Agent 面板               │
-└────────────────────┬────────────────────────────────────┘
-                     │  HTTP + SSE
-┌────────────────────┴────────────────────────────────────┐
-│  WebUI 服务端 (FastAPI, 主进程)                           │
-│  表单 Schema · 任务注册表 · 进程启停                        │
-│  SSE: 文件监控 → 浏览器推送                               │
-└───┬──────────────────────────────────────┬──────────────┘
-    │ 子进程 (LocalLauncher)               │ (未来) HTTP
-┌───┴───────────────┐              ┌──────┴──────────────┐
-│ 编排器 #1          │   ...        │ 远程节点               │
-│ 每任务子进程        │              │ RemoteLauncher        │
-│ 任务流水线          │              │ over HTTPS            │
-│ Sub-agent 管理器    │              └─────────────────────┘
-└───────────────────┘
-```
-
-> **Launcher Protocol** 是多机协同的扩展点。将 `LocalLauncher` 替换为
-> `RemoteLauncher` 即可通过 HTTPS 启停远程编排器——无需修改其他代码。
-
-## 工作原理
-
-每个任务在当前节点下占用**两个并列目录**：
-
-```text
-$METAINFER_ROOT/                  (默认 cwd)
-└── nodes/
-    └── <node_id>/                (主机名；$METAINFER_NODE_ID 可覆盖)
-        ├── workspaces/
-        │   └── <task_id>/        ← 迭代产物
-        └── .metainfer/
-            ├── registry.json     ← 全局任务列表
-            └── tasks/<task_id>/  ← 元数据、日志、时间线、迭代记录
-```
-
-WebUI 写入 `requirements.json`、启动编排器，然后**监控文件变更**——
-所有面板数据均来源于磁盘 JSON。无内存状态，无 IPC。重启 WebUI
-即可无缝恢复。
-
-## 扩展
-
-### 新建任务类型
-
-复制骨架即可。骨架包含完整注释——表单 Schema、流水线、Web 路由、
-QA 端点、静态资源、测试。
-
-```bash
-cp -r metainfer/tasks/example metainfer/tasks/<your_task>
-# 1. 将 X-type-id / X / example 替换为你的标识
-# 2. 取消 __init__.py、orchestrator/plugin.py、server/plugin.py 中 register() 的注释
-# 3. 实现 orchestrator/pipeline.py
-# 4. 编写测试
-```
-
-**仓库中其他文件不需要任何改动。** 完整注释骨架见
-`metainfer/tasks/example/`，契约约束详见 `CLAUDE.md`。
-
-### 新增表单字段
-
-编辑你任务的 `form.yaml`：
-
-```yaml
-- key: model_path
-  question: "模型权重路径？"
-  header: "模型"
-  required: true
-  form: text              # text | textarea | select | multiselect | file | number
-  options:                # 仅 select / multiselect 使用
-    - label: "选项 A"
-      description: "含义说明"
-```
-
-### 知识库
-
-将 markdown 文档放入 `metainfer/tasks/<pkg>/notebooks/`。
-Prompt 模板已引用该目录——无需代码改动。
-
-## 仓库结构
-
-```text
-MetaInfer/
-├── pyproject.toml
-├── serve.py
-├── README.md / README_CN.md
-│
-├── metainfer/
-│   ├── server/                WebUI 后端 (FastAPI)
-│   │   ├── app.py             create_app、插件路由、静态挂载
-│   │   ├── launcher.py        LocalLauncher (Protocol → RemoteLauncher 扩展)
-│   │   ├── registry.py        registry.json CRUD (fcntl.flock)
-│   │   ├── forms.py           form.yaml → 前端 Schema
-│   │   ├── state_reader.py    文件 → JSON (仅 shell 层字段)
-│   │   ├── sse.py             mtime 监控 → SSE 广播
-│   │   ├── reconcile.py       启动时清理孤儿编排器进程
-│   │   └── qa.py / qa_routes.py  QA 端点框架
-│   │
-│   ├── orchestrator/          每任务子进程框架
-│   │   ├── state.py           跨进程安全 JSON StateStore
-│   │   ├── subagent_manager.py  Claude Code 子进程生命周期
-│   │   ├── agent_pool.py      多 agent 并发池
-│   │   ├── token_budget.py    token / 费用追踪
-│   │   ├── gpu_preflight.py   oracle 运行前 GPU 显存清理
-│   │   └── tasks/             TaskPlugin 自动发现
-│   │
-│   └── tasks/                 每种类型一个 task 包
-│       ├── example/           规范骨架（注释状态，可直接复制）
-│       ├── sys_shell/         shell UI + 任务生命周期 API
-│       ├── gen_infer_framework/
-│       └── calc_value/
-```
-
 ## License
 
 MIT
 
+## 学术研究
+
+MetaInfer的最初想法和实验数据已经公开在https://arxiv.org/abs/2607.12875，相关代码位于`arxiv-paper`分支。
+
+引用信息：
+```
+@misc{miao2026metainferknowledgellminference,
+      title={MetaInfer: A Knowledge Only LLM Inference Engine Generator SKILL Toolbox}, 
+      author={Zhenwen Miao and Honglin Wang and Mingheng Mi},
+      year={2026},
+      eprint={2607.12875},
+      archivePrefix={arXiv},
+      primaryClass={cs.MA},
+      url={https://arxiv.org/abs/2607.12875}, 
+}
+```
+
+## 如何贡献
 架构细节、设计理念和新任务类型添加方法见 [CONTRIBUTING.md](CONTRIBUTING.md)。

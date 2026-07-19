@@ -55,7 +55,7 @@ function usePluginBody(detailViewModule) {
   return Body;
 }
 
-export function TaskDetailView({ taskId, run, status, onChange, label, detailViewModule = null }) {
+export function TaskDetailView({ taskId, taskType, run, status, onChange, label, detailViewModule = null }) {
   // Shell-fetches only what the shell chrome needs. Everything that's
   // task-specific (iterations, charts, state-graph, retrospective) is
   // fetched by the plugin body itself via its own runtime-api.
@@ -107,13 +107,32 @@ export function TaskDetailView({ taskId, run, status, onChange, label, detailVie
     return () => clearInterval(id);
   }, [taskId, refreshAll]);
 
+  const [controlError, setControlError] = useState(null);
+
+  // Auto-clear control error after 5 seconds.
+  useEffect(() => {
+    if (!controlError) return;
+    const id = setTimeout(() => setControlError(null), 5000);
+    return () => clearTimeout(id);
+  }, [controlError]);
+
   const onControl = async (action, extra = {}) => {
+    setControlError(null);
     try {
-      await controlTask(taskId, action, extra);
+      const result = await controlTask(taskId, action, extra);
+      // Refresh shell-owned panels (timeline / agents) immediately.
+      // Status/run refresh comes from the parent's 5-second polling
+      // or SSE task_changed event.
       setTimeout(refreshAll, 400);
+      // If kill returned ok:false, the process was already dead and the
+      // backend has cleaned up the zombie state. Tell the user — the UI
+      // will flip to Restart on the next poll cycle.
+      if (action === "kill" && result && !result.ok) {
+        setControlError("Process was already stopped. Refreshing…");
+      }
     } catch (e) {
       console.error(e);
-      throw e;
+      setControlError(`Failed: ${e.message || e}`);
     }
   };
 
@@ -139,7 +158,7 @@ export function TaskDetailView({ taskId, run, status, onChange, label, detailVie
         <div class="task-id">
           <span class="label">task</span>
           <code>${run?.task_id || taskId}</code>
-          <span class="muted">· ${run?.task_type || "?"}</span>
+          <span class="muted">· ${taskType || "?"}</span>
         </div>
         <div class="task-stats">
           <span class="stat">
@@ -172,6 +191,9 @@ export function TaskDetailView({ taskId, run, status, onChange, label, detailVie
                 onClick=${() => setShowReset(true)}>Reset</button>`
             : null}
         </div>
+        ${controlError
+          ? html`<div class="control-error">${controlError}</div>`
+          : null}
       </header>
 
       ${Body

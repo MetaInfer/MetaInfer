@@ -251,9 +251,7 @@ class Orchestrator:
 
     def run(self) -> None:
         task_id = self.req.get("task_id", "task")
-        _, is_resume = self.store.init_or_resume(
-            task_id=task_id, task_type=self.req.get("task_type", "unknown"),
-        )
+        _, is_resume = self.store.init_or_resume(task_id=task_id)
 
         resume_from: Optional[Dict[str, Any]] = None
         if is_resume:
@@ -1654,18 +1652,11 @@ class Orchestrator:
         here ``self.cfg.max_iterations`` carries the user's intent. But
         double-check the top-level field too in case the cfg was built by
         a code path that bypassed ``_extract_max_iter`` (e.g. tests,
-        hand-rolled configs). Top-level wins; ``answers.`` is a back-compat
-        fallback.
+        Single source: ``req_field_int`` from the shared requirements helper
+        (handles flat key + legacy nested ``answers.`` / ``form.`` fallback).
         """
-        v = self.req.get("max_iterations")
-        if v is None:
-            v = self.req.get("answers", {}).get("max_iterations")
-        if v is None:
-            return self.cfg.max_iterations
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return self.cfg.max_iterations
+        from metainfer.orchestrator.requirements import req_field_int
+        return req_field_int(self.req, "max_iterations", self.cfg.max_iterations)
 
     # ------------------------------------------------------------------ #
     # Test runner

@@ -273,7 +273,8 @@ def run_step4_visualize(
     common = {
         "graph_json": json.dumps(graph, indent=2, ensure_ascii=False),
         "calc_dir": str(calc_dir),
-        "compute_url": "/api/calc-theoretical-value/{task_id}/calc/compute",
+        "task_id": task_id,
+        "compute_url": f"/api/calc-theoretical-value/{task_id}/calc/compute",
     }
 
     name = "viz_builder"

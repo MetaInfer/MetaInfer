@@ -338,6 +338,15 @@ body {
   display: inline-flex;
   gap: var(--sp-2);
 }
+.control-error {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: #da363340;
+  color: #ff7b72;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: monospace;
+}
 
 .task-grid {
   display: grid;

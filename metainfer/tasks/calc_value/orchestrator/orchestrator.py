@@ -42,6 +42,7 @@ from metainfer.orchestrator._bootstrap import (
     write_pid_file,
 )
 from metainfer.orchestrator.state import StateStore
+from metainfer.orchestrator.token_budget import TokenBudget, resolve_budget_limits
 from . import phases as _phases
 from .pipeline import run_pipeline
 
@@ -116,6 +117,25 @@ def _validate_inputs(req: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _build_budget(state_dir: Path, req: Dict[str, Any]) -> Optional[TokenBudget]:
+    """Construct the per-task :class:`TokenBudget`.
+
+    Limit resolution is delegated to :func:`token_budget.resolve_budget_limits`
+    so all task types share one source of truth: ``token_budget.json::config``
+    wins over the ``requirements.json`` seed (which is only consulted on
+    first boot before the runtime file exists). See that helper's docstring
+    for the full cascade + the bug this prevents.
+    """
+    soft, hard = resolve_budget_limits(state_dir, req)
+    if soft is None and hard is None:
+        return None
+    return TokenBudget(
+        state_dir,
+        max_cost_usd=soft,
+        max_cost_usd_hard=hard,
+    )
+
+
 def run_with_requirements(
     requirements_path: Path,
     *,
@@ -163,7 +183,7 @@ def run_with_requirements(
     if err:
         print(f"[calc-value] FATAL: {err}", flush=True)
         store = StateStore(state_dir)
-        rs, _ = store.init_or_resume(task_id, "calc-theoretical-value")
+        rs, _ = store.init_or_resume(task_id)
         store.update_run(
             current_phase=_phases.FINISHED,
             finished=True,
@@ -185,7 +205,7 @@ def run_with_requirements(
     extra_add_dirs = [repo_root, workspace_dir, model_dir, framework_dir]
 
     store = StateStore(state_dir)
-    rs, is_resume = store.init_or_resume(task_id, "calc-theoretical-value")
+    rs, is_resume = store.init_or_resume(task_id)
     if not is_resume:
         store.update_run(current_phase=_phases.IDLE)
     store.append_timeline(
@@ -195,6 +215,33 @@ def run_with_requirements(
          "resume": is_resume},
     )
 
+    # Build the per-task token/cost budget. Reads ``token_budget`` block
+    # from requirements.json (e.g. {"max_cost_usd": 50.0}); env override
+    # METAINFER_TOKEN_BUDGET_COST_USD wins over both. When no limit is
+    # set, budget is None and the circuit breaker is inert.
+    budget = _build_budget(state_dir, req)
+    if budget is not None:
+        # Mirror every record into timeline.jsonl so the WebUI can draw
+        # a live cost-over-time graph.
+        store_for_cb = store
+        budget._on_recorded = lambda rec, snap: store_for_cb.append_timeline(
+            "token_usage",
+            {
+                "agent": rec.agent,
+                "source": rec.source,
+                "phase": rec.phase,
+                "input_tokens": rec.input_tokens,
+                "output_tokens": rec.output_tokens,
+                "cache_read_input_tokens": rec.cache_read_input_tokens,
+                "cost_usd": rec.total_cost_usd,
+                "running_total_cost_usd": snap.total_cost_usd,
+                "running_total_input_tokens": snap.total_input_tokens,
+                "running_total_output_tokens": snap.total_output_tokens,
+                "agent_count": snap.agent_count,
+                "exhausted": snap.exhausted,
+            },
+        )
+
     manager = make_subagent_manager(
         claude_bin=claude_bin,
         model=model,
@@ -203,7 +250,13 @@ def run_with_requirements(
         extra_add_dirs=extra_add_dirs,
         snapshot_file=paths["agents_file"],
         max_concurrent=5,
+        budget=budget,
     )
+    # Wire the hard-exhausted callback NOW that the manager exists.
+    # When the hard threshold is crossed, every in-flight agent gets
+    # SIGTERM'd via the manager's process-group kill.
+    if budget is not None and budget.max_cost_usd_hard is not None:
+        budget._on_hard = lambda: manager.shutdown()
 
     print(f"[calc-value] task_id        = {task_id}")
     print(f"[calc-value] state dir      = {state_dir}")
@@ -224,6 +277,7 @@ def run_with_requirements(
             store=store,
             manager=manager,
             paths=paths,
+            budget=budget,
         )
     except Exception as exc:  # noqa: BLE001 — top-level guard
         import traceback

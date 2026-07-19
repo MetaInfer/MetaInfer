@@ -954,6 +954,36 @@ STEP3_VIZ_BUILDER_PROMPT = """\
 You are generating an interactive HTML visualization of an LLM forward
 pass's theoretical FLOPs and memory-traffic breakdown.
 
+The task_id is "{task_id}". The compute endpoint is:
+
+  {compute_url}?batch_size=<b>&seq_len=<s>
+
+CRITICAL: In your HTML JavaScript, embed the task_id and compute base
+URL as HARDCODED constants — do NOT try to parse them from
+window.location or URL query parameters. The page is served inside an
+<iframe> at a path-based URL (no ?task_id= in the query string).
+Use this pattern at the top of your <script>:
+
+  // Fall back to server-injected globals if you forgot to hardcode.
+  const TASK_ID = "{task_id}" || window.METAINFER_TASK_ID;
+  const COMPUTE_URL = "{compute_url}" || window.METAINFER_COMPUTE_URL;
+
+Also listen for postMessage to detect the API base when embedded in
+the WebUI (copy this block exactly):
+
+  let API_BASE = "";
+  window.addEventListener("message", (ev) => {{
+    if (ev.data && ev.data.metainfer_api_base) {{
+      API_BASE = ev.data.metainfer_api_base;
+    }}
+  }});
+
+Then construct the fetch URL as:
+  API_BASE + COMPUTE_URL + "?batch_size=" + b + "&seq_len=" + s
+
+or if API_BASE is empty (standalone testing):
+  COMPUTE_URL + "?batch_size=" + b + "&seq_len=" + s
+
 The execution-flow graph is SECTIONED (validated):
 
 ```json
@@ -996,9 +1026,11 @@ Produce a single self-contained HTML file with these requirements:
    1), and a "Recalculate" button. Each per-node badge and the totals
    bar must show BOTH prefill and decode numbers side by side (e.g. two
    TFLOPs columns: "prefill.tf" and "decode.tf").
-4. The Recalculate button fetches:
-     {compute_url}?batch_size=<b>&seq_len=<s>
-   and expects a JSON response keyed by compound id with both phases
+4. The Recalculate button fetches (using the TASK_ID/COMPUTE_URL/API_BASE
+   constants declared above):
+     COMPUTE_URL + "?batch_size=" + b + "&seq_len=" + s
+   (prefixed with API_BASE when available). The response is JSON keyed
+   by compound id with both phases
    (``per_compound["<section_id>__<node_id>"] = {{"prefill": {{"tflops", "access_gb"}},
    "decode": {{"tflops", "access_gb"}}}}``).
    JS fills in the per-instance badges AND multiplies by repeat_count

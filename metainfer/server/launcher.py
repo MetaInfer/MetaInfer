@@ -139,6 +139,23 @@ def _read_pid_file(task_id: str) -> Dict[str, Any]:
         return {}
 
 
+def _write_pid_file_placeholder(state_dir: Path, task_id: str, pid: int, started_at: float) -> None:
+    """Write a transitional orchestrator.pid so launcher.status() returns
+    running=True immediately after spawn.  The orchestrator's own
+    ``write_pid_file()`` overwrites this with its real values within
+    seconds; if the orchestrator crashes before that, liveness detects
+    the dead pid and reaps it.
+
+    Uses tmp+replace for atomicity (no flock needed — single writer per
+    task at this point).
+    """
+    pf = state_dir / "orchestrator.pid"
+    tmp = pf.with_suffix(".tmp")
+    data = {"pid": pid, "task_id": task_id, "started_at": started_at}
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(pf)
+
+
 def json_loads_safe(s: str) -> Dict[str, Any]:
     import json
     try:
@@ -146,6 +163,36 @@ def json_loads_safe(s: str) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except ValueError:
         return {}
+
+
+def _update_run_stopped(run_path: Path, now: float) -> None:
+    """Update run.json to reflect that the task was stopped externally.
+
+    Reads the current run.json (if any), sets ``finished=True``,
+    ``final_status="stopped"``, and bumps ``last_update``. Preserves all
+    other fields so the UI still shows the last phase / iteration.
+    """
+    import json
+    try:
+        if run_path.exists():
+            data = json.loads(run_path.read_text(encoding="utf-8"))
+        else:
+            data = {}
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    data["finished"] = True
+    data["final_status"] = "stopped"
+    data["last_update"] = now
+    from metainfer.server.filelock import lock_file
+    try:
+        tmp = run_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        with lock_file(run_path):
+            tmp.replace(run_path)
+    except OSError:
+        pass
 
 
 class LocalLauncher:
@@ -177,9 +224,11 @@ class LocalLauncher:
     ) -> int:
         state_dir.mkdir(parents=True, exist_ok=True)
         workspace_dir.mkdir(parents=True, exist_ok=True)
-        req_path = state_dir / "requirements.json"
         import json
-        req_path.write_text(json.dumps(requirements, indent=2), encoding="utf-8")
+        req_path = state_dir / "requirements.json"
+        tmp = req_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(requirements, indent=2), encoding="utf-8")
+        tmp.replace(req_path)
 
         log_path = state_dir / "orchestrator.log"
         log_fp = open(log_path, "ab", buffering=0)
@@ -227,13 +276,22 @@ class LocalLauncher:
         )
         log_fp.close()  # child holds the fd now; parent doesn't need it
         spawn_time = time.time()
-        # Cache pid in the registry so the task list view doesn't have to
-        # stat every state_dir to render status.
-        _tasks.update_task(
-            task_id, pid=proc.pid, started_at=spawn_time, finished_at=None,
-        )
+        # Write a PLACEHOLDER orchestrator.pid IMMEDIATELY so
+        # launcher.status() returns running=True within milliseconds of
+        # spawn. Without this there is a 2-10 second gap (orchestrator
+        # startup — imports, dir creation, agent init) where the OLD pid
+        # file (with finished_at from the prior kill/reap) is still on
+        # disk and the UI shows "stopped" even though a new process IS
+        # running. The orchestrator's write_pid_file() will overwrite
+        # this placeholder with its own pid + started_at when it's ready;
+        # if it never does (crash-on-start), the 10-second liveness scan
+        # will detect the dead pid and mark it accordingly.
+        _write_pid_file_placeholder(state_dir, task_id, proc.pid, spawn_time)
         # Record in runtime.json so reconciliation on next WebUI start
-        # can recognize the process as ours.
+        # can recognize the process as ours. Process state (pid,
+        # started_at) is owned by orchestrator.pid + runtime.json
+        # ONLY — never cached in the registry. See
+        # :class:`metainfer.server.tasks.TaskEntry` for why.
         if self._boot_id:
             _runtime.record_task_spawn(
                 task_id, proc.pid, state_dir, self._boot_id,
@@ -246,27 +304,32 @@ class LocalLauncher:
         pid = data.get("pid")
         finished_at = data.get("finished_at")
         started_at = data.get("started_at")
+        # finished_at 是 pid 文件里的权威"已退出"信号——它由 orchestrator
+        # 自身的 graceful exit、launcher 的 _reap_dead_pid_file、以及
+        # spawn 失败清理路径盖戳，任何一条都意味着进程确实没了。多节点
+        # NFS 场景下尤其关键：本机 /proc 永远看不到兄弟节点上的进程，
+        # 唯一可靠的"已停止"判据就是这个字段，而不是本机 os.kill(pid, 0)。
+        if finished_at is not None:
+            return ProcStatus(
+                running=False, pid=pid, started_at=started_at,
+                finished_at=finished_at,
+                exit_hint=data.get("exit_hint") or "pid-file-finished",
+            )
         if pid is None:
-            # Pid file is "cleared" (orchestrator exited cleanly) iff
-            # finished_at is set; otherwise the orchestrator hasn't
-            # started or its pid file was wiped.
-            if finished_at is not None:
-                return ProcStatus(
-                    running=False, pid=None, started_at=started_at,
-                    finished_at=finished_at, exit_hint="pid-file-cleared",
-                )
+            # 既没有 pid 也没有 finished_at：orchestrator 还没启动过，
+            # 或者它的 pid 文件被擦了。
             return ProcStatus(
                 running=False, pid=None, started_at=None,
                 finished_at=None, exit_hint="no-pid-file",
             )
-        # VALIDATED liveness: check that the kernel start time of `pid`
-        # matches what we recorded. A bare os.kill(pid, 0) check would
-        # pass even if the original process died and the PID was
-        # recycled to an unrelated process.
+        # 既没有 finished_at、pid 又存在：才走本机 liveness 探测。
+        # 这一支只覆盖"orchestrator 硬死、还没来得及盖 finished_at"的场景
+        # （SIGKILL / OOM / 内核 panic）。校验 kernel starttime 与 started_at
+        # 匹配可以挡住 PID 复用导致的误判。
         alive = _proc.validate_pid_started_at(pid, started_at)
         return ProcStatus(
             running=alive, pid=pid, started_at=started_at,
-            finished_at=finished_at if not alive else None,
+            finished_at=None,
             exit_hint="pid-alive" if alive else "pid-dead",
         )
 
@@ -286,11 +349,14 @@ class LocalLauncher:
         ok = _proc.kill_pid_validated(pid, sig=sig, expected_started_at=started_at)
         if not ok:
             # Orchestrator is already dead (crashed / SIGKILLed / OOM-killed)
-            # but its pid file + run.json still show "running". The user
-            # clicking Kill wants this task to STOP, so clean up the zombie
-            # state: stamp finished_at on the pid file and mark the task
-            # as not running in the registry. Without this the UI keeps
-            # showing the task as alive but the kill button does nothing.
+            # but its pid file + run.json still show "running". Clean up the
+            # zombie state so the UI flips from Kill→Restart.
+            self._reap_dead_pid_file(task_id, pid, started_at)
+        elif force:
+            # SIGKILL was delivered — the orchestrator cannot run its own
+            # cleanup handlers (SIGKILL is uncatchable), so we must update
+            # run.json and the pid file ourselves. Without this the UI
+            # stays frozen at the last phase forever.
             self._reap_dead_pid_file(task_id, pid, started_at)
         return ok
 
@@ -304,11 +370,14 @@ class LocalLauncher:
           not-running.
         - Clear the live pid in the task registry so the list view's
           status pill flips.
+        - Update ``run.json`` with ``finished=True, final_status="stopped"``
+          so the task detail view stops showing a stale phase.
         - Append a timeline marker so the audit trail explains why the
           task transitioned to stopped without a clean shutdown.
         """
         import json
-        import time
+
+        now = time.time()
         try:
             sd = _paths.task_dir(task_id)
             pf = sd / "orchestrator.pid"
@@ -316,24 +385,28 @@ class LocalLauncher:
                 d = _read_pid_file(task_id)
                 d.setdefault("pid", pid)
                 d.setdefault("started_at", started_at)
-                d["finished_at"] = time.time()
+                d["finished_at"] = now
                 d["exit_hint"] = "reaped-by-kill-on-dead-pid"
-                pf.write_text(
-                    json.dumps(d, indent=2), encoding="utf-8",
-                )
+                tmp = pf.with_suffix(".tmp")
+                tmp.write_text(json.dumps(d, indent=2), encoding="utf-8")
+                tmp.replace(pf)
         except Exception:  # noqa: BLE001 — best-effort cleanup
             pass
-        try:
-            _tasks.update_task(
-                task_id, pid=None, started_at=started_at,
-                finished_at=time.time(),
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        # Process state cleanup is done — orchestrator.pid was stamped
+        # above. The registry does NOT cache pid/finished_at (that was
+        # a SSOT violation; launcher.status() reads orchestrator.pid
+        # directly). run.json + timeline get updated below for the UI.
         try:
             from . import state_reader as _sr
+            sd = _paths.task_dir(task_id)
+            # Update run.json so the frontend sees the task as finished.
+            # Only touch finished / final_status / last_update — preserve
+            # everything else (current_iteration, current_phase, etc.) so
+            # the user can still see where the task was when it stopped.
+            run_path = sd / "run.json"
+            _update_run_stopped(run_path, now)
             _sr.append_timeline_event(
-                _paths.task_dir(task_id), "kill_reaped_dead_pid",
+                sd, "kill_reaped_dead_pid",
                 {"task_id": task_id, "dead_pid": pid,
                  "started_at": started_at},
             )

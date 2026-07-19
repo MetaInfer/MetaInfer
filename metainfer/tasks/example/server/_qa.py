@@ -1,11 +1,11 @@
-/** QAConfig — tells the generic QA engine how to find transcripts on disk.
+"""QAConfig -- tells the generic QA engine how to find transcripts on disk.
 
   ``resolve_target(state_dir, payload)`` returns::
 
       {"events_file": Path, "target_workdir": Path | None, "target_label": str}
 
-  The QA engine only calls this method — it knows nothing about your task's
-  directory layout (step dirs, agent names, iteration structure, …).
+  The QA engine only calls this method -- it knows nothing about your task's
+  directory layout (step dirs, agent names, iteration structure, ...).
 
   Provide the SMALLEST implementation that works. For a frontend-driven QA
   (where the browser uploads an events file and workdir directly), just

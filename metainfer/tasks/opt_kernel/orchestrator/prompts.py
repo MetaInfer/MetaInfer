@@ -59,21 +59,8 @@ Rules:
 
 
 def _render_req(req: Dict[str, Any]) -> str:
-    lines = [f"- task_type: {req.get('task_type', '?')}",
-             f"- task_id: {req.get('task_id', '?')}"]
-    _skip = {"task_type", "task_id", "raw_request", "answers"}
-    for k, v in req.items():
-        if k in _skip:
-            continue
-        if isinstance(v, (list, tuple)):
-            v = ", ".join(str(x) for x in v) if v else "(none)"
-        lines.append(f"- {k}: {v}")
-    answers = req.get("answers") or {}
-    for k, v in answers.items():
-        if isinstance(v, (list, tuple)):
-            v = ", ".join(str(x) for x in v) if v else "(none)"
-        lines.append(f"- {k}: {v}")
-    return "\n".join(lines)
+    from metainfer.orchestrator.requirements import req_summary_lines
+    return "\n".join(req_summary_lines(req))
 
 
 def plan_prompt(

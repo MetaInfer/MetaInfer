@@ -33,6 +33,13 @@
   required: false
   form: textarea
 
+- key: token_budget_max_cost_usd
+  question: "Token-cost budget cap in USD (optional)? When the running total crosses this limit, the task soft-aborts at the next phase boundary. Leave blank for unlimited."
+  header: "Cost cap"
+  required: false
+  form: number
+  default: ""
+
 - key: extra_notes
   question: "Any extra constraints or notes (free text)?"
   header: "Notes"

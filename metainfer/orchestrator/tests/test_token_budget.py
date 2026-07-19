@@ -20,6 +20,7 @@ from metainfer.orchestrator.token_budget import (
     BudgetSnapshot,
     TokenBudget,
     UsageRecord,
+    resolve_budget_limits,
     usage_from_result_event,
 )
 
@@ -226,6 +227,72 @@ def test_external_edit_is_hot_reloaded():
         assert snap.exhausted
 
 
+def test_resolve_budget_limits_runtime_file_overrides_seed():
+    """Regression: WebUI raises the budget mid-task → orchestrator
+    restarts → the new (runtime) limit must win over the stale seed in
+    requirements.json. Before resolve_budget_limits existed, the
+    orchestrator read the seed and silently ignored the runtime file,
+    so user budget bumps were lost on restart."""
+    with tempfile.TemporaryDirectory() as td:
+        # requirements.json has the original $50 seed from task creation
+        req = {"token_budget_max_cost_usd": 50}
+        # WebUI later bumped to $100 — runtime file is authoritative
+        (Path(td) / "token_budget.json").write_text(json.dumps({
+            "schema_version": 1,
+            "config": {"max_cost_usd": 100.0, "max_cost_usd_hard": None},
+            "totals": {"total_cost_usd": 50.28},
+        }))
+        soft, hard = resolve_budget_limits(td, req)
+        assert soft == 100.0
+        assert hard is None
+
+
+def test_resolve_budget_limits_falls_back_to_seed_on_first_boot():
+    """First boot: no token_budget.json yet → seed from requirements.json."""
+    with tempfile.TemporaryDirectory() as td:
+        req = {"token_budget_max_cost_usd": 50}
+        soft, hard = resolve_budget_limits(td, req)
+        assert soft == 50.0
+        assert hard is None
+
+
+def test_resolve_budget_limits_env_var_wins():
+    """Env var is the ops escape hatch — overrides both file + seed."""
+    with tempfile.TemporaryDirectory() as td:
+        req = {"token_budget_max_cost_usd": 50}
+        (Path(td) / "token_budget.json").write_text(json.dumps({
+            "config": {"max_cost_usd": 100.0},
+        }))
+        old = os.environ.get("METAINFER_TOKEN_BUDGET_COST_USD")
+        os.environ["METAINFER_TOKEN_BUDGET_COST_USD"] = "200"
+        try:
+            soft, _ = resolve_budget_limits(td, req)
+            assert soft == 200.0
+        finally:
+            if old is None:
+                del os.environ["METAINFER_TOKEN_BUDGET_COST_USD"]
+            else:
+                os.environ["METAINFER_TOKEN_BUDGET_COST_USD"] = old
+
+
+def test_resolve_budget_limits_nested_token_budget_object():
+    """requirements.json::token_budget.max_cost_usd (nested object form)
+    is honored on first boot too."""
+    with tempfile.TemporaryDirectory() as td:
+        req = {"token_budget": {"max_cost_usd": 75.0, "max_cost_usd_hard": 90.0}}
+        soft, hard = resolve_budget_limits(td, req)
+        assert soft == 75.0
+        assert hard == 90.0
+
+
+def test_resolve_budget_limits_disabled_when_nothing_set():
+    """No env, no runtime file, no seed → (None, None) → budget disabled."""
+    with tempfile.TemporaryDirectory() as td:
+        soft, hard = resolve_budget_limits(td, {})
+        assert soft is None
+        assert hard is None
+
+
 def _main() -> None:
     tests = [
         ("test_basic_accumulation", test_basic_accumulation),
@@ -239,6 +306,16 @@ def _main() -> None:
         ("test_reset_clears_everything", test_reset_clears_everything),
         ("test_update_limit_unblocks", test_update_limit_unblocks),
         ("test_external_edit_is_hot_reloaded", test_external_edit_is_hot_reloaded),
+        ("test_resolve_budget_limits_runtime_file_overrides_seed",
+         test_resolve_budget_limits_runtime_file_overrides_seed),
+        ("test_resolve_budget_limits_falls_back_to_seed_on_first_boot",
+         test_resolve_budget_limits_falls_back_to_seed_on_first_boot),
+        ("test_resolve_budget_limits_env_var_wins",
+         test_resolve_budget_limits_env_var_wins),
+        ("test_resolve_budget_limits_nested_token_budget_object",
+         test_resolve_budget_limits_nested_token_budget_object),
+        ("test_resolve_budget_limits_disabled_when_nothing_set",
+         test_resolve_budget_limits_disabled_when_nothing_set),
     ]
     failed = 0
     for name, fn in tests:

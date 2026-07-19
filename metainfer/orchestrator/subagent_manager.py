@@ -288,6 +288,16 @@ class SubAgentManager:
                 with self._ctrl_lock:
                     self._results[spec.name] = result
                 return AgentHandle(spec=spec, attempt=attempt - 1)
+            # If the failure was caused by a stale session resume (ccb
+            # sessions are in-memory, not persisted across processes),
+            # drop resume_session_id so the retry starts fresh instead
+            # of repeating the same "No conversation found" error.
+            if (
+                spec.resume_session_id
+                and result.error
+                and "No conversation found" in result.error
+            ):
+                spec.resume_session_id = None
             # failed -> retry
             self._write_status(spec, handle, result, attempt, phase="retrying")
             time.sleep(2.0)  # brief backoff

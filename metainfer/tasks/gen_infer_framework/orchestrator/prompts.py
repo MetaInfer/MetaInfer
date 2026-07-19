@@ -25,15 +25,18 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from metainfer.orchestrator.requirements import req_field
+
 
 NOTEBOOKS_HINT = """A knowledge base of reference designs, known pitfalls, and worked
 examples lives in the `notebooks/` directory.
 
 Read it EFFICIENTLY:
-- Use the Read tool directly. Do NOT spawn sub-agents (no Agent / Task /
-  TaskOutput / Explore tool calls) — each sub-agent cold-starts a separate
-  `claude -p` process and burns 1-3 minutes of startup time per call,
-  which dominates your budget without producing better answers.
+- Use the Read tool directly. Do NOT spawn sub-agents FOR READING (no Agent
+  / Task / TaskOutput / Explore tool calls to read files) — each sub-agent
+  cold-starts a separate `ccb` process and burns 1-3 minutes of startup
+  time per call. Reading a file yourself takes seconds; delegating it to a
+  sub-agent costs 100× more and adds zero value.
 - Start with `Glob notebooks/**/*.md` to see the layout, then Read only
   the files whose names match this iteration's task (typically 3-6 files).
   Do NOT read every notebook "to be complete".
@@ -41,6 +44,35 @@ Read it EFFICIENTLY:
   contents are already in your context window.
 - Hard cap: at most ~8 Read calls to notebooks for planning, ~4 for
   implement / review / perf-plan."""
+
+IMPLEMENT_PARALLEL_HINT = """# Parallel implementation strategy (IMPLEMENTER ONLY)
+
+You will typically need to write **3+ independent source files** in one
+iteration (e.g. `engine.py`, `scheduler.py`, `server.py`, `config.py`).
+Writing them sequentially burns 20-40 minutes. Use parallel sub-agents
+to write them simultaneously:
+
+1. **Read `plan.md` first.** Identify which files are independent (no
+   cross-file imports during initial writing).
+2. **For each independent file, spawn ONE parallel Agent** that ONLY
+   writes that file. Each sub-agent prompt should include:
+   - The task requirements (frozen section above)
+   - The relevant excerpt from `plan.md` for THAT file
+   - The relevant notebook page(s) for that file's domain
+   - An explicit instruction: "Write exactly `<filename>` and nothing else"
+3. **Spawn all writing agents in ONE message** so they run in parallel.
+   You can spawn up to 5 agents at once.
+4. **After all agents finish**, read the files they wrote and:
+   - Fix import paths so cross-file references resolve
+   - Ensure consistent naming (class names, function signatures) across files
+   - Run `test.sh` to verify the whole system works together
+5. **Do NOT delegate READING to sub-agents.** You read `plan.md`, the
+   notebooks, and any reference files yourself. Sub-agents only WRITE.
+
+Why this saves time: 5 files × 6 minutes each sequentially = 30 minutes.
+5 files in parallel = ~8 minutes (longest single file) + 2 minutes of
+glue work = ~10 minutes total. The sub-agent startup overhead (1-3 min
+each) is well worth it for implementer workloads."""
 
 
 # Subdirectory (relative to iter_dir/.metainfer-logs/) where the previous
@@ -162,6 +194,84 @@ skip the self-test, C will fail and you will be back here next iteration
 reading this same prompt. Save everyone the round-trip."""
 
 
+# Asyncio anti-pattern mandate (gen-infer-framework).
+#
+# Born from a real 12-iteration death spiral: the implementer called
+# HuggingFace tokenizer.apply_chat_template() directly inside the async
+# FastAPI route handler. This BLOCKS the asyncio event loop (no other
+# coroutines run while the tokenizer is computing). At concurrency=1
+# most requests timed out (>120s); at concurrency≥4 ALL requests got
+# ConnectionRefused because the TCP accept queue filled up while the
+# event loop was blocked by the first request's tokenizer call.
+#
+# The fix is a one-liner change — see the mandate below.
+ASYNC_NONBLOCK_MANDATE = """# MANDATORY: never block the asyncio event loop (gen-infer-framework)
+Your inference server uses **asyncio** (FastAPI + uvicorn). A single
+blocking synchronous call inside an `async def` route handler FREEZES
+the entire event loop — no other request can be processed while it runs,
+the TCP accept queue fills up, and concurrent benchmarks fail instantly.
+
+A real 12-iteration death spiral proved this: the implementer's server
+passed C-test (8 serial requests) but E-perf got **0 requests/s at
+concurrency≥4** and **nearly all timeouts at concurrency=1** because:
+
+  async def chat_completions(req):
+      prompt = engine.tokenizer.apply_chat_template(...)  # ← BLOCKS!
+
+## The fix (MUST apply to ALL CPU-heavy / I/O calls in route handlers)
+
+Wrap every blocking call in ``await asyncio.to_thread(...)`` (Python 3.9+):
+
+  async def chat_completions(req):
+      prompt = await asyncio.to_thread(
+          engine.tokenizer.apply_chat_template, messages, ...)
+
+This runs the tokenizer in a background thread so the event loop stays
+alive to accept new connections, run the step loop, and drain responses.
+
+## What counts as BLOCKING (must be offloaded)
+
+- Tokenizer calls: ``tokenizer.encode()``, ``tokenizer.apply_chat_template()``,
+  ``tokenizer.decode()``, ``tokenizer.__call__()``
+- Model weight loading: ``torch.load(...)``, ``safetensors`` loads
+- File I/O: ``open(...).read()`` on large files
+- NumPy / torch CPU compute: big ``torch.matmul``, ``.numpy()``
+- Profiler flush: ``profiler.export_chrome_trace(...)``
+
+## What is SAFE (no offload needed)
+
+- ``await asyncio.sleep()`` — naturally yields
+- ``await`` on FastAPI / httpx / aiohttp — naturally async
+- ``await`` on asyncio.Queue — naturally async
+- GPU calls (``.to("cuda")``, ``torch.cuda.synchronize()``) — they
+  release the GIL internally but still run on the CPU thread; wrap
+  them in ``asyncio.to_thread`` to be safe
+- GPU inference: ``model.forward()`` — technically releases GIL, but
+  the surrounding scheduler logic (pre/post-processing) is CPU-bound;
+  wrap the entire engine step in ``asyncio.to_thread``
+
+## Test your fix
+
+Before declaring B done, run the import smoke test AND then a local
+concurrency smoke test:
+
+  python3 -c "
+import asyncio, urllib.request, json, concurrent.futures
+def hit():
+    data = json.dumps({...}).encode()
+    r = urllib.request.urlopen('http://127.0.0.1:<PORT>/v1/chat/completions', data=data, timeout=30)
+    return r.status
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    results = list(pool.map(hit, range(4)))
+assert all(s==200 for s in results), f'some workers got {results}'
+print('concurrency smoke OK')
+  "
+
+If 4 concurrent requests can't all get 200 within 30s, you are NOT done
+— the E-phase perf oracle will fail exactly the same way.
+"""
+
+
 # GPU preflight mandate (gen-infer-framework).
 #
 # Every iteration's B-phase self-test boots serve.sh, which loads model
@@ -186,12 +296,32 @@ of this iteration chasing a phantom bug.
 
 Required preflight recipe (run it as a separate Bash turn BEFORE the boot):
 
+  **CRITICAL — never kill your own ancestors.** You run inside a process
+  tree: `orchestrator (python) → ccb / claude → this agent's bash`. If
+  any of those ancestors appears in the GPU pid list (e.g. the orchestrator
+  touched GPU once for a probe), killing them kills the entire task — the
+  dashboard freezes, agents.json stops updating, and the iteration is
+  lost. The recipe below walks `$$`'s ancestor chain and EXCLUDES every
+  PID in it before any kill.
+
   ```bash
+  # Build the ancestor PID set ONCE: this bash → claude/ccb → orchestrator → ...
+  # Never kill any of these — killing an ancestor kills the whole iteration.
+  ancestors=" $$"
+  _p=$PPID
+  while [ "$_p" -gt 1 ] 2>/dev/null; do
+    ancestors="$ancestors $_p"
+    _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
+    [ -z "$_p" ] && break
+  done
+  is_ancestor() { case " $ancestors " in *" $1 "*) return 0;; *) return 1;; esac; }
+
   # NVIDIA
   if command -v nvidia-smi >/dev/null; then
       nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits \
         | awk -F', ' '$2+0 >= 128 {print $1}' \
         | while read pid; do
+            if is_ancestor "$pid"; then echo "SKIP ancestor pid=$pid (do not kill)"; continue; fi
             echo "killing orphan GPU pid=$pid"
             kill -TERM "$pid" 2>/dev/null || true
           done
@@ -203,6 +333,7 @@ Required preflight recipe (run it as a separate Bash turn BEFORE the boot):
       rocm-smi --showpids 2>/dev/null \
         | grep -oE '\\b[0-9]{4,}\\b' \
         | while read pid; do
+            if is_ancestor "$pid"; then echo "SKIP ancestor pid=$pid (do not kill)"; continue; fi
             # Only kill processes you can attribute to python / ccb / metainfer
             cmd=$(ps -o comm= -p "$pid" 2>/dev/null || true)
             case "$cmd" in
@@ -219,6 +350,7 @@ Required preflight recipe (run it as a separate Bash turn BEFORE the boot):
     case "$tgt" in
       /dev/dri/renderD*|/dev/nvidia*)
         pid=$(echo "$f" | awk -F/ '{print $3}')
+        if is_ancestor "$pid"; then continue; fi
         cmd=$(ps -o comm= -p "$pid" 2>/dev/null || true)
         case "$cmd" in
           python*|ccb*|claude*) kill -TERM "$pid" 2>/dev/null || true ;;
@@ -236,15 +368,20 @@ Rules:
 1. **Run this every time before booting**, not just once at the start of
    B. Your own prior attempt's `python test.sh` may have crashed and left
    VRAM behind; the next boot will collide with it.
-2. **Only kill python / ccb / claude processes.** Never kill X, your
-   shell, or unrelated daemons that happen to hold the render node for
-   display.
-3. **If the preflight shows zero occupants, proceed immediately** — don't
+2. **Never kill your own ancestors.** The `is_ancestor` guard above is
+   mandatory; without it, a stray `python*` match on the orchestrator or
+   `ccb*` match on your parent kills the whole task. If you rewrite the
+   recipe, keep the ancestor-exclusion walk.
+3. **Only kill python / ccb / claude processes that are NOT your
+   ancestors.** Never kill X, your shell, or unrelated daemons that
+   happen to hold the render node for display.
+4. **If the preflight shows zero occupants, proceed immediately** — don't
    waste the turn. The point is to catch orphans, not to make you do
    ceremony.
-4. **If `kill -TERM` doesn't free the VRAM after 3 seconds, escalate**:
+5. **If `kill -TERM` doesn't free the VRAM after 3 seconds, escalate**:
    `kill -9 $pid`. CUDA/ROCm contexts sometimes need a hard kill.
-5. **The orchestrator's C and E oracles already run this same check** —
+   Re-check `is_ancestor` before the `-9` — never SIGKILL an ancestor.
+6. **The orchestrator's C and E oracles already run this same check** —
    you don't need to add anything to serve.sh itself. The check is YOUR
    responsibility only during local B-phase debugging."""
 
@@ -424,10 +561,14 @@ def _prev_logs_section(
     """Render the 'previous iteration diagnostics' block.
 
     Only emitted when there IS a prev_failure (i.e. we're retrying after a
-    failed C step). When emitted, it tells the agent in no uncertain terms
-    to READ the actual log files before writing any code — the prev_failure
-    text is a summary, the real root cause is usually in server.stderr.log
-    or the per-case judge reasons inside oracle-report.json.
+    failed C or E step). When emitted, it tells the agent in no uncertain
+    terms to READ the actual log files before writing any code.
+
+    The block auto-discovers which files exist in the prev-iter snapshot
+    rather than assuming C_test-specific filenames — E_perf_test failures
+    produce different artifacts (perf_report.json, perf-server.*.log), and
+    the retrospective.md often has better root cause analysis than either
+    oracle's raw output.
 
     ``prev_logs_dir`` is the ABSOLUTE path to the prev-iter snapshot
     directory (typically ``<cwd>/.metainfer/logs/<task_id>/<NNN>/prev-iter/``).
@@ -438,46 +579,102 @@ def _prev_logs_section(
     if not prev_failure:
         return ""
     if prev_logs_dir is None:
-        # No absolute path available — fall back to the legacy relative
-        # pointer. Should not happen in the new layout, but keeps the
-        # prompt useful if a caller forgets to pass the path.
-        snap = f".metainfer-logs/{PREV_ITER_LOGS_SUBDIR}"
-        p_oracle = f"{snap}/oracle-report.json"
-        p_stderr = f"{snap}/server.stderr.log"
-        p_stdout = f"{snap}/server.stdout.log"
-        p_judge = f"{snap}/judge.*.log"
-        loc_phrase = f"your working directory under `{snap}/`"
+        snap_str: str = f".metainfer-logs/{PREV_ITER_LOGS_SUBDIR}"
+        snap_path: Optional[Path] = None
+        loc_phrase = f"your working directory under `{snap_str}/`"
     else:
-        snap = prev_logs_dir
-        p_oracle = snap / "oracle-report.json"
-        p_stderr = snap / "server.stderr.log"
-        p_stdout = snap / "server.stdout.log"
-        p_judge = snap / "judge.*.log"
-        loc_phrase = f"`{snap}/`"
+        snap_path = prev_logs_dir
+        snap_str = str(snap_path)
+        loc_phrase = f"`{snap_path}/`"
+
+    # Build file pointers, separated by purpose. Reuse the same
+    # descriptions that _render_oracle_failure uses for C files, and
+    # add E-perf-specific entries.
+    file_entries: list[str] = []
+    if snap_path is not None and snap_path.is_dir():
+        existing = {p.name for p in snap_path.iterdir() if p.is_file()}
+    else:
+        existing = set()
+
+    # ---- C_test artifacts ----
+    if "oracle-report.json" in existing:
+        p = f"{snap_str}/oracle-report.json"
+        file_entries.append(
+            f"  - {p}\n"
+            "    Full structured verdict: every test case's prompt, the server's actual\n"
+            "    response, the judge's verdict + reason, http status, latency."
+        )
+    if "server.stderr.log" in existing:
+        p = f"{snap_str}/server.stderr.log"
+        file_entries.append(
+            f"  - {p}\n"
+            "    The server's stderr capture — Python tracebacks, OOM messages, CUDA\n"
+            "    errors, \"address already in use\", etc. For a crashed/hung server this\n"
+            "    is almost always where the root cause lives."
+        )
+    if "server.stdout.log" in existing:
+        p = f"{snap_str}/server.stdout.log"
+        file_entries.append(
+            f"  - {p}\n"
+            "    Server stdout — startup banner, model load progress, \"Uvicorn running\n"
+            "    on ...\". Useful for confirming whether the server even started."
+        )
+
+    # ---- E_perf_test artifacts ----
+    if "perf_report.json" in existing:
+        p = f"{snap_str}/perf_report.json"
+        file_entries.append(
+            f"  - {p}\n"
+            "    Structured perf sweep: per-concurrency throughput, latency percentiles,\n"
+            "    error counts per concurrency level. When num_requests=0, the server was\n"
+            "    not responding at all — check perf-server.stderr.log."
+        )
+    if "perf-server.stderr.log" in existing:
+        p = f"{snap_str}/perf-server.stderr.log"
+        file_entries.append(
+            f"  - {p}\n"
+            "    Perf oracle server stderr — why the serve.sh under perf load failed.\n"
+            "    OOM, CUDA errors, port conflicts, or request-handling crashes live here."
+        )
+    if "perf-server.stdout.log" in existing:
+        p = f"{snap_str}/perf-server.stdout.log"
+        file_entries.append(
+            f"  - {p}\n"
+            "    Perf oracle server stdout — startup banner, model load progress, request\n"
+            "    throughput. Confirms whether serve.sh booted successfully under perf load."
+        )
+
+    # ---- Review / analysis ----
+    if "retrospective.md" in existing:
+        p = f"{snap_str}/retrospective.md"
+        file_entries.append(
+            f"  - {p}\n"
+            "    The previous iteration's retrospective. Written by a reviewer agent AFTER\n"
+            "    seeing the full test results, it often contains the best root cause\n"
+            "    analysis and concrete fix suggestions. READ THIS FIRST."
+        )
+
+    # Fallback: list everything in the snapshot.
+    if not file_entries:
+        if snap_path is not None and snap_path.is_dir():
+            names = sorted(p.name for p in snap_path.iterdir() if p.is_file())
+            if names:
+                file_entries = [f"  - {snap_str}/{n}" for n in names]
+
+    file_list = "\n".join(file_entries)
+
     return f"""
 
 # Previous iteration's diagnostic logs (READ BEFORE CODING)
-The previous C step failed. Its diagnostic artifacts have been copied into
+The previous iteration failed. Its diagnostic artifacts have been copied into
 {loc_phrase}:
 
-  - {p_oracle}
-    Full structured verdict: every test case's prompt, the server's actual
-    response, the judge's verdict + reason, http status, latency. This is
-    the authoritative record of what went wrong.
-  - {p_stderr}
-    The server's stderr capture — Python tracebacks, OOM messages, CUDA
-    errors, "address already in use", etc. **For a crashed/hung server this
-    is almost always where the root cause lives.**
-  - {p_stdout}
-    Server stdout — startup banner, model load progress, "Uvicorn running
-    on ...". Useful for confirming whether the server even started.
-  - {p_judge}
-    The LLM-judge sub-agent's raw output per case (when judge_mode=llm).
+{file_list}
 
 The `prev_failure` text above is a condensed summary. BEFORE writing any
-code, open these files (especially `server.stderr.log` and the failing
-cases' entries in `oracle-report.json`) and identify the concrete root
-cause. Quote the relevant lines in your plan/commit message.
+code, open these files (especially `server.stderr.log`, `perf-server.stderr.log`,
+and `retrospective.md`) and identify the concrete root cause. Quote the
+relevant lines in your plan/commit message.
 """
 
 
@@ -668,26 +865,8 @@ def _render_req(req: Dict[str, Any]) -> str:
     e.g. the agent knew the model name from ``raw_request`` but not the
     on-disk path, so its serve.sh always fell back to a mock dir.
     """
-    lines = [f"- task_type: {req.get('task_type', '?')}",
-             f"- task_id: {req.get('task_id', '?')}",
-             f"- raw_request: {req.get('raw_request', '')}"]
-    # Top-level structured fields — the actual contract (model path,
-    # hardware, perf target, etc.). Skip the ones already rendered above
-    # and any internal bookkeeping keys.
-    _skip = {"task_type", "task_id", "raw_request", "answers"}
-    for k, v in req.items():
-        if k in _skip:
-            continue
-        if isinstance(v, (list, tuple)):
-            v = ", ".join(str(x) for x in v) if v else "(none)"
-        lines.append(f"- {k}: {v}")
-    # Backwards-compat: also surface legacy ``answers`` nesting if present.
-    answers = req.get("answers") or {}
-    for k, v in answers.items():
-        if isinstance(v, (list, tuple)):
-            v = ", ".join(str(x) for x in v) if v else "(none)"
-        lines.append(f"- {k}: {v}")
-    return "\n".join(lines)
+    from metainfer.orchestrator.requirements import req_summary_lines
+    return "\n".join(req_summary_lines(req))
 
 
 # --------------------------------------------------------------------------- #
@@ -802,6 +981,8 @@ If a previous failure is shown, your FIRST commit must address it.
 {_perf_plan_section(perf_plan)}
 {_review_feedback_section(review_feedback)}
 
+{IMPLEMENT_PARALLEL_HINT}
+
 # Deliverables
 1. The code described in the plan, inside `{iter_dir}`.
 {_deliverables_for_task(task_type, iter_dir, req)}
@@ -852,9 +1033,14 @@ file:line first.
 - Run the import + server-boot smoke tests from SMOKE_TEST_MANDATE
   before exiting — your last turn's exit without a passing smoke check
   is exactly why we're back here.
+- Do NOT block the asyncio event loop with synchronous tokenizer / file
+  I/O calls — see ASYNC_NONBLOCK_MANDATE below. Wrap blocking calls in
+  ``await asyncio.to_thread(...)``.
 - Be terse. Stop as soon as smoke checks pass.
 
 {PROCESS_SAFETY_MANDATE}
+
+{ASYNC_NONBLOCK_MANDATE}
 
 # Knowledge base
 {NOTEBOOKS_HINT}
@@ -871,7 +1057,7 @@ def _deliverables_for_task(task_type: str, iter_dir: Path, req: Dict[str, Any]) 
     For other task types, the agent writes ``test.sh`` itself.
     """
     if task_type == "gen-infer-framework":
-        target_model = req.get("target_model") or (req.get("answers") or {}).get("target_model") or "<path from requirements>"
+        target_model = req_field(req, "target_model") or "<path from requirements>"
         return f"""2. A serving script at `{iter_dir}/serve.sh` (bash, executable) that:
    - Takes the port as `$1` (e.g. `./serve.sh 8080`).
    - Starts your inference framework's HTTP server on that port.
@@ -929,6 +1115,8 @@ def _deliverables_for_task(task_type: str, iter_dir: Path, req: Dict[str, Any]) 
 {IMPORT_SMOKE_TEST_MANDATE}
 
 {SMOKE_TEST_MANDATE}
+
+{ASYNC_NONBLOCK_MANDATE}
 """
     # default: agent-written test.sh
     return f"""2. A test script at `{iter_dir}/test.sh` (bash, executable) that:

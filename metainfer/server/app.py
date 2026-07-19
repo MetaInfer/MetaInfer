@@ -319,6 +319,14 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001 — never fail shutdown
             pass
 
+    # Background liveness probe — detects orchestrators that died
+    # mid-run while the WebUI was up (crash / OOM kill / agent killing
+    # its own parent). reconcile() only runs at startup, so without
+    # this the UI would freeze on a stale "running" snapshot until the
+    # next WebUI restart. See metainfer.server.liveness.
+    from . import liveness as _liveness
+    _liveness.attach(app, interval=10.0)
+
     return app
 
 

@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from metainfer.orchestrator.requirements import req_field
 from metainfer.orchestrator.oracles.base import Oracle, OracleCaseResult, OracleResult
 from metainfer.orchestrator.oracles.judge import JudgeInput, run_judge_batch
 
@@ -112,7 +113,7 @@ class InferFrameworkOracle(Oracle):
             # Pass the real model path (if captured in requirements) to
             # serve.sh via env var so a weakly-written serve.sh still finds
             # the weights instead of falling into mock mode.
-            model_dir = req.get("target_model") or (req.get("answers") or {}).get("target_model")
+            model_dir = req_field(req, "target_model")
             proc = _start_server(serve_sh, port, report_dir, model_dir=model_dir)
             startup_to = _resolve_startup_timeout_s()
             ok, err = _wait_healthy(
@@ -551,7 +552,7 @@ def _load_cases(req: Dict[str, Any]) -> List[Dict[str, Any]]:
         data = yaml.safe_load(PROMPTS_FILE.read_text(encoding="utf-8")) or []
         cases.extend([c for c in data if isinstance(c, dict) and "id" in c and "prompt" in c])
     # 2. user overrides — look in req answers for a path, else skip
-    custom = (req.get("answers") or {}).get("oracle_prompts_path")
+    custom = req_field(req, "oracle_prompts_path")
     if custom:
         cp = Path(custom)
         if cp.exists():
