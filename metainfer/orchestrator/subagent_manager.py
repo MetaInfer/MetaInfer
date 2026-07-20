@@ -33,6 +33,16 @@ from typing import Any, Dict, List, Literal, Optional
 # Exit codes / signals that indicate infrastructure rather than logic failure.
 # 124 = timeout (coreutils convention), 137 = SIGKILL (128+9), 143 = SIGTERM (128+15).
 _INFRA_EXIT_CODES = {124, 137, 143}
+AgentBackend = Literal["claude", "codex"]
+
+
+def _normalize_agent_backend(value: str) -> AgentBackend:
+    v = (value or "claude").strip().lower()
+    if v in {"claude", "claude-code", "ccb"}:
+        return "claude"
+    if v in {"codex", "openai-codex"}:
+        return "codex"
+    raise ValueError(f"invalid agent backend {value!r}; expected 'claude' or 'codex'")
 
 
 # --------------------------------------------------------------------------- #
@@ -149,6 +159,8 @@ class SubAgentManager:
     def __init__(
         self,
         claude_bin: str = "ccb",
+        codex_bin: str = "codex",
+        agent_backend: AgentBackend = "claude",
         default_model: Optional[str] = None,
         max_concurrent: int = 4,
         permission_mode: str = "bypassPermissions",
@@ -158,7 +170,9 @@ class SubAgentManager:
         budget: Any = None,
         budget_source: str = "orchestrator",
     ) -> None:
+        self.agent_backend = _normalize_agent_backend(agent_backend)
         self.claude_bin = claude_bin
+        self.codex_bin = codex_bin
         self.default_model = default_model
         self.max_concurrent = max_concurrent
         # Per-task token / cost budget (TokenBudget instance or None to
@@ -616,6 +630,11 @@ class SubAgentManager:
     # ------------------------------------------------------------------ #
 
     def _build_command(self, spec: AgentSpec) -> List[str]:
+        if self.agent_backend == "codex":
+            return self._build_codex_command(spec)
+        return self._build_claude_command(spec)
+
+    def _build_claude_command(self, spec: AgentSpec) -> List[str]:
         cmd = [
             self.claude_bin,
             "-p",  # print (non-interactive) mode; prompt read from stdin
@@ -658,11 +677,49 @@ class SubAgentManager:
         cmd += list(spec.extra_args)
         return cmd
 
+    def _build_codex_command(self, spec: AgentSpec) -> List[str]:
+        # Codex CLI owns auth + user configuration. Do not pass API keys
+        # or --ignore-user-config; child processes inherit the current
+        # CODEX_HOME / OPENAI_* environment exactly like a normal user run.
+        model = spec.model or self.default_model
+        if spec.resume_session_id:
+            cmd = [
+                self.codex_bin,
+                "exec",
+                "resume",
+                "--json",
+                "--skip-git-repo-check",
+            ]
+            if model:
+                cmd += ["--model", model]
+            cmd += list(spec.extra_args)
+            cmd += [spec.resume_session_id, "-"]
+        else:
+            cmd = [
+                self.codex_bin,
+                "exec",
+                "--json",
+                "--color", "never",
+                "--skip-git-repo-check",
+                "--sandbox", "workspace-write",
+                "-C", str(spec.workdir),
+                "--add-dir", "/tmp",
+            ]
+            for d in self.extra_add_dirs:
+                cmd += ["--add-dir", str(d)]
+            if model:
+                cmd += ["--model", model]
+            cmd += list(spec.extra_args)
+            cmd += ["-"]
+        return cmd
+
     def _build_env(self, spec: AgentSpec) -> Dict[str, str]:
         env = dict(os.environ)
         env.update(spec.env_overrides)
         # Keep the agent from going interactive
         env.setdefault("DISABLE_INTERACTIVITY", "1")
+        if self.agent_backend == "codex":
+            return env
         # bypassPermissions under EUID=0 normally trips a hard exit
         # ("--dangerously-skip-permissions cannot be used with root/sudo
         # privileges"). ccb skips that check when IS_SANDBOX=1, which is
@@ -694,6 +751,13 @@ class SubAgentManager:
                     continue
         final_text = ""
         for ev in reversed(events):
+            if ev.get("type") == "item.completed":
+                item = ev.get("item")
+                if isinstance(item, dict) and item.get("type") == "agent_message":
+                    text = item.get("text")
+                    if isinstance(text, str) and text:
+                        final_text = text
+                        break
             if ev.get("type") == "assistant" and isinstance(ev.get("message"), dict):
                 content = ev["message"].get("content")
                 if isinstance(content, list):
@@ -714,6 +778,8 @@ class SubAgentManager:
         session_id = None
         for ev in events:
             sid = ev.get("session_id")
+            if not sid:
+                sid = ev.get("thread_id")
             if sid:
                 session_id = sid
                 if ev.get("type") == "result":
@@ -727,6 +793,14 @@ class SubAgentManager:
                 if "usage" in ev or "total_cost_usd" in ev:
                     usage = ev
                     break
+            if ev.get("type") == "turn.completed" and isinstance(ev, dict):
+                if "usage" in ev:
+                    usage = ev
+                    break
+        if usage is not None and session_id:
+            if not usage.get("session_id") and not usage.get("thread_id"):
+                usage = dict(usage)
+                usage["thread_id"] = session_id
         error = None
         failure_mode: Optional[Literal["infra", "logic", "budget"]] = None
         success = (rc == 0) and not handle.killed

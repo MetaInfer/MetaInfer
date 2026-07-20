@@ -567,6 +567,9 @@ def usage_from_result_event(
     usage = event.get("usage") if isinstance(event, dict) else None
     if not isinstance(usage, dict):
         usage = {}
+    cache_read = usage.get("cache_read_input_tokens")
+    if cache_read is None:
+        cache_read = usage.get("cached_input_tokens", 0)
     return UsageRecord(
         agent=str(agent),
         source=str(source),
@@ -574,10 +577,10 @@ def usage_from_result_event(
         ended_at=time.time(),
         input_tokens=int(usage.get("input_tokens", 0) or 0),
         output_tokens=int(usage.get("output_tokens", 0) or 0),
-        cache_read_input_tokens=int(usage.get("cache_read_input_tokens", 0) or 0),
+        cache_read_input_tokens=int(cache_read or 0),
         cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens", 0) or 0),
         total_cost_usd=float(event.get("total_cost_usd", 0.0) or 0.0),
-        session_id=event.get("session_id"),
+        session_id=event.get("session_id") or event.get("thread_id"),
     )
 
 

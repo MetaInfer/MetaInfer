@@ -79,11 +79,46 @@
 
 ## Quick start
 
-### Step 1: Install ccb (MetaInfer currently uses the open-source Claude Code CLI; other coding agents are not yet supported — contributions welcome)
+### Step 1: Install a coding agent CLI
 
-Open-source ccb repository: https://github.com/claude-code-best/claude-code
+MetaInfer launches phase-specific coding agents through a shared
+`SubAgentManager`. The backend is selected by `METAINFER_AGENT_BACKEND`.
+
+#### Claude/ccb backend
+
+Install ccb if you want to use the Claude-compatible backend:
+
 ```
 npm i -g claude-code-best
+```
+
+Run MetaInfer with:
+
+```bash
+METAINFER_AGENT_BACKEND=claude ./serve.py
+```
+
+#### Codex backend
+
+Install the Codex CLI and configure it before starting MetaInfer. MetaInfer
+does not store or pass API keys; it invokes `codex exec` and reuses your local
+Codex login, environment, and config such as `$CODEX_HOME/config.toml`.
+
+```bash
+codex login
+codex doctor
+```
+
+Then start MetaInfer with the Codex backend:
+
+```bash
+METAINFER_AGENT_BACKEND=codex ./serve.py
+```
+
+If the Codex binary is not named `codex` or is not on `PATH`, set:
+
+```bash
+METAINFER_AGENT_BACKEND=codex METAINFER_CODEX_BIN=/path/to/codex ./serve.py
 ```
 
 ### Step 2: Install MetaInfer

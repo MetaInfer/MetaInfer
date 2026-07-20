@@ -79,11 +79,46 @@
 
 ## 快速开始
 
-### 第一步，安装ccb。（本项目目前使开源的claude code版本，暂不支持其他coding agent，欢迎贡献代码以支持更多coding agent）
+### 第一步，安装一个 coding agent CLI
 
-开源ccb项目地址：https://github.com/claude-code-best/claude-code
+MetaInfer 通过统一的 `SubAgentManager` 拉起各阶段 coding agent。
+后端通过 `METAINFER_AGENT_BACKEND` 选择。
+
+#### Claude/ccb 后端
+
+如果使用 Claude-compatible 后端，先安装 ccb：
+
 ```
 npm i -g claude-code-best
+```
+
+启动时指定：
+
+```bash
+METAINFER_AGENT_BACKEND=claude ./serve.py
+```
+
+#### Codex 后端
+
+如果使用 Codex 后端，需要先在本机安装并配置 Codex CLI。MetaInfer
+不会保存或传递 API key；它只调用 `codex exec`，复用你本机已有的
+Codex 登录状态、环境变量和 `$CODEX_HOME/config.toml` 等配置。
+
+```bash
+codex login
+codex doctor
+```
+
+然后用 Codex 后端启动 MetaInfer：
+
+```bash
+METAINFER_AGENT_BACKEND=codex ./serve.py
+```
+
+如果 Codex 二进制不叫 `codex`，或者不在 `PATH` 里，可以显式指定：
+
+```bash
+METAINFER_AGENT_BACKEND=codex METAINFER_CODEX_BIN=/path/to/codex ./serve.py
 ```
 
 ### 第二步，安装MetaInfer

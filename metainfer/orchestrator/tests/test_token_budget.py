@@ -176,6 +176,24 @@ def test_usage_from_result_event():
     assert rec2.total_cost_usd == 0.0
 
 
+def test_usage_from_codex_turn_completed_event():
+    ev = {
+        "type": "turn.completed",
+        "thread_id": "thread-123",
+        "usage": {
+            "input_tokens": 100,
+            "cached_input_tokens": 80,
+            "output_tokens": 20,
+        },
+    }
+    rec = usage_from_result_event(ev, agent="codex-a", source="orchestrator")
+    assert rec.input_tokens == 100
+    assert rec.output_tokens == 20
+    assert rec.cache_read_input_tokens == 80
+    assert rec.total_cost_usd == 0.0
+    assert rec.session_id == "thread-123"
+
+
 def test_reset_clears_everything():
     with tempfile.TemporaryDirectory() as td:
         b = TokenBudget(td, max_cost_usd=1.0)
