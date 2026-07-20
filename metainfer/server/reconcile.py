@@ -63,25 +63,12 @@ def _read_pid_file(state_dir: Path) -> Dict[str, Any]:
         return {}
 
 
-def _write_pid_file_finished(state_dir: Path) -> None:
-    """Mark the task's pid file as finished (pid=None, finished_at=now)
-    when we detect the orchestrator is gone but the pid file still
-    claims it's running."""
-    p = state_dir / "orchestrator.pid"
-    if not p.exists():
-        return
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
-        data = {}
-    if data.get("pid") is None:
-        # Already cleared — don't clobber the original finished_at.
-        return
-    data["pid"] = None
-    data["finished_at"] = time.time()
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(p)
+# NOTE: reconcile used to have its own _write_pid_file_finished that only
+# touched orchestrator.pid. That diverged from launcher._reap_dead_pid_file
+# (which also updates run.json + writes a timeline event) — two reap
+# paths with different effects, classic SSOT violation. Now both
+# reconcile and liveness funnel through the same launcher reaper so
+# cleanup is identical regardless of who detects the death.
 
 
 def reconcile(silent: bool = False) -> Dict[str, Any]:
@@ -138,15 +125,11 @@ def reconcile(silent: bool = False) -> Dict[str, Any]:
         chosen = max(procs, key=lambda p: p.get("started_at") or 0)
         # Adopt: write into runtime.json under this boot_id and refresh
         # the pid file's started_at to match the actual kernel value.
+        # Process state lives ONLY in orchestrator.pid + runtime.json;
+        # registry.json holds identity only (see TaskEntry).
         _runtime.record_task_spawn(
             tid, chosen["pid"], sd, boot_id,
             started_at=chosen.get("started_at"),
-        )
-        # Keep registry pid cache in sync.
-        _tasks.update_task(
-            tid, pid=chosen["pid"],
-            started_at=chosen.get("started_at"),
-            finished_at=None,
         )
         adopted.append(tid)
         if not silent:
@@ -162,26 +145,39 @@ def reconcile(silent: bool = False) -> Dict[str, Any]:
             # runtime too.
             _runtime.clear_task(tid)
             continue
-        # The recorded PID isn't running (or was recycled). Mark the
-        # task's pid file as finished so status() reports dead cleanly.
+        # The recorded PID isn't running (or was recycled). Reap via the
+        # SAME path as the user-Kill and liveness paths — single source
+        # of cleanup truth. _reap_dead_pid_file stamps orchestrator.pid,
+        # updates run.json::finished/final_status, and writes a timeline
+        # event.
         registry_entry = registry_entries[tid]
         sd = Path(registry_entry.state_dir)
         pidfile = _read_pid_file(sd)
-        if pidfile.get("pid") is not None:
-            # Double-check the recorded pid isn't actually alive — it's
-            # possible we missed it in the scan (race with fork).
-            recorded_pid = pidfile.get("pid")
-            recorded_started = pidfile.get("started_at")
-            if recorded_pid and _proc.validate_pid_started_at(
-                recorded_pid, recorded_started,
-            ):
-                # Race: the process is alive but our scan missed it.
-                # Don't mark dead; we'll pick it up next reconcile.
-                continue
-            _write_pid_file_finished(sd)
+        recorded_pid = pidfile.get("pid")
+        if recorded_pid is None:
+            # Already cleared by a prior reap. Just drop the runtime entry.
+            _runtime.clear_task(tid)
+            continue
+        recorded_started = pidfile.get("started_at")
+        # Double-check the recorded pid isn't actually alive — it's
+        # possible we missed it in the scan (race with fork).
+        if _proc.validate_pid_started_at(recorded_pid, recorded_started):
+            # Race: the process is alive but our scan missed it.
+            # Don't mark dead; we'll pick it up next reconcile.
+            continue
+        from .launcher import get_default_launcher
+        try:
+            get_default_launcher()._reap_dead_pid_file(
+                tid, recorded_pid, recorded_started,
+            )
             marked_dead.append(tid)
             if not silent:
                 _log(f"marked task {tid} dead (pid {recorded_pid} no longer alive)")
+        except Exception:  # noqa: BLE001 — reaper is best-effort
+            if not silent:
+                _log(f"reaper FAILED for task {tid} (pid {recorded_pid}); "
+                     "leaving runtime entry in place for next pass")
+            continue
         _runtime.clear_task(tid)
 
     if ghosts and not silent:

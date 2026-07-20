@@ -151,6 +151,7 @@ function App() {
       ${active
         ? html`<${TaskDetailView}
             taskId=${active.id}
+            taskType=${active.type}
             run=${cached?.run}
             status=${active.status}
             label=${cached?.label || active.label}

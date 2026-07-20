@@ -38,9 +38,14 @@ def read_requirements(state_dir: Path) -> Optional[Dict[str, Any]]:
 
 
 def read_run(state_dir: Path) -> Dict[str, Any]:
-    """Return RunStatus dict, or a default 'idle' sentinel if missing."""
+    """Return RunStatus dict, or a default 'idle' sentinel if missing.
+
+    ``task_type`` is intentionally absent — its authoritative source is
+    ``requirements.json::task_type`` (read via :func:`read_requirements`),
+    not run.json. The frontend gets type from the registry entry.
+    """
     default = {
-        "task_id": None, "task_type": None, "created_at": 0,
+        "task_id": None,
         "current_iteration": 0, "current_phase": "idle",
         "last_update": 0, "finished": False, "final_status": None,
         "last_outcome": None, "last_transition_label": None, "notes": [],
@@ -48,7 +53,12 @@ def read_run(state_dir: Path) -> Dict[str, Any]:
     data = _load_json(state_dir / "run.json", None)
     if data is None:
         return default
-    # Merge with defaults so missing keys don't crash the frontend.
+    # Drop legacy fields if an old run.json still has them — single
+    # source of truth is requirements.json (task_type) and registry.json
+    # (created_at). Merge with defaults so missing keys don't crash the
+    # frontend.
+    for _legacy in ("task_type", "created_at"):
+        data.pop(_legacy, None)
     return {**default, **data}
 
 
@@ -101,12 +111,15 @@ def append_timeline_event(
         "type": event_type,
         "payload": payload or {},
     }
-    with open(state_dir / "timeline.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+    from metainfer.server.filelock import lock_file
+    timeline_path = state_dir / "timeline.jsonl"
+    with lock_file(timeline_path):
+        with open(timeline_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
 
 
 def reset_state_dir(
-    state_dir: Path, workspace_dir: Path, task_id: str, task_type: str,
+    state_dir: Path, workspace_dir: Path, task_id: str,
 ) -> Dict[str, Any]:
     """Wipe everything in ``state_dir`` except ``requirements.json``,
     and wipe the entire ``workspace_dir``.
@@ -118,6 +131,10 @@ def reset_state_dir(
     ``run.json`` matching the RunStatus defaults so the WebUI shows a
     clean idle state immediately, and stamps a single ``task_reset``
     timeline event so the reset itself is auditable.
+
+    ``task_type`` is intentionally NOT a parameter — it lives in
+    requirements.json (which is preserved across reset) and the registry
+    entry (which the caller already has).
 
     Caller MUST ensure the orchestrator is not running — this function
     does not check.
@@ -146,8 +163,6 @@ def reset_state_dir(
     now = time.time()
     fresh_run = {
         "task_id": task_id,
-        "task_type": task_type,
-        "created_at": now,
         "current_iteration": 0,
         "current_phase": "idle",
         "last_update": now,
@@ -158,9 +173,10 @@ def reset_state_dir(
         "notes": [],
     }
     state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "run.json").write_text(
-        json.dumps(fresh_run, indent=2), encoding="utf-8",
-    )
+    run_path = state_dir / "run.json"
+    tmp = run_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(fresh_run, indent=2), encoding="utf-8")
+    tmp.replace(run_path)
     append_timeline_event(state_dir, "task_reset", {
         "task_id": task_id, "reset_at": now, "removed_count": len(removed),
         "workspace_reset": True,

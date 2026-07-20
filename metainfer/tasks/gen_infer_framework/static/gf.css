@@ -15,3 +15,11 @@
   background: rgba(88, 166, 255, 0.15);
   color: #58a6ff;
 }
+
+/* Constrain panels that grow without bound so the detail page stays
+   navigable after 10+ iterations (instead of forcing the user to
+   scroll the entire page past thousands of timeline events). */
+.task-grid .panel {
+  max-height: 64vh;
+  overflow-y: auto;
+}

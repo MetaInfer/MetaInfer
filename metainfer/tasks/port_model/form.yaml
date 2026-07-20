@@ -1,0 +1,54 @@
+- key: model_dir
+  question: 模型权重目录路径
+  header: Model dir
+  required: true
+  form: file
+
+- key: source_framework_dir
+  question: 源框架源码目录（已支持该模型的参考实现）
+  header: Source FW
+  required: true
+  form: file
+
+- key: target_framework_dir
+  question: 目标框架源码目录（需要在此框架中新增模型支持）
+  header: Target FW
+  required: true
+  form: file
+
+- key: target_framework_type
+  question: 目标推理框架类型
+  header: FW type
+  required: true
+  form: select
+  choices:
+    - vLLM
+    - SGLang
+    - TensorRT-LLM
+    - TGI
+    - llama.cpp
+
+- key: target_hardware
+  question: GPU 硬件平台
+  header: HW
+  required: true
+  form: select
+  choices:
+    - NVIDIA H100
+    - NVIDIA H200
+    - NVIDIA B200
+    - NVIDIA A100
+    - Hygon K100AI
+    - Hygon BW1000
+
+- key: test_prompts
+  question: 基准测试用例（每行一个 prompt；留空则用内置通用用例）
+  header: Prompts
+  required: false
+  form: textarea
+
+- key: token_budget_max_cost_usd
+  question: Token 预算上限（USD；留空则不设限）
+  header: Budget
+  required: false
+  form: number

@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>find-low-hanging-kernel · execution-flow graph</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --node-bg: #ffffff;
+    --node-border: #c4c4c4;
+    --node-border-entry: #16a34a;
+    --node-border-exit: #b91c1c;
+    --edge: #6b7280;
+    --edge-label-bg: #ffffff;
+    --ink: #1f2937;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --warn: #b45309;
+  }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--ink); font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  #toolbar { padding: 8px 12px; background: #fff; border-bottom: 1px solid #e5e7eb; display: flex; gap: 12px; align-items: center; position: sticky; top: 0; z-index: 10; }
+  #toolbar h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  #toolbar .meta { color: var(--muted); font-size: 12px; }
+  #toolbar button { padding: 4px 10px; border: 1px solid #d1d5db; background: #fff; border-radius: 4px; cursor: pointer; font: inherit; }
+  #toolbar button:hover { background: #f3f4f6; }
+  #stage { width: 100%; height: calc(100vh - 48px); overflow: hidden; cursor: grab; }
+  #stage.dragging { cursor: grabbing; }
+  svg.graph { display: block; background:
+    radial-gradient(circle, #e5e7eb 1px, transparent 1px) 0 0 / 24px 24px;
+  }
+  svg.graph .node rect.box { fill: var(--node-bg); stroke: var(--node-border); stroke-width: 1; rx: 6; ry: 6; }
+  svg.graph .node.entry rect.box { stroke: var(--node-border-entry); stroke-width: 2; }
+  svg.graph .node.exit rect.box { stroke: var(--node-border-exit); stroke-width: 2; }
+  svg.graph .node foreignObject { pointer-events: none; }
+  svg.graph .node .nd-content { padding: 6px 8px; box-sizing: border-box; font: 12px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: var(--ink); }
+  svg.graph .node .nd-role { font-weight: 600; margin-bottom: 2px; }
+  svg.graph .node .nd-op { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  svg.graph .node .nd-src { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  svg.graph .node .nd-stats { color: var(--warn); font-size: 11px; margin-top: 4px; }
+  svg.graph .node .nd-shape { color: var(--muted); font-size: 10px; margin-top: 2px; }
+  svg.graph .node .nd-conf-low { color: var(--warn); font-size: 10px; font-style: italic; }
+  svg.graph .edge path { fill: none; stroke: var(--edge); stroke-width: 1.4; }
+  svg.graph .edge polygon.arrow { fill: var(--edge); }
+  svg.graph .edge text { font: 10px/1 -apple-system, sans-serif; fill: var(--muted); }
+  svg.graph .edge text+rect { fill: var(--edge-label-bg); }
+  #legend { position: fixed; bottom: 12px; right: 12px; background: #fff; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px 10px; font-size: 11px; line-height: 1.6; box-shadow: 0 2px 6px rgba(0,0,0,0.05); }
+  #legend code { background: #f3f4f6; padding: 0 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <h1>find-low-hanging-kernel</h1>
+  <span class="meta" id="meta-info">execution-flow graph</span>
+  <span style="flex:1"></span>
+  <button id="btn-zoom-in" title="Zoom in">+</button>
+  <button id="btn-zoom-out" title="Zoom out">−</button>
+  <button id="btn-fit" title="Fit to screen">Fit</button>
+  <button id="btn-reset" title="Reset pan/zoom">Reset</button>
+</div>
+<div id="stage"><svg class="graph" id="graph"></svg></div>
+<div id="legend">
+  <div><span style="color:var(--node-border-entry)">■</span> entry node &nbsp; <span style="color:var(--node-border-exit)">■</span> exit node</div>
+  <div><code>total_us</code> = sum across all calls in the trace</div>
+</div>
+
+<!-- ELK.js bundle (inlined by visualizer.py at render time) -->
+<script>/*__ELK_BUNDLE__*/</script>
+
+<!-- The validated flow_graph.json (inlined by visualizer.py) -->
+/*__FLOW_GRAPH_JSON__*/
+
+<script>
+(function () {
+  "use strict";
+
+  // --- Pull the embedded graph data out of the DOM -----------------------
+  var dataTag = document.getElementById("flow-graph-data");
+  if (!dataTag) {
+    document.getElementById("stage").innerHTML =
+      '<div style="padding:24px;color:#b91c1c">No flow-graph data embedded.</div>';
+    return;
+  }
+  var graph = JSON.parse(dataTag.textContent || "{}");
+
+  // --- Toolbar metadata --------------------------------------------------
+  var metaEl = document.getElementById("meta-info");
+  var md = graph.metadata || {};
+  var nodeCount = (graph.nodes || []).length;
+  var edgeCount = (graph.edges || []).length;
+  metaEl.textContent =
+    (md.model || "?") + " · tp=" + (md.tp_size || 1) +
+    " · " + nodeCount + " nodes · " + edgeCount + " edges";
+
+  // --- Build ELK input ---------------------------------------------------
+  // ELK uses node ids as layout keys; we use the same ids as the graph.
+  var elkInput = {
+    id: "root",
+    layoutOptions: {
+      "elk.algorithm": "layered",
+      "elk.direction": "RIGHT",
+      "elk.edgeRouting": "ORTHOGONAL",
+      "elk.layered.spacing.edgeEdgeBetweenLayers": "30",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "60",
+      "elk.layered.spacing.baseValue": "40",
+      "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
+      "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
+      // Elbow routing with no rounded corners → true orthogonal elbows.
+      "elk.layered.edgeRouting.fontSpacing": "0",
+    },
+    children: (graph.nodes || []).map(function (n) {
+      return {
+        id: n.id,
+        width: 240,
+        height: 96,
+        layoutOptions: {
+          "elk.portConstraints": "FIXED_SIDE",
+        },
+        // Ports anchor edge endpoints so elbows sit on node borders.
+        ports: [
+          { id: n.id + "_in", properties: { "elk.port.side": "WEST" } },
+          { id: n.id + "_out", properties: { "elk.port.side": "EAST" } },
+        ],
+      };
+    }),
+    edges: (graph.edges || []).map(function (e, i) {
+      return {
+        id: "e" + i,
+        sources: [e.from + "_out"],
+        targets: [e.to + "_in"],
+        label: { text: e.label || "" },
+      };
+    }),
+  };
+
+  // --- ELK runner --------------------------------------------------------
+  var elk;
+  if (typeof window !== "undefined" && window.ELK) {
+    elk = new window.ELK();
+  } else if (typeof require === "function") {
+    try { elk = new (require("elkjs").ELK)(); } catch (e) { elk = null; }
+  }
+  if (!elk) {
+    document.getElementById("stage").innerHTML =
+      '<div style="padding:24px;color:#b91c1c">ELK.js bundle failed to load. ' +
+      'Re-render via <code>visualizer.py</code>.</div>';
+    return;
+  }
+
+  elk.layout(elkInput).then(render).catch(function (err) {
+    document.getElementById("stage").innerHTML =
+      '<div style="padding:24px;color:#b91c1c">ELK layout failed: ' +
+      (err && err.message ? err.message : String(err)) + "</div>";
+  });
+
+  // --- Render ------------------------------------------------------------
+  function render(laid) {
+    var svg = document.getElementById("graph");
+    var NS = "http://www.w3.org/2000/svg";
+
+    // Find extent of laid-out graph.
+    var w = laid.width || 800;
+    var h = laid.height || 600;
+    svg.setAttribute("width", w);
+    svg.setAttribute("height", h);
+    svg.setAttribute("viewBox", "0 0 " + w + " " + h);
+
+    // Map of node id → node JSON (for content lookup).
+    var nodesById = {};
+    (graph.nodes || []).forEach(function (n) { nodesById[n.id] = n; });
+
+    // --- Edges first (so nodes paint over) ------------------------------
+    (laid.edges || []).forEach(function (le) {
+      if (!le.sections || !le.sections.length) return;
+      var s = le.sections[0];
+      var d = "M " + s.startPoint.x + " " + s.startPoint.y;
+      (s.bendPoints || []).forEach(function (bp) {
+        d += " L " + bp.x + " " + bp.y;
+      });
+      d += " L " + s.endPoint.x + " " + s.endPoint.y;
+
+      var g = document.createElementNS(NS, "g");
+      g.setAttribute("class", "edge");
+      var p = document.createElementNS(NS, "path");
+      p.setAttribute("d", d);
+      // Arrow at end (oriented along the last segment).
+      var arrow = document.createElementNS(NS, "polygon");
+      arrow.setAttribute("class", "arrow");
+      arrow.setAttribute("points", arrowPoints(s));
+      g.appendChild(p);
+      g.appendChild(arrow);
+
+      // Label (small, near midpoint).
+      if (le.labels && le.labels.length && le.labels[0].text) {
+        var lbl = le.labels[0];
+        var t = document.createElementNS(NS, "text");
+        t.setAttribute("x", (lbl.x || 0) + (lbl.width || 0) / 2);
+        t.setAttribute("y", (lbl.y || 0) + (lbl.height || 0) / 2);
+        t.setAttribute("text-anchor", "middle");
+        t.setAttribute("dominant-baseline", "middle");
+        t.textContent = lbl.text;
+        g.appendChild(t);
+      }
+      svg.appendChild(g);
+    });
+
+    // --- Nodes ----------------------------------------------------------
+    (laid.children || []).forEach(function (ln) {
+      var n = nodesById[ln.id];
+      if (!n) return;
+
+      var g = document.createElementNS(NS, "g");
+      g.setAttribute("class", "node" +
+        (n.role === "entry" ? " entry" : "") +
+        (n.role === "exit" ? " exit" : ""));
+      g.setAttribute("transform", "translate(" + ln.x + "," + ln.y + ")");
+
+      var r = document.createElementNS(NS, "rect");
+      r.setAttribute("class", "box");
+      r.setAttribute("width", ln.width);
+      r.setAttribute("height", ln.height);
+      g.appendChild(r);
+
+      var fo = document.createElementNS(NS, "foreignObject");
+      fo.setAttribute("width", ln.width);
+      fo.setAttribute("height", ln.height);
+      var div = document.createElementNS("http://www.w3.org/1999/xhtml", "div");
+      div.setAttribute("class", "nd-content");
+      div.innerHTML = nodeInnerHtml(n);
+      fo.appendChild(div);
+      g.appendChild(fo);
+
+      svg.appendChild(g);
+    });
+
+    initPanZoom(svg, w, h);
+  }
+
+  function arrowPoints(section) {
+    // Use the last segment to orient the arrow.
+    var pts = [section.startPoint].concat(section.bendPoints || [], [section.endPoint]);
+    var a = pts[pts.length - 2];
+    var b = pts[pts.length - 1];
+    var dx = b.x - a.x, dy = b.y - a.y;
+    var len = Math.sqrt(dx * dx + dy * dy) || 1;
+    var ux = dx / len, uy = dy / len;
+    // Arrow base sits 2px shy of b so it doesn't overshoot.
+    var bx = b.x - ux * 2, by = b.y - uy * 2;
+    var size = 7;
+    var left = { x: bx - uy * size - ux * size, y: by + ux * size - uy * size };
+    var right = { x: bx + uy * size - ux * size, y: by - ux * size - uy * size };
+    return bx + "," + by + " " + left.x + "," + left.y + " " + right.x + "," + right.y;
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+  function shapeStr(t) {
+    if (!t || !t.shape) return "";
+    return t.name + ": " + (t.dtype || "?") + "[" + t.shape.join(",") + "]";
+  }
+  function statsStr(s) {
+    if (!s) return "";
+    var parts = [];
+    if (s.total_us != null) parts.push("Σ=" + s.total_us + "us");
+    if (s.count != null) parts.push("n=" + s.count);
+    if (s.mean_us != null) parts.push("μ=" + s.mean_us + "us");
+    if (s.p99_us != null) parts.push("p99=" + s.p99_us + "us");
+    return parts.join(" · ");
+  }
+  function nodeInnerHtml(n) {
+    var src = n.source_ref || {};
+    var srcStr = "";
+    if (src.file) {
+      srcStr = esc(src.file) +
+        (src.line ? ":" + esc(src.line) : "") +
+        (src.symbol ? " (" + esc(src.symbol) + ")" : "");
+    }
+    var inputs = (n.inputs || []).map(shapeStr).filter(Boolean);
+    var outputs = (n.outputs || []).map(shapeStr).filter(Boolean);
+    var shapeHtml = "";
+    if (inputs.length || outputs.length) {
+      shapeHtml = '<div class="nd-shape">in: ' + esc(inputs.join(" | ") || "—") +
+        "<br/>out: " + esc(outputs.join(" | ") || "—") + "</div>";
+    }
+    var confHtml = "";
+    if (n.confidence && (n.confidence === "low" || n.confidence === "medium")) {
+      confHtml = '<div class="nd-conf-low">conf: ' + esc(n.confidence) + "</div>";
+    }
+    return (
+      '<div class="nd-role">' + esc(n.role || n.id) + " <span class='nd-op'>· " +
+        esc(n.operator || "?") + "</span></div>" +
+      (srcStr ? '<div class="nd-src">' + srcStr + "</div>" : "") +
+      shapeHtml +
+      (statsStr(n.stats) ? '<div class="nd-stats">' + statsStr(n.stats) + "</div>" : "") +
+      confHtml
+    );
+  }
+
+  // --- Pan / zoom --------------------------------------------------------
+  function initPanZoom(svg, w, h) {
+    var stage = document.getElementById("stage");
+    var vb = { x: 0, y: 0, w: w, h: h };
+    var scale = 1;
+    var pan = { x: 0, y: 0 };
+    var dragging = false;
+    var last = null;
+
+    function applyViewBox() {
+      svg.setAttribute("viewBox",
+        (vb.x - pan.x / scale) + " " + (vb.y - pan.y / scale) + " " +
+        vb.w + " " + vb.h);
+    }
+    function fitToStage() {
+      var rect = stage.getBoundingClientRect();
+      var s = Math.min(rect.width / w, rect.height / h) * 0.95;
+      vb.w = w; vb.h = h;
+      svg.setAttribute("width", w * s);
+      svg.setAttribute("height", h * s);
+      pan.x = 0; pan.y = 0;
+      applyViewBox();
+    }
+    fitToStage();
+    window.addEventListener("resize", fitToStage);
+
+    stage.addEventListener("mousedown", function (e) {
+      dragging = true;
+      last = { x: e.clientX, y: e.clientY };
+      stage.classList.add("dragging");
+    });
+    window.addEventListener("mousemove", function (e) {
+      if (!dragging) return;
+      pan.x += (e.clientX - last.x);
+      pan.y += (e.clientY - last.y);
+      last = { x: e.clientX, y: e.clientY };
+      applyViewBox();
+    });
+    window.addEventListener("mouseup", function () {
+      dragging = false;
+      stage.classList.remove("dragging");
+    });
+    stage.addEventListener("wheel", function (e) {
+      e.preventDefault();
+      var delta = e.deltaY > 0 ? 1.1 : 1 / 1.1;
+      vb.w = Math.max(50, Math.min(w * 4, vb.w * delta));
+      vb.h = Math.max(50, Math.min(h * 4, vb.h * delta));
+      applyViewBox();
+    }, { passive: false });
+
+    document.getElementById("btn-zoom-in").onclick = function () {
+      vb.w = Math.max(50, vb.w / 1.2);
+      vb.h = Math.max(50, vb.h / 1.2);
+      applyViewBox();
+    };
+    document.getElementById("btn-zoom-out").onclick = function () {
+      vb.w = Math.min(w * 4, vb.w * 1.2);
+      vb.h = Math.min(h * 4, vb.h * 1.2);
+      applyViewBox();
+    };
+    document.getElementById("btn-fit").onclick = fitToStage;
+    document.getElementById("btn-reset").onclick = function () {
+      vb.w = w; vb.h = h; pan.x = 0; pan.y = 0; applyViewBox();
+    };
+  }
+})();
+</script>
+</body>
+</html>

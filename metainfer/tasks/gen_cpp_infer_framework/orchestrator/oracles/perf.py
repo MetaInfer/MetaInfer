@@ -46,6 +46,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from metainfer.orchestrator.requirements import req_field
+
 import yaml
 
 from .gpu import GpuTelemetry
@@ -183,7 +185,7 @@ def _resolve_token_counter(req: Dict[str, Any]) -> Tuple[str, Any]:
     comparisons can detect methodology drift (you should compare
     numbers only when the source matches).
     """
-    model_dir = req.get("target_model") or (req.get("answers") or {}).get("target_model")
+    model_dir = req_field(req, "target_model")
     if model_dir and Path(model_dir).exists():
         try:
             from transformers import AutoTokenizer  # type: ignore
@@ -594,8 +596,7 @@ def _load_cases(req: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
     Override: ``req['perf_prompts_path']`` or ``req['answers']['perf_prompts_path']``
     points at a user-provided yaml file with the same shape.
     """
-    custom = (req.get("perf_prompts_path")
-              or (req.get("answers") or {}).get("perf_prompts_path"))
+    custom = req_field(req, "perf_prompts_path")
     if custom and Path(custom).exists():
         data = yaml.safe_load(Path(custom).read_text(encoding="utf-8")) or []
         cases = [c for c in data if isinstance(c, dict) and "id" in c and "prompt" in c]
@@ -695,7 +696,7 @@ class PerfOracle:
         report.methodology["tokenizer_source"] = tokenizer_source
 
         port = _pick_free_port()
-        model_dir = req.get("target_model") or (req.get("answers") or {}).get("target_model")
+        model_dir = req_field(req, "target_model")
         # Profile output dir — created here, scanned after the sweep.
         # The framework writes ``metainfer-profile-rank{R}-{ts}.json.gz``
         # files into it per the contract.

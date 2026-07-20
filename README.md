@@ -30,9 +30,13 @@
 </p>
 
 <p align="center">
-  <a href="https://star-history.com/#MetaInfer/MetaInfer&Date">
-    <img src="https://api.star-history.com/svg?repos=MetaInfer/MetaInfer&type=Date" alt="Star History" width="600">
-  </a>
+ <a href="https://www.star-history.com/?type=date&repos=MetaInfer%2FMetaInfer">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&theme=dark&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+ </picture>
+</a>
 </p>
 
 ---
@@ -75,6 +79,49 @@
 
 ## Quick start
 
+### Step 1: Install a coding agent CLI
+
+MetaInfer launches phase-specific coding agents through a shared
+`SubAgentManager`. The backend is selected by `METAINFER_AGENT_BACKEND`.
+
+#### Claude/ccb backend
+
+Install ccb if you want to use the Claude-compatible backend:
+
+```
+npm i -g claude-code-best
+```
+
+Run MetaInfer with:
+
+```bash
+METAINFER_AGENT_BACKEND=claude ./serve.py
+```
+
+#### Codex backend
+
+Install the Codex CLI and configure it before starting MetaInfer. MetaInfer
+does not store or pass API keys; it invokes `codex exec` and reuses your local
+Codex login, environment, and config such as `$CODEX_HOME/config.toml`.
+
+```bash
+codex login
+codex doctor
+```
+
+Then start MetaInfer with the Codex backend:
+
+```bash
+METAINFER_AGENT_BACKEND=codex ./serve.py
+```
+
+If the Codex binary is not named `codex` or is not on `PATH`, set:
+
+```bash
+METAINFER_AGENT_BACKEND=codex METAINFER_CODEX_BIN=/path/to/codex ./serve.py
+```
+
+### Step 2: Install MetaInfer
 ```bash
 git clone https://github.com/MetaInfer/MetaInfer.git
 cd MetaInfer
@@ -83,7 +130,7 @@ pip install -r requirements.txt
 ```
 
 Open [http://127.0.0.1:8765](http://127.0.0.1:8765), click **+ New Task**,
-pick a task type, describe your requirements, and the LLM gets to work.
+pick a task type, fill in your requirements, and the LLM gets to work.
 
 ```bash
 # Other ways to start
@@ -95,6 +142,27 @@ python -m metainfer.server.app
 ## License
 
 MIT
+
+## Academic Research
+
+The initial ideas and experimental data of MetaInfer are publicly available
+at https://arxiv.org/abs/2607.12875. The related code is on the `arxiv-paper` branch.
+
+Citation:
+
+```
+@misc{miao2026metainferknowledgellminference,
+      title={MetaInfer: A Knowledge Only LLM Inference Engine Generator SKILL Toolbox}, 
+      author={Zhenwen Miao and Honglin Wang and Mingheng Mi},
+      year={2026},
+      eprint={2607.12875},
+      archivePrefix={arXiv},
+      primaryClass={cs.MA},
+      url={https://arxiv.org/abs/2607.12875}, 
+}
+```
+
+## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture details, design
 principles, and how to add new task types.

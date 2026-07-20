@@ -42,10 +42,9 @@ def load_hardware_profiles() -> Dict[str, Dict[str, Any]]:
 
 
 def selected_hardware(req: Dict[str, Any]) -> Optional[str]:
-    """Read the current hardware selection, including legacy nested inputs."""
-    value = req.get("target_hardware")
-    if value is None:
-        value = (req.get("answers") or {}).get("target_hardware")
+    """Read the current hardware selection (via shared req_field helper)."""
+    from metainfer.orchestrator.requirements import req_field
+    value = req_field(req, "target_hardware")
     return str(value) if value else None
 
 

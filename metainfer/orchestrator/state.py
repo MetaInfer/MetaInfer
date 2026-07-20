@@ -20,7 +20,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -47,8 +47,6 @@ Outcome = Union[str, None]
 @dataclass
 class RunStatus:
     task_id: str
-    task_type: str
-    created_at: float
     current_iteration: int = 0
     current_phase: Phase = "idle"
     last_update: float = 0.0
@@ -66,6 +64,14 @@ class RunStatus:
     last_outcome: Optional[Outcome] = None
     last_transition_label: Optional[str] = None
     notes: List[str] = field(default_factory=list)
+
+    # ``task_type`` and ``created_at`` are deliberately NOT fields here.
+    # Authoritative sources:
+    #   - task_type  → requirements.json (immutable after task creation)
+    #   - created_at → registry.json::created_at (task spawn time)
+    # Persisting either in run.json created stale-copy hazards (reset
+    # used to overwrite created_at, losing the original). See CLAUDE.md
+    # "数据一致性" section.
 
 
 # --------------------------------------------------------------------------- #
@@ -118,17 +124,15 @@ class StateStore:
     # Run status
     # ------------------------------------------------------------------ #
 
-    def init_run(self, task_id: str, task_type: str) -> RunStatus:
+    def init_run(self, task_id: str) -> RunStatus:
         rs = RunStatus(
             task_id=task_id,
-            task_type=task_type,
-            created_at=time.time(),
             last_update=time.time(),
         )
         self._write_run(rs)
         return rs
 
-    def init_or_resume(self, task_id: str, task_type: str) -> tuple[RunStatus, bool]:
+    def init_or_resume(self, task_id: str) -> tuple[RunStatus, bool]:
         """Either initialize a fresh run.json or load the existing one.
 
         Returns ``(run_status, is_resume)``. ``is_resume`` is True iff a
@@ -138,13 +142,20 @@ class StateStore:
         with self._lock:
             if self.run_path.exists():
                 return self.load_run(), True
-            return self.init_run(task_id, task_type), False
+            return self.init_run(task_id), False
 
     def load_run(self) -> RunStatus:
         if not self.run_path.exists():
             raise FileNotFoundError(f"no run.json at {self.run_path}")
         data = json.loads(self.run_path.read_text(encoding="utf-8"))
-        return RunStatus(**data)
+        # Filter to known fields so old run.json files (which used to
+        # persist task_type) load cleanly. Extra keys are silently
+        # dropped — single source of truth lives in requirements.json.
+        if not isinstance(data, dict):
+            raise ValueError(f"run.json at {self.run_path} is not a JSON object")
+        known = {f.name for f in fields(RunStatus)}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return RunStatus(**filtered)
 
     def update_run(self, **kwargs: Any) -> RunStatus:
         with self._lock:
@@ -251,8 +262,10 @@ class StateStore:
                 "type": event_type,
                 "payload": payload or {},
             }
-            with open(self.timeline_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
+            from metainfer.server.filelock import lock_file
+            with lock_file(self.timeline_path):
+                with open(self.timeline_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
 
     def load_timeline(self, since: float = 0.0) -> List[Dict[str, Any]]:
         if not self.timeline_path.exists():

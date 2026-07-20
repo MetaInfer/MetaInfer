@@ -154,6 +154,8 @@ def install_subagent_shutdown_handlers(
 def make_subagent_manager(
     *,
     claude_bin: str,
+    codex_bin: Optional[str] = None,
+    agent_backend: Optional[str] = None,
     model: Optional[str],
     permission_mode: str,
     effort: str,
@@ -170,8 +172,20 @@ def make_subagent_manager(
     ``budget`` (optional) wires the per-task :class:`TokenBudget` so
     every agent launch is gated + every result's cost is recorded.
     """
+    resolved_agent_backend = (
+        agent_backend
+        or os.environ.get("METAINFER_AGENT_BACKEND")
+        or "claude"
+    )
+    resolved_codex_bin = (
+        codex_bin
+        or os.environ.get("METAINFER_CODEX_BIN")
+        or "codex"
+    )
     return SubAgentManager(
         claude_bin=claude_bin,
+        codex_bin=resolved_codex_bin,
+        agent_backend=resolved_agent_backend,
         default_model=model,
         permission_mode=permission_mode,
         effort=effort,

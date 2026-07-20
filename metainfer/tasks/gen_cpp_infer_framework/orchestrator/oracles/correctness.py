@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from metainfer.orchestrator.requirements import req_field
 from ..hardware import (
     HardwareProfileError,
     execution_environment,
@@ -121,7 +122,7 @@ class InferFrameworkOracle(Oracle):
         if not cases_cfg:
             return self._fail(report_dir, "no test cases configured")
 
-        model_dir = req.get("target_model") or (req.get("answers") or {}).get("target_model")
+        model_dir = req_field(req, "target_model")
         ok, build_err = _run_build_check(
             build_sh, report_dir, model_dir=model_dir,
             extra_env=hardware_env, timeout_s=min(timeout_s, 900)
@@ -636,7 +637,7 @@ def _load_cases(req: Dict[str, Any]) -> List[Dict[str, Any]]:
         data = yaml.safe_load(PROMPTS_FILE.read_text(encoding="utf-8")) or []
         cases.extend([c for c in data if isinstance(c, dict) and "id" in c and "prompt" in c])
     # 2. user overrides — look in req answers for a path, else skip
-    custom = (req.get("answers") or {}).get("oracle_prompts_path")
+    custom = req_field(req, "oracle_prompts_path")
     if custom:
         cp = Path(custom)
         if cp.exists():

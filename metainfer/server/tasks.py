@@ -28,7 +28,24 @@ from . import paths as _paths
 
 @dataclass
 class TaskEntry:
-    """One row in the registry."""
+    """One row in the registry — IDENTITY ONLY.
+
+    The registry is the durable list of tasks the WebUI knows about.
+    It pins each task to its ``state_dir`` (metadata + logs) and
+    ``workspace_dir`` (artifacts), plus the task type and display
+    label. That's it.
+
+    **Process state (pid / started_at / finished_at) is NOT stored
+    here.** It lives only in the per-task ``orchestrator.pid`` file,
+    read on demand via :meth:`Launcher.status`. Caching it here used
+    to cause SSOT violations: every cleanup path (reconcile,
+    _reap_dead_pid_file, kill) had to remember to mirror its write
+    into the registry cache, and the ``if v is None: continue`` rule
+    in :func:`update_task` silently swallowed ``pid=None`` clearings,
+    so the cache stuck at stale values forever. If you need to know
+    whether a task is running, call ``launcher.status(task_id)`` —
+    do NOT add a pid field back to this dataclass.
+    """
     id: str                                 # user-visible task id, unique
     type: str                               # task type id (matches WebPlugin.type)
     label: str                              # short display name
@@ -43,13 +60,12 @@ class TaskEntry:
     # "remote:<node_id>" semantics will eventually resolve to a path under
     # <root>/nodes/<node_id>/ on the shared filesystem.
     launcher: str = "local"
-    # Last-known orchestrator PID + lifecycle markers. The orchestrator
-    # subprocess writes its own PID file under state_dir; the registry
-    # caches a copy here for the task list view to render quickly without
-    # touching every task dir.
-    pid: Optional[int] = None
-    started_at: Optional[float] = None
-    finished_at: Optional[float] = None
+
+
+# Legacy fields that used to live on TaskEntry but were removed when
+# process state was consolidated into orchestrator.pid. Silently
+# stripped on read so old registry.json files keep working.
+_LEGACY_FIELDS = frozenset({"pid", "started_at", "finished_at"})
 
 
 def _read_registry_locked() -> Dict[str, Any]:
@@ -103,7 +119,7 @@ def list_tasks() -> List[TaskEntry]:
     """Return all tasks in creation order."""
     with _lock():
         data = _read_registry_locked()
-    return [TaskEntry(**t) for t in data["tasks"]]
+    return [TaskEntry(**_strip_legacy(t)) for t in data["tasks"]]
 
 
 def get_task(task_id: str) -> Optional[TaskEntry]:
@@ -112,8 +128,15 @@ def get_task(task_id: str) -> Optional[TaskEntry]:
         data = _read_registry_locked()
     for t in data["tasks"]:
         if t.get("id") == task_id:
-            return TaskEntry(**t)
+            return TaskEntry(**_strip_legacy(t))
     return None
+
+
+def _strip_legacy(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove legacy fields (pid/started_at/finished_at) from a registry
+    entry dict. Old registry.json files may still contain them; new code
+    must not consume them. See :class:`TaskEntry` for why."""
+    return {k: v for k, v in d.items() if k not in _LEGACY_FIELDS}
 
 
 def add_task(entry: TaskEntry) -> None:
@@ -128,22 +151,24 @@ def add_task(entry: TaskEntry) -> None:
 
 
 def update_task(task_id: str, **patch: Any) -> Optional[TaskEntry]:
-    """Patch fields on an existing task (e.g. refresh pid / started_at /
-    finished_at). Returns the updated entry, or None if no such task.
+    """Patch identity fields on an existing task (e.g. relabel). Returns
+    the updated entry, or None if no such task.
 
-    None values in ``patch`` are skipped (treated as 'no change'). Pass
-    an explicit sentinel if you need to clear a field."""
+    Process state (pid/started_at/finished_at) is NOT accepted here —
+    those live only in ``orchestrator.pid``. Passing them will be
+    silently dropped (see :class:`TaskEntry` for why).
+    """
+    patch = {k: v for k, v in patch.items() if k not in _LEGACY_FIELDS}
+    if not patch:
+        return get_task(task_id)
     with _lock():
         data = _read_registry_locked()
         for i, t in enumerate(data["tasks"]):
             if t.get("id") == task_id:
-                for k, v in patch.items():
-                    if v is None:
-                        continue
-                    t[k] = v
+                t.update(patch)
                 data["tasks"][i] = t
                 _write_registry_locked(data)
-                return TaskEntry(**t)
+                return TaskEntry(**_strip_legacy(t))
     return None
 
 

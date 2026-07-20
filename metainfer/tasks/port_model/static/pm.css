@@ -1,0 +1,75 @@
+/* port-model detail view */
+
+.pm-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1rem;
+}
+
+.pm-tab {
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 0.875rem;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.pm-tab:hover { color: var(--text); }
+
+.pm-tab.active {
+  color: var(--accent-1);
+  border-bottom-color: var(--accent-1);
+}
+
+.pm-memory {
+  max-width: 900px;
+  font-size: 0.875rem;
+  line-height: 1.6;
+  overflow-wrap: break-word;
+}
+
+.pm-memory h1 { font-size: 1.25rem; }
+.pm-memory h2 { font-size: 1.1rem; }
+.pm-memory h3 { font-size: 1rem; }
+.pm-memory pre { background: var(--code); padding: 0.75rem; border-radius: 4px; overflow-x: auto; }
+.pm-memory code { font-size: 0.8rem; }
+.pm-memory table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; }
+.pm-memory th, .pm-memory td { border: 1px solid var(--border); padding: 0.35rem 0.5rem; text-align: left; font-size: 0.8rem; }
+.pm-memory th { background: var(--surface-2); }
+
+.pm-diff {
+  max-width: 900px;
+  font-size: 0.8rem;
+  font-family: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo, Consolas, monospace;
+  background: var(--code);
+  padding: 1rem;
+  border-radius: 4px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  line-height: 1.4;
+}
+
+.pm-results {
+  max-width: 900px;
+}
+
+.pm-results table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.pm-results th,
+.pm-results td {
+  border: 1px solid var(--border);
+  padding: 0.5rem;
+  text-align: left;
+  font-size: 0.8rem;
+}
+
+.pm-results th { background: var(--surface-2); }
+.pm-results .pass { color: var(--ok); }
+.pm-results .fail { color: var(--err); }

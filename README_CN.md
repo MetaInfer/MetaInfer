@@ -30,9 +30,13 @@
 </p>
 
 <p align="center">
-  <a href="https://star-history.com/#MetaInfer/MetaInfer&Date">
-    <img src="https://api.star-history.com/svg?repos=MetaInfer/MetaInfer&type=Date" alt="Star History" width="600">
-  </a>
+  <a href="https://www.star-history.com/?type=date&repos=MetaInfer%2FMetaInfer">
+  <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&theme=dark&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=MetaInfer/MetaInfer&type=date&legend=top-left&sealed_token=7N_57a34GhT7taYXyy9U_E1V_9P1i7A_0PK4Am3dOHxXcNvtk9CuxadGB6B1ZCyS0Zsa2rq_z1U0OmRgz9YDhWs5IaomukOlrF5zq5eapw47cM1rYdOKnQ" />
+ </picture>
+</a>
 </p>
 
 ---
@@ -75,6 +79,49 @@
 
 ## 快速开始
 
+### 第一步，安装一个 coding agent CLI
+
+MetaInfer 通过统一的 `SubAgentManager` 拉起各阶段 coding agent。
+后端通过 `METAINFER_AGENT_BACKEND` 选择。
+
+#### Claude/ccb 后端
+
+如果使用 Claude-compatible 后端，先安装 ccb：
+
+```
+npm i -g claude-code-best
+```
+
+启动时指定：
+
+```bash
+METAINFER_AGENT_BACKEND=claude ./serve.py
+```
+
+#### Codex 后端
+
+如果使用 Codex 后端，需要先在本机安装并配置 Codex CLI。MetaInfer
+不会保存或传递 API key；它只调用 `codex exec`，复用你本机已有的
+Codex 登录状态、环境变量和 `$CODEX_HOME/config.toml` 等配置。
+
+```bash
+codex login
+codex doctor
+```
+
+然后用 Codex 后端启动 MetaInfer：
+
+```bash
+METAINFER_AGENT_BACKEND=codex ./serve.py
+```
+
+如果 Codex 二进制不叫 `codex`，或者不在 `PATH` 里，可以显式指定：
+
+```bash
+METAINFER_AGENT_BACKEND=codex METAINFER_CODEX_BIN=/path/to/codex ./serve.py
+```
+
+### 第二步，安装MetaInfer
 ```bash
 git clone https://github.com/MetaInfer/MetaInfer.git
 cd MetaInfer
@@ -96,4 +143,22 @@ python -m metainfer.server.app
 
 MIT
 
+## 学术研究
+
+MetaInfer的最初想法和实验数据已经公开在https://arxiv.org/abs/2607.12875，相关代码位于`arxiv-paper`分支。
+
+引用信息：
+```
+@misc{miao2026metainferknowledgellminference,
+      title={MetaInfer: A Knowledge Only LLM Inference Engine Generator SKILL Toolbox}, 
+      author={Zhenwen Miao and Honglin Wang and Mingheng Mi},
+      year={2026},
+      eprint={2607.12875},
+      archivePrefix={arXiv},
+      primaryClass={cs.MA},
+      url={https://arxiv.org/abs/2607.12875}, 
+}
+```
+
+## 如何贡献
 架构细节、设计理念和新任务类型添加方法见 [CONTRIBUTING.md](CONTRIBUTING.md)。

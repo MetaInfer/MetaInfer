@@ -964,8 +964,9 @@ window.location or URL query parameters. The page is served inside an
 <iframe> at a path-based URL (no ?task_id= in the query string).
 Use this pattern at the top of your <script>:
 
-  const TASK_ID = "{task_id}";
-  const COMPUTE_URL = "{compute_url}";
+  // Fall back to server-injected globals if you forgot to hardcode.
+  const TASK_ID = "{task_id}" || window.METAINFER_TASK_ID;
+  const COMPUTE_URL = "{compute_url}" || window.METAINFER_COMPUTE_URL;
 
 Also listen for postMessage to detect the API base when embedded in
 the WebUI (copy this block exactly):

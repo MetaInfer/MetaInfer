@@ -177,9 +177,23 @@ def build_router(plugin):
         try:
             pid = launcher.start(task_id, requirements, sd, wd, extra_args=extra_args)
         except Exception as e:  # noqa: BLE001
-            # Spawn failed — keep the registration so the user can see
-            # the error in the UI, but mark as not running.
-            _tasks.update_task(task_id, pid=None, finished_at=time.time())
+            # Spawn failed — stamp orchestrator.pid with finished_at so
+            # launcher.status() reports not-running. Process state lives
+            # only in orchestrator.pid (SSOT); registry holds identity.
+            pf = sd / "orchestrator.pid"
+            try:
+                import json as _json
+                data = _json.dumps({
+                    "pid": None,
+                    "task_id": task_id,
+                    "finished_at": time.time(),
+                    "exit_hint": "spawn-failed",
+                }, indent=2)
+                tmp = pf.with_suffix(".tmp")
+                tmp.write_text(data, encoding="utf-8")
+                tmp.replace(pf)
+            except OSError:
+                pass
             raise HTTPException(500, detail={"error": f"spawn failed: {e!r}"})
         return {"task_id": task_id, "pid": pid,
                 "state_dir": str(sd), "workspace_dir": str(wd)}
@@ -228,9 +242,8 @@ def build_router(plugin):
             sd = _state_dir_for(entry)
             prior_run = _sr.read_run(sd) or {}
             tid = prior_run.get("task_id") or task_id
-            ttype = prior_run.get("task_type") or entry.type
             wd = _workspace_dir_for(entry)
-            summary = _sr.reset_state_dir(sd, wd, tid, ttype)
+            summary = _sr.reset_state_dir(sd, wd, tid)
             return {"ok": True, "action": "reset", **summary}
         raise HTTPException(400, f"unknown action: {action}")
 
@@ -337,7 +350,9 @@ def build_router(plugin):
             isinstance(hard, (int, float)) and used >= hard)
         tmp = budget_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        tmp.replace(budget_path)
+        from metainfer.server.filelock import lock_file
+        with lock_file(budget_path):
+            tmp.replace(budget_path)
         os.utime(budget_path)
         return task_token_budget(task_id)
 

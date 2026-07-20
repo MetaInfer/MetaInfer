@@ -58,7 +58,7 @@ def run_with_requirements(
     #   from .pipeline import Pipeline
     #
     #   store = StateStore(state_dir)
-    #   run, is_resume = store.init_or_resume(task_id, task_type)
+    #   run, is_resume = store.init_or_resume(task_id)
     #   agent_manager = setup_orchestrator(state_dir, task_id, [workspace_dir])
     #   pipeline = Pipeline(store, agent_manager, paths, req)
     #   try:

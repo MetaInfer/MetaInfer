@@ -50,12 +50,34 @@ def read_graph(workspace_dir: Path) -> Dict[str, Any]:
     return json.loads(graph_path.read_text(encoding="utf-8"))
 
 
-def read_viz(workspace_dir: Path) -> str:
-    """Return step4/viz.html as a string. Raises FileNotFoundError."""
+def read_viz(workspace_dir: Path, task_id: str) -> str:
+    """Return step4/viz.html with TASK_ID and COMPUTE_URL injected as a
+    server-side header script.  This guarantees correctness even if the
+    S4 agent ignored the prompt instruction to hardcode them (the agent
+    may try to parse window.location which always fails inside the
+    WebUI's path-routed iframe)."""
     viz_path = workspace_dir / "step4" / "viz.html"
     if not viz_path.exists():
         raise FileNotFoundError("viz.html not built yet")
-    return viz_path.read_text(encoding="utf-8")
+    html = viz_path.read_text(encoding="utf-8")
+    header = (
+        "<script>"
+        "window.METAINFER_TASK_ID = " + json.dumps(task_id) + ";"
+        "window.METAINFER_COMPUTE_URL = " + json.dumps(
+            f"/api/calc-theoretical-value/{task_id}/calc/compute"
+        ) + ";"
+        "</script>"
+    )
+    # Insert right after <head> or <html>, before any agent-written
+    # <script> that tries to parse window.location for task_id.
+    import re
+    if re.search(r"<head[^>]*>", html, re.IGNORECASE):
+        html = re.sub(r"(<head[^>]*>)", r"\1\n" + header, html, count=1, flags=re.IGNORECASE)
+    elif re.search(r"<html[^>]*>", html, re.IGNORECASE):
+        html = re.sub(r"(<html[^>]*>)", r"\1\n" + header, html, count=1, flags=re.IGNORECASE)
+    else:
+        html = header + html
+    return html
 
 
 def read_summary(workspace_dir: Path) -> Dict[str, Any]:

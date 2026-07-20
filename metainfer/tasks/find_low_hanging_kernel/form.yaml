@@ -1,0 +1,49 @@
+# Question bank for the `find-low-hanging-kernel` task type.
+# This task takes a Chrome tracing profile + a model directory + an inference
+# framework source tree and builds an auditable execution-flow graph that
+# highlights the kernels with the most optimization headroom.
+
+- key: trace_file
+  question: "Path to the Chrome tracing file produced by the inference framework (.json or .json.gz). This is the raw profile — a deterministic parser extracts kernel stats; the analysis agents never read this file directly."
+  header: "Trace file"
+  required: true
+  form: file
+
+- key: model_dir
+  question: "Path to the model directory. Must contain config.json (architecture + quantization params) and the weight files (the parser reads weight names + dtypes + shapes from the index). READ-ONLY: this task will never modify model files."
+  header: "Model dir"
+  required: true
+  form: file
+
+- key: framework_source_dir
+  question: "Path to the inference framework source tree that produced the trace. Agents will read this to map kernel names to source locations. READ-ONLY: this task will never modify framework source."
+  header: "Framework src"
+  required: true
+  form: file
+
+- key: cli_args_and_env
+  question: "Framework CLI args + env vars at launch time (free-form text, e.g. `--tp 2 --enable-cuda-graph` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`). Critical for resolving which code path actually ran, TP-affected tensor shapes, and CUDA Graph capture."
+  header: "CLI + env"
+  required: false
+  form: textarea
+  default: ""
+
+- key: startup_log
+  question: "Path to the framework startup log file (optional). Helps the runtime-tracer agent confirm which kernels / paths were actually instantiated at launch."
+  header: "Startup log"
+  required: false
+  form: file
+
+- key: max_validator_rounds
+  question: "Maximum number of Step 3 graph-validation rounds before we accept the best-effort graph and proceed to visualization."
+  header: "Max rounds"
+  required: false
+  form: number
+  default: 5
+
+- key: token_budget_max_cost_usd
+  question: "Token-cost budget cap in USD (optional). When the running total crosses this limit the task soft-aborts at the next phase boundary. Leave blank for unlimited."
+  header: "Cost cap"
+  required: false
+  form: number
+  default: ""
