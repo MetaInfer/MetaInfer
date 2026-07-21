@@ -46,6 +46,16 @@
   min: 0
   step: 1
 
+- key: enable_phase_a
+  question: "Start with Phase A (pure KB attempt)? Phase A tries to generate the framework using only existing notebook knowledge, without open-source code. If disabled, the task starts directly from Phase B (enrich with open-source exploration)."
+  header: "Enable Phase A"
+  required: false
+  type: select
+  default: "Yes"
+  options:
+    - label: "Yes"
+    - label: "No"
+
 - key: max_iterations
   question: "Maximum number of total evolution iterations across all phases (A/B/C/D). Each iteration is one attempt at a phase — plan, implement, test, and review. When this limit is reached, the evolution stops gracefully."
   header: "Max rounds"

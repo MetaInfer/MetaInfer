@@ -20,6 +20,7 @@ from metainfer.orchestrator._bootstrap import (
     write_pid_file,
 )
 from metainfer.orchestrator.paths import repo_root as _repo_root
+from metainfer.orchestrator.requirements import req_field, req_field_int
 from metainfer.orchestrator.state import StateStore
 
 from .pipeline import EvolutionConfig, EvolutionOrchestrator
@@ -51,29 +52,23 @@ def _task_subdirs(state_dir: Path) -> Dict[str, Path]:
 
 
 def _extract_max_iter(req: Dict[str, Any], default: int = 20) -> int:
-    """Extract max_iterations from requirements, with fallbacks."""
-    try:
-        val = req.get("max_iterations")
-        if val is None:
-            val = req.get("form", {}).get("max_iterations")
-        if val is None:
-            return default
-        return int(val)
-    except (TypeError, ValueError):
-        return default
+    """Extract max_iterations from requirements via SSOT helper."""
+    return req_field_int(req, "max_iterations", default) or default
 
 
 def _extract_max_verify_attempts(req: Dict[str, Any]) -> int:
-    """Extract max_verify_attempts from requirements, with fallbacks."""
-    try:
-        val = req.get("max_verify_attempts")
-        if val is None:
-            val = req.get("form", {}).get("max_verify_attempts")
-        if val is None:
-            return 3
-        return int(val)
-    except (TypeError, ValueError):
-        return 3
+    """Extract max_verify_attempts from requirements via SSOT helper."""
+    return req_field_int(req, "max_verify_attempts", 3) or 3
+
+
+def _extract_enable_phase_a(req: Dict[str, Any]) -> bool:
+    """Extract enable_phase_a from requirements via SSOT helper."""
+    val = req_field(req, "enable_phase_a")
+    if val is None:
+        return True
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() not in ("no", "false", "0")
 
 
 def run_with_requirements(
@@ -140,6 +135,7 @@ def run_with_requirements(
     resolved_max_verify = max_verify_attempts
     if resolved_max_verify is None:
         resolved_max_verify = _extract_max_verify_attempts(req)
+    enable_phase_a = _extract_enable_phase_a(req)
     if extra_claude_args is None:
         extra_claude_args = []
 
@@ -156,6 +152,7 @@ def run_with_requirements(
         logs_root=logs_root,
         max_iterations=resolved_max_iter,
         max_verify_attempts=resolved_max_verify,
+        enable_phase_a=enable_phase_a,
         claude_bin=claude_bin,
         model=model,
         permission_mode=permission_mode,

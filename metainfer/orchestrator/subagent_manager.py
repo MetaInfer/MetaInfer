@@ -360,6 +360,11 @@ class SubAgentManager:
             handle = AgentHandle(spec=spec, attempt=attempt)
             with self._ctrl_lock:
                 self._handles[spec.name] = handle
+                # Clear any stale result from a previous agent with the
+                # same name (e.g. B-phase result when D-phase re-launches
+                # "iter1-implementer"). Otherwise health() returns "done"
+                # from the old result while the new agent is running.
+                self._results.pop(spec.name, None)
             self._write_status(spec, handle, None, attempt, phase="starting")
             # Surface the new agent to the WebUI immediately so the
             # Live Agents panel reflects the start without waiting for
@@ -387,6 +392,7 @@ class SubAgentManager:
                     )
                 handle.process = proc
                 self._write_status(spec, handle, None, attempt, phase="running")
+                self.dump_snapshot()
 
                 # drain stdout on a thread (stream-json is line-delimited JSON)
                 stop_evt = threading.Event()

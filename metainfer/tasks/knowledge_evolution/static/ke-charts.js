@@ -1,12 +1,15 @@
 // Per-iteration mini-chart tiles for knowledge-evolution tasks.
-// Renders Chart.js line charts for iteration duration and perf metrics
+// Renders Chart.js line charts for oracle perf metrics
 // (e.g. oracle_cases_passed) using vendored Chart.js v4.4.1.
 
 import { html } from "htm/preact";
 import { useEffect, useRef } from "preact/hooks";
-import { Chart, registerables } from "chart.js";
+import {
+  Chart, LineController, LineElement, PointElement,
+  LinearScale, CategoryScale, Title, Tooltip, Legend, Filler,
+} from "chart.js";
 
-Chart.register(...registerables);
+Chart.register(LineController, LineElement, PointElement, LinearScale, CategoryScale, Title, Tooltip, Legend, Filler);
 
 const PALETTE = ["#58a6ff", "#3fb950", "#d29922", "#f778ba", "#a371f7", "#79c0ff"];
 
@@ -48,7 +51,7 @@ function miniChartOptions(color, yLabel) {
   };
 }
 
-export function Charts({ payload }) {
+export function Charts({ payload, iterations }) {
   const gridRef = useRef(null);
   const chartsRef = useRef({});
 
@@ -79,7 +82,7 @@ export function Charts({ payload }) {
       if (!key || !charts[key]) orphan.remove();
     }
 
-    const wanted = new Set(["duration"]);
+    const wanted = new Set();
     (payload.perf_series || []).forEach((s) => wanted.add(s.metric));
 
     // Drop tiles for disappeared metrics.
@@ -119,12 +122,6 @@ export function Charts({ payload }) {
       return chart;
     }
 
-    const dur = ensure("duration", "Iteration duration (s)", "#d29922", "seconds");
-    dur.data.datasets[0].data = (payload.durations || []).map(
-      (d) => ({ x: d.x, y: d.y }),
-    );
-    dur.update();
-
     (payload.perf_series || []).forEach((s, i) => {
       const color = PALETTE[i % PALETTE.length];
       const ch = ensure(s.metric, s.metric, color);
@@ -135,15 +132,28 @@ export function Charts({ payload }) {
     });
   }, [payload]);
 
-  const empty = !payload
-    || (!payload.durations?.length && !payload.perf_series?.length);
+  const hasCharts = payload && payload.perf_series && payload.perf_series.length > 0;
+
+  // Count oracle evaluations from iterations
+  const totalIterations = (iterations || []).length;
+  const oracleEvals = (iterations || []).filter((it) => {
+    const p = it.phases || {};
+    return ["A_attempt_pure", "B_enrich", "D_verify_final"].some((k) => p[k]);
+  }).length;
 
   return html`
     <div class="charts-panel">
-      ${empty
-        ? html`<p class="muted">No oracle data yet. Tiles appear after the
-            oracle validates generated framework code.</p>`
-        : null}
+      ${!hasCharts ? html`
+        <div class="ke-stats-bar">
+          <span class="ke-stat"><strong>${totalIterations}</strong> iteration${totalIterations !== 1 ? "s" : ""}</span>
+          <span class="ke-stat"><strong>${oracleEvals}</strong> oracle eval${oracleEvals !== 1 ? "s" : ""}</span>
+          ${totalIterations > 0 && oracleEvals === 0 ? html`
+            <span class="muted" style="font-size:11px">— charts appear after first passing oracle run</span>
+          ` : oracleEvals > 0 ? html`
+            <span class="muted" style="font-size:11px">— no metrics collected (oracle didn't pass)</span>
+          ` : null}
+        </div>
+      ` : null}
       <div class="charts-grid" ref=${gridRef}></div>
     </div>
   `;

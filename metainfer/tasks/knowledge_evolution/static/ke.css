@@ -98,6 +98,140 @@
     font-size: 12px;
 }
 
+/* ---- Knowledge Gained: two-section layout ---- */
+.knowledge-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.knowledge-section h3 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted, #7d8794);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.knowledge-section-header {
+    padding: 4px 0;
+    user-select: none;
+}
+.knowledge-section-header:hover h3 {
+    color: var(--fg, #c9d1d9);
+}
+.ke-expand-arrow {
+    font-size: 12px;
+    color: var(--muted, #7d8794);
+    width: 14px;
+    text-align: center;
+}
+
+/* ---- Architecture key points ---- */
+.arch-key-points {
+    margin: 2px 0 6px;
+    padding-left: 18px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--fg, #c9d1d9);
+}
+.arch-key-points li {
+    margin-bottom: 2px;
+}
+
+/* ---- Architecture detail (expandable) ---- */
+.arch-detail {
+    margin-top: 8px;
+    max-height: 360px;
+    overflow-y: auto;
+    border: 1px solid var(--border, #2a323d);
+    border-radius: 4px;
+    background: var(--bg, #0d1117);
+}
+.arch-text {
+    margin: 0;
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--fg, #c9d1d9);
+}
+
+/* ---- View Detail / Collapse button ---- */
+.btn-detail {
+    padding: 2px 8px;
+    font-size: 11px;
+    background: transparent;
+    border: 1px solid var(--border, #2a323d);
+    border-radius: 4px;
+    color: var(--accent, #58a6ff);
+    cursor: pointer;
+}
+.btn-detail:hover {
+    background: rgba(88, 166, 255, 0.1);
+}
+
+/* ---- Code detail modal ---- */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+}
+.modal-content {
+    background: var(--bg, #0d1117);
+    border: 1px solid var(--border, #2a323d);
+    border-radius: 8px;
+    max-width: 90vw;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+.modal-code {
+    width: 760px;
+}
+.modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border, #2a323d);
+    background: var(--bg-elev, #161b22);
+}
+.modal-title {
+    font-size: 13px;
+    font-weight: 600;
+}
+.modal-close {
+    background: none;
+    border: none;
+    font-size: 20px;
+    color: var(--muted, #7d8794);
+    cursor: pointer;
+    padding: 0 4px;
+}
+.modal-close:hover {
+    color: var(--fg, #c9d1d9);
+}
+.modal-body {
+    overflow-y: auto;
+    padding: 12px 14px;
+}
+.code-block {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-x: auto;
+    background: var(--bg, #0d1117);
+    color: var(--fg, #c9d1d9);
+}
+
 /* ---- Log viewer ---- */
 .log-viewer {
     margin-top: 12px;
@@ -125,8 +259,8 @@
     overflow-y: auto;
     margin: 0;
     padding: 12px;
-    background: #0d1117;
-    color: #c9d1d9;
+    background: var(--bg, #0d1117);
+    color: var(--fg, #c9d1d9);
     font-size: 12px;
     line-height: 1.5;
     white-space: pre-wrap;
@@ -189,6 +323,9 @@
     border-bottom: 1px solid var(--border, #2a323d);
     vertical-align: middle;
 }
+.ke-oracle-table tr.oracle-running td {
+    opacity: 0.85;
+}
 .ke-oracle-table tr:hover {
     background: var(--bg-elev, #161b22);
 }
@@ -226,6 +363,88 @@
     height: 180px;
     position: relative;
 }
+.ke-stats-bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 6px 4px;
+    font-size: 13px;
+}
+.ke-stat {
+    color: var(--fg, #c9d1d9);
+}
+.ke-stat strong {
+    color: var(--accent, #58a6ff);
+}
 .charts-panel .muted {
     padding: 8px 0;
+}
+
+/* ---- Inline error badge ---- */
+.ke-panel-err {
+    font-size: 11px;
+    cursor: pointer;
+    vertical-align: middle;
+    margin-left: 6px;
+}
+.ke-panel-err:hover {
+    opacity: 0.8;
+}
+
+/* ---- Iteration detail inline ---- */
+.iter-detail-inline {
+    margin-top: 12px;
+    border: 1px solid var(--border, #2a323d);
+    border-radius: 6px;
+    overflow: hidden;
+}
+.iter-detail-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--bg-elev, #161b22);
+    border-bottom: 1px solid var(--border, #2a323d);
+    flex-wrap: wrap;
+}
+.iter-detail-section {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border, #2a323d);
+}
+.iter-detail-section:last-child {
+    border-bottom: none;
+}
+.iter-detail-section h4 {
+    margin: 0 0 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted, #7d8794);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+/* ---- Sub-agent card ---- */
+.sa-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.sa-card {
+    border: 1px solid var(--border, #2a323d);
+    border-radius: 4px;
+    padding: 6px 10px;
+}
+.sa-card-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.sa-summary {
+    margin-top: 4px;
+}
+
+/* ---- Oracle cases inline ---- */
+.oracle-cases {
+    overflow-x: auto;
 }

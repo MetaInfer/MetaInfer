@@ -24,6 +24,24 @@ export async function getKnowledgeGained(taskId) {
     return resp.json();
 }
 
+export async function getModelCode(taskId) {
+    const resp = await fetch(`${TASK_BASE(taskId)}/model-code`);
+    if (!resp.ok) throw new Error(`GET model-code failed: ${resp.status}`);
+    return resp.json();
+}
+
+export async function getModelCodeFile(taskId, iteration, file) {
+    const resp = await fetch(`${TASK_BASE(taskId)}/model-code-file?iteration=${iteration}&file=${encodeURIComponent(file)}`);
+    if (!resp.ok) throw new Error(`GET model-code-file failed: ${resp.status}`);
+    return resp.json();
+}
+
+export async function getIterationDetail(taskId, iteration) {
+    const resp = await fetch(`${TASK_BASE(taskId)}/iterations/${iteration}/detail`);
+    if (!resp.ok) throw new Error(`GET iteration-detail failed: ${resp.status}`);
+    return resp.json();
+}
+
 export async function getOracleReport(taskId, iteration) {
     const resp = await fetch(`${TASK_BASE(taskId)}/iterations/${iteration}/oracle-report`);
     if (!resp.ok) throw new Error(`GET oracle-report failed: ${resp.status}`);

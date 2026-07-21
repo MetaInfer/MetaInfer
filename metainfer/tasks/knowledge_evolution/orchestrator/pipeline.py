@@ -6,7 +6,7 @@ pattern. Phase C is unique to knowledge-evolution (consolidator).
 
 Loop shape::
 
-    phase = "A_attempt_pure"
+    phase = initial_phase()  # A_attempt_pure or B_enrich depending on config
     while not terminal(phase):
         if no open iteration folder: open one
         outcome = run_phase(phase, ...)
@@ -71,7 +71,9 @@ class IterationRecord:
     closed_at: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("closed_at", None)  # runtime-only, never persisted
+        return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "IterationRecord":
@@ -127,10 +129,12 @@ class EvolutionConfig:
     max_verify_attempts: int = 3
     plan_timeout_s: int = 1800
     impl_timeout_s: int = 3600
+    impl_timeout_s_phase_a: int = 2400
     review_timeout_s: int = 1800
     retro_timeout_s: int = 900
     stuck_timeout_s: int = 600
     max_c_retries: int = MAX_C_RETRIES
+    enable_phase_a: bool = True
     claude_bin: str = "ccb"
     model: Optional[str] = None
     permission_mode: str = "bypassPermissions"
@@ -157,16 +161,6 @@ class EvolutionOrchestrator:
         self.req = req
         self.store = store
         self.cfg = cfg
-
-    # ---- agent_status file (KE-private, avoids touching shared RunStatus) ----
-
-    def _set_agent_status(self, status: Optional[str]) -> None:
-        """Persist current agent activity so the WebUI can show a live pill."""
-        path = self.store.task_dir / "agent_status"
-        if status:
-            path.write_text(status.strip(), encoding="utf-8")
-        elif path.exists():
-            path.unlink()
         self.manager = manager or SubAgentManager(
             claude_bin=cfg.claude_bin,
             default_model=cfg.model,
@@ -182,14 +176,38 @@ class EvolutionOrchestrator:
         self._stop = False
         self.nooped = False
 
+    # ---- agent_status file (KE-private, avoids touching shared RunStatus) ----
+
+    def _set_agent_status(self, status: Optional[str]) -> None:
+        """Persist current agent activity so the WebUI can show a live pill."""
+        path = self.store.task_dir / "agent_status"
+        if status:
+            path.write_text(status.strip(), encoding="utf-8")
+        elif path.exists():
+            path.unlink()
+
+    def _initial_phase(self) -> P.Phase:
+        """Return the starting phase: A_attempt_pure if enabled, else B_enrich."""
+        if self.cfg.enable_phase_a:
+            return "A_attempt_pure"
+        return "B_enrich"
+
+    def _impl_timeout_for(self, phase: P.Phase) -> int:
+        """Return the implementer/oracle timeout for *phase*.
+
+        Phase A has a shorter timeout because it works without open-source
+        reference code — expected to fail fast and move on to B_enrich.
+        """
+        if phase == "A_attempt_pure":
+            return self.cfg.impl_timeout_s_phase_a
+        return self.cfg.impl_timeout_s
+
     # ---- Main entry ----
 
     def run(self) -> None:
         """Execute the state machine to completion (or until stopped)."""
         task_id = self.req.get("task_id", "task")
-        _, is_resume = self.store.init_or_resume(
-            task_id=task_id, task_type=self.req.get("task_type", "unknown"),
-        )
+        _, is_resume = self.store.init_or_resume(task_id=task_id)
 
         resume_from: Optional[Dict[str, Any]] = None
         if is_resume:
@@ -251,7 +269,7 @@ class EvolutionOrchestrator:
                 "iteration_interrupted",
                 {"iteration": discarded, "reason": reason},
             )
-            start_phase = (old_rec.start_phase if old_rec else "A_attempt_pure") or "A_attempt_pure"
+            start_phase = (old_rec.start_phase if old_rec else self._initial_phase()) or self._initial_phase()
             iter_num = discarded
             carried_failure = None
             last_outcome: Optional[P.Outcome] = None
@@ -272,11 +290,11 @@ class EvolutionOrchestrator:
                     carried_failure = prev_rec.failure_reason
                     last_outcome = prev_rec.outcome
                 else:
-                    start_phase = "A_attempt_pure"
+                    start_phase = self._initial_phase()
                     carried_failure = None
                     last_outcome = prev_rec.outcome
             else:
-                start_phase = "A_attempt_pure"
+                start_phase = self._initial_phase()
                 carried_failure = None
                 last_outcome = None
 
@@ -287,11 +305,10 @@ class EvolutionOrchestrator:
             "last_outcome": last_outcome,
         }
 
-    @staticmethod
-    def _phase_after(rec: IterationRecord) -> P.Phase:
+    def _phase_after(self, rec: IterationRecord) -> P.Phase:
         """Determine the starting phase after a previous iteration record."""
         if rec.outcome == P.OK:
-            return "A_attempt_pure"
+            return self._initial_phase()
         return "B_enrich"
 
     def _loop(self, resume_from: Optional[Dict[str, Any]] = None) -> None:
@@ -305,7 +322,7 @@ class EvolutionOrchestrator:
             ctx.failure = resume_from.get("carried_failure")
             ctx.last_outcome = resume_from.get("last_outcome")
         else:
-            phase: P.Phase = "A_attempt_pure"
+            phase: P.Phase = self._initial_phase()
             iter_num = 0
 
         iter_dir: Optional[Path] = None
@@ -395,26 +412,12 @@ class EvolutionOrchestrator:
                         break
 
                 if phase == "D_verify_final":
-                    ctx.verify_failures += 1
-                    self.store.append_timeline(
-                        "verify_escalation",
-                        {"iteration": iter_num, "verify_failures": ctx.verify_failures},
-                    )
-                    max_va = self._resolve_max_verify_attempts()
-                    if ctx.verify_failures >= max_va:
+                    if self._halt_if_verify_exhausted(
+                        ctx, iter_rec,
+                        timeline_event="verify_escalation",
+                        outcome=outcome,
+                    ):
                         final_status = "halted"
-                        self.store.append_timeline(
-                            "evolution_halted",
-                            {"reason": "max_verify_attempts exceeded",
-                             "verify_failures": ctx.verify_failures,
-                             "limit": max_va},
-                        )
-                        self._close_iteration(
-                            iter_rec, status="failed",
-                            failure=f"D_verify_final failed {ctx.verify_failures} times (limit {max_va}); halting evolution.",
-                            perf=ctx.this_iter_perf,
-                            outcome=outcome,
-                        )
                         phase = "finished"
                         break
 
@@ -432,7 +435,7 @@ class EvolutionOrchestrator:
                 elif phase == "D_verify_final":
                     phase = "B_enrich"
                 else:
-                    phase = "A_attempt_pure"
+                    phase = "B_enrich"
                 self._set_agent_status(f"retrying: {phase}")
                 continue
 
@@ -449,7 +452,7 @@ class EvolutionOrchestrator:
                 ctx.last_outcome = outcome
                 iter_dir = None
                 iter_rec = None
-                phase = "A_attempt_pure"
+                phase = "B_enrich"
                 self._set_agent_status(f"retrying: {phase}")
                 continue
 
@@ -477,12 +480,11 @@ class EvolutionOrchestrator:
             )
             self._set_agent_status(None)
 
-            # ---- spawn Failure Analyst on A/D failures ------------------ #
-            if (
-                phase in ("A_attempt_pure", "D_verify_final")
-                and outcome == P.LOGIC_FAIL
-                and failure
-            ):
+            # ---- spawn Failure Analyst on failed oracle phases ---------- #
+            # Any phase whose oracle found a failure gets distilled into
+            # notebooks/06_experience and 08_issues/ so the knowledge
+            # gained (even failed knowledge) persists across iterations.
+            if failure and outcome in (P.LOGIC_FAIL, P.INFRA_FAIL):
                 self._spawn_failure_analyst(
                     iter_num, iter_dir, failure,
                     source_open=(phase == "B_enrich"),
@@ -490,26 +492,12 @@ class EvolutionOrchestrator:
 
             # ---- verify failure counter (D_verify_final → D_verify_final) - #
             if phase == "D_verify_final" and outcome == P.LOGIC_FAIL:
-                ctx.verify_failures += 1
-                self.store.append_timeline(
-                    "verify_failure",
-                    {"iteration": iter_num, "verify_failures": ctx.verify_failures},
-                )
-                max_va = self._resolve_max_verify_attempts()
-                if ctx.verify_failures >= max_va:
+                if self._halt_if_verify_exhausted(
+                    ctx, iter_rec,
+                    timeline_event="verify_failure",
+                    outcome=outcome,
+                ):
                     final_status = "halted"
-                    self.store.append_timeline(
-                        "evolution_halted",
-                        {"reason": "max_verify_attempts exceeded",
-                         "verify_failures": ctx.verify_failures,
-                         "limit": max_va},
-                    )
-                    self._close_iteration(
-                        iter_rec, status="failed",
-                        failure=f"D_verify_final failed {ctx.verify_failures} times (limit {max_va}); halting evolution.",
-                        perf=ctx.this_iter_perf,
-                        outcome=outcome,
-                    )
                     iter_dir = None
                     iter_rec = None
                     phase = "finished"
@@ -632,7 +620,7 @@ class EvolutionOrchestrator:
             iteration=iter_num,
             iter_dir=iter_dir,
             prompt=impl_prompt,
-            timeout=self.cfg.impl_timeout_s,
+            timeout=self._impl_timeout_for(phase),
             resume_session_id=ctx.b_session_id,
         )
         if sid:
@@ -645,7 +633,7 @@ class EvolutionOrchestrator:
         # ---- Step 3: Oracle (with c_debugger repair loop) -------------- #
         self._set_agent_status("running: oracle")
         c_outcome, c_perf, c_failure = self._run_oracle_step(
-            iter_num, iter_dir, ctx, phase_label, source_open,
+            iter_num, iter_dir, ctx, phase, source_open,
         )
 
         # ---- Step 4: Review (post-oracle, advisory only) --------------- #
@@ -697,12 +685,14 @@ class EvolutionOrchestrator:
         iter_num: int,
         iter_dir: Path,
         ctx: IterationContext,
-        phase_label: str,
+        phase: P.Phase,
         source_open: bool,
     ) -> Tuple[P.Outcome, Optional[Dict[str, float]], Optional[str]]:
         """Run the correctness oracle, with a c_debugger repair loop on failure."""
         oracle = InferFrameworkOracle()
         logs_dir = self._logs_dir_for(iter_num)
+        phase_label = P.phase_label(phase)
+        impl_timeout = self._impl_timeout_for(phase)
         max_attempts = max(1, int(self.cfg.max_c_retries))
         last_outcome: Optional[P.Outcome] = None
         last_perf: Optional[Dict[str, float]] = None
@@ -722,7 +712,7 @@ class EvolutionOrchestrator:
 
             t_start = time.time()
             outcome, perf, failure = self._run_oracle_once(
-                iter_num, iter_dir, ctx, oracle,
+                iter_num, iter_dir, ctx, oracle, impl_timeout,
             )
             last_outcome, last_perf, last_failure = outcome, perf, failure
             attempt_duration = time.time() - t_start
@@ -800,7 +790,7 @@ class EvolutionOrchestrator:
                 iteration=iter_num,
                 iter_dir=iter_dir,
                 prompt=prompt,
-                timeout=self.cfg.impl_timeout_s,
+                timeout=impl_timeout,
                 resume_session_id=c_session_id,
             )
             if sid:
@@ -901,6 +891,7 @@ class EvolutionOrchestrator:
         iter_dir: Path,
         ctx: IterationContext,
         oracle: InferFrameworkOracle,
+        timeout_s: int,
     ) -> Tuple[P.Outcome, Optional[Dict[str, float]], Optional[str]]:
         """Run the correctness oracle once against the code in iter_dir."""
         report_dir = self._logs_dir_for(n)
@@ -912,7 +903,7 @@ class EvolutionOrchestrator:
         try:
             result = oracle.run(
                 iter_dir=iter_dir, req=self.req, report_dir=report_dir,
-                timeout_s=self.cfg.impl_timeout_s, manager=self.manager,
+                timeout_s=timeout_s, manager=self.manager,
             )
         except Exception as exc:
             err = f"oracle exception: {exc!r}"
@@ -1090,6 +1081,43 @@ class EvolutionOrchestrator:
             "phase_start",
             {"iteration": iter_num, "phase": phase, "label": P.phase_label(phase)},
         )
+
+    def _halt_if_verify_exhausted(
+        self,
+        ctx: IterationContext,
+        iter_rec: IterationRecord,
+        *,
+        timeline_event: str,
+        outcome: P.Outcome,
+    ) -> bool:
+        """Increment verify_failures and halt evolution if limit exceeded.
+
+        Returns True when evolution was halted (caller must ``break`` out
+        of the main loop), False otherwise.
+        """
+        ctx.verify_failures += 1
+        max_va = self._resolve_max_verify_attempts()
+        self.store.append_timeline(
+            timeline_event,
+            {"iteration": iter_rec.iteration,
+             "verify_failures": ctx.verify_failures},
+        )
+        if ctx.verify_failures >= max_va:
+            self.store.append_timeline(
+                "evolution_halted",
+                {"reason": "max_verify_attempts exceeded",
+                 "verify_failures": ctx.verify_failures,
+                 "limit": max_va},
+            )
+            self._close_iteration(
+                iter_rec, status="failed",
+                failure=f"D_verify_final failed {ctx.verify_failures} times "
+                        f"(limit {max_va}); halting evolution.",
+                perf=ctx.this_iter_perf,
+                outcome=outcome,
+            )
+            return True
+        return False
 
     def _close_iteration(
         self,

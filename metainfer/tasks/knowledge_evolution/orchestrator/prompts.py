@@ -55,14 +55,56 @@ You are building a framework FROM SCRATCH. The following are STRICTLY FORBIDDEN:
 
 If you find yourself wanting to "see how vLLM does it" — STOP. Re-read the
 relevant notebooks/ entry instead; if none exists, design it from first
-principles. A correct, original implementation is always the goal."""
+principles. A correct, original implementation is always the goal.
+
+# CRITICAL: no delegation to pre-built models or external processes
+
+The following cheating patterns are ALSO forbidden — the model graph AND
+the forward pass MUST be your own code:
+
+5. **No HuggingFace model-loading APIs.** Do NOT call any of these:
+   - `AutoModelForCausalLM.from_pretrained()` / `AutoModel.from_pretrained()`
+   - `AutoConfig.from_pretrained()` for model architecture
+   - `pipeline()` / `TextGenerationPipeline`
+   - `PreTrainedModel`, `GenerationMixin`, or any `transformers` modeling class
+   - `from_pretrained()` on ANY class from any library
+   **You MAY use** `AutoTokenizer.from_pretrained()` — tokenization is a
+   data-prep step, not model execution. You MAY read `config.json` from the
+   model directory to get architecture parameters (hidden_size, num_layers,
+   etc.), but you must build the model graph yourself from those numbers.
+
+6. **No wrapping external inference processes.** Do NOT:
+   - Start vLLM / TGI / llama.cpp / Ollama as a subprocess and forward requests
+   - Shell out to any inference server via `subprocess` / `os.system` / `popen`
+   - Connect to a pre-existing inference endpoint on localhost or any other host
+   Your `serve.sh` must start a Python process whose model graph YOU wrote.
+
+7. **No downloading or importing third-party inference code.** Do NOT:
+   - `pip install` any inference package beyond the allowed primitives above
+   - `git clone` an inference repo and import from it
+   - `torch.hub.load()` or `torch.load()` a pre-built model graph
+   - `import transformers` (except tokenizers) or any other modeling library
+   - Read or import from `~/.cache/huggingface/` or `site-packages/`
+
+If you're tempted to take a shortcut — DON'T. The whole point of this task
+is to LEARN the architecture and RE-IMPLEMENT it. A ~100-line wrapper around
+someone else's model teaches nothing and wastes the iteration."""
 
 FRAMEWORK_REFERENCE_ALLOWED = """# Open-source code access: ALLOWED
 You MAY read open-source inference framework source code (vLLM, SGLang,
-TensorRT-LLM, etc.) to understand how the target model is implemented.
-However, you MUST still produce original code — do not copy-paste entire
-files. Your goal is to LEARN patterns and RE-IMPLEMENT them, then distill
-the reusable knowledge into notebooks/."""
+TensorRT-LLM, HuggingFace transformers, etc.) to understand how the target
+model is implemented. However, you MUST still produce original code — do not
+copy-paste entire files. Your goal is to LEARN patterns and RE-IMPLEMENT
+them, then distill the reusable knowledge into notebooks/.
+
+**Even with source access, these shortcuts are STILL FORBIDDEN:**
+- `AutoModelForCausalLM.from_pretrained()` / `AutoModel.from_pretrained()` or any `from_pretrained()` model loader
+- `pipeline()`, `TextGenerationPipeline`, or any pre-built generation wrapper
+- Wrapping an external inference server (vLLM subprocess, etc.)
+- `torch.hub.load()` a pre-built model
+
+Tokenizers (`AutoTokenizer.from_pretrained()`) and reading `config.json` for
+architecture parameters ARE allowed. You must build the model graph yourself."""
 
 CORRECTNESS_ONLY_GOAL = """# Goal: correctness only (NOT performance)
 
@@ -722,9 +764,9 @@ The knowledge base to update is at: `{notebooks_dir}`
    Write `knowledge_delta.json` listing all files created or modified.
 
 ## Output
-After completion, create a file `{log_dir}/result.json` with:
+After completion, create a file `{log_dir}/consolidation.json` with:
 ```json
-{{"status": "pass"|"fail", "files_written": [<list of paths>], "summary": "<brief>"}}
+{{"status": "pass"|"fail", "files": [<list of paths>], "summary": "<brief>"}}
 ```
 
 Logs directory (for tool outputs): `{log_dir}`
@@ -790,9 +832,9 @@ The knowledge base to update is at: `{notebooks_dir}`
    patterns, what to look for), write to `{notebooks_dir}/06_experience/`.
 
 ## Output
-After completion, create a file `{log_dir}/result.json` with:
+After completion, create a file `{log_dir}/consolidation.json` with:
 ```json
-{{"status": "pass"|"fail", "files_written": [<list>], "root_cause": "<brief>", "summary": "<brief>"}}
+{{"status": "pass"|"fail", "files": [<list>], "root_cause": "<brief>", "summary": "<brief>"}}
 ```
 
 Logs directory (for tool outputs): `{log_dir}`

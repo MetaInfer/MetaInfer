@@ -124,9 +124,9 @@ TRANSITIONS: Dict[Tuple[Phase, Outcome], Transition] = {
     ("A_attempt_pure", INFRA_FAIL): Transition(
         from_phase="A_attempt_pure",
         on=INFRA_FAIL,
-        to_phase="A_attempt_pure",
-        label="retry",
-        carry_failure=False,
+        to_phase="B_enrich",
+        label="infra fail -> enrich",
+        carry_failure=True,
         consume_iteration=False,
     ),
     # B_enrich

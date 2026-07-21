@@ -51,12 +51,37 @@ def build_router(plugin) -> APIRouter:
         sd = state_dir_for(entry)
         return _state_readers.read_oracle_report(sd, iteration)
 
+    @router.get("/iterations/{iteration}/detail")
+    async def get_iteration_detail(task_id: str, iteration: int):
+        """Return detailed progress for an iteration (sub-agents, oracle cases, repairs)."""
+        entry = task_or_404(task_id)
+        sd = state_dir_for(entry)
+        return _state_readers.read_iteration_detail(sd, iteration)
+
     @router.get("/iterations/{iteration}/retrospective")
     async def get_retrospective(task_id: str, iteration: int):
         """Return the retrospective markdown for a given iteration."""
         entry = task_or_404(task_id)
         sd = state_dir_for(entry)
         return _state_readers.read_retrospective(sd, iteration)
+
+    @router.get("/model-code")
+    async def get_model_code(task_id: str):
+        """Return generated model code summary across all iterations."""
+        entry = task_or_404(task_id)
+        sd = state_dir_for(entry)
+        return _state_readers.read_model_knowledge(sd)
+
+    @router.get("/model-code-file")
+    async def get_model_code_file(
+        task_id: str,
+        iteration: int = Query(...),
+        file: str = Query(...),
+    ):
+        """Return the content of a single generated code file."""
+        entry = task_or_404(task_id)
+        sd = state_dir_for(entry)
+        return _state_readers.read_model_code_file(sd, iteration, file)
 
     @router.get("/knowledge-diff")
     async def get_knowledge_diff(

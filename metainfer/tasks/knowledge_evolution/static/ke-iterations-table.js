@@ -52,6 +52,7 @@ export function IterationsTable({ iterations, selectedN, onSelect }) {
         <td><strong>${n}</strong></td>
         <td>${phasePill(phase)}</td>
         <td><span class="pill ${status}">${status || "running"}</span></td>
+        <td>${(r.agent_status || "").replace("running: ", "") || "—"}</td>
         <td>${outcome || "—"}</td>
         <td>${fmtDur(r.duration_s, r.started_at)}</td>
         <td class="fail-reason">${r.failure_reason || ""}</td>
@@ -71,6 +72,7 @@ export function IterationsTable({ iterations, selectedN, onSelect }) {
             <th>#</th>
             <th>Phase</th>
             <th>Status</th>
+            <th>Agent</th>
             <th>Outcome</th>
             <th>Dur</th>
             <th>Failure</th>
