@@ -4,7 +4,7 @@
 >
 > 算子参考源码（实现事实来源）：`MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/qwen3_z200_kernels.hip.cpp`
 >
-> 模型数学与权重 shape：`MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/03_qwen3_8b_cpp_contract.md`
+> 模型数学与权重 shape：`MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/03_qwen3_8b_contract.md`
 
 ## 0. 核心约定：矩阵乘统一调用 hipBLAS
 
@@ -32,9 +32,12 @@ Qwen3-8B 中各算子的选择如下：
 
 | 模型算子 | 是否调用 hipBLAS | 实际入口 |
 | --- | --- | --- |
-| QKV projection | 是 | `qwen3_z200_q8_linear_fp32(M=T,N=6144,K=4096)` |
+| Q projection | 是 | `qwen3_z200_q8_linear_fp32(M=T,N=4096,K=4096)` |
+| K projection | 是 | `qwen3_z200_q8_linear_fp32(M=T,N=1024,K=4096)` |
+| V projection | 是 | `qwen3_z200_q8_linear_fp32(M=T,N=1024,K=4096)` |
 | O projection | 是 | `qwen3_z200_q8_linear_fp32(M=T,N=4096,K=4096)` |
-| gate-up projection | 是 | `qwen3_z200_q8_linear_fp32(M=T,N=24576,K=4096)` |
+| gate projection | 是 | `qwen3_z200_q8_linear_fp32(M=T,N=12288,K=4096)` |
+| up projection | 是 | `qwen3_z200_q8_linear_fp32(M=T,N=12288,K=4096)` |
 | down projection | 是 | `qwen3_z200_q8_linear_fp32(M=T,N=4096,K=12288)` |
 | LM Head | 是 | `qwen3_z200_q8_linear_fp32(M=1,N=151936,K=4096)` |
 | Embedding | 否 | Q8_0 查表 kernel，只解 token 对应行 |
@@ -54,7 +57,11 @@ Qwen3-8B 中各算子的选择如下：
 - hipBLAS 处理所有带权重的线性层；
 - 先保证 prefill/decode 数值正确，再优化 decode 性能。
 
-当前源码是**正确性参考 kernel**，不是最终高性能实现。它没有 GGUF loader、模型类、buffer allocator、采样器，也没有 fused Q8_0 GEMV。这些由生成的 C++ runtime 补齐。
+> **多并发实现覆盖说明：** 上述 `B=1` 是本算子参考实现的基线，不是多请求服务的实现方式。连续批处理必须以 `09_continuous_batching_contract.md` 为准：kernel 需要接收每个 row 的 `slot_id`/`position`，KV cache、scores 和 logits 必须按 slot/row 隔离；不能让多个 host 线程并发调用当前单序列 kernel。
+
+当前源码是**正确性参考 kernel**，不是最终高性能实现。它没有 GGUF loader、模型类、buffer allocator 或完整 sampling policy，也没有 fused Q8_0 GEMV。这些由生成的 C++ runtime 补齐。源码已经提供确定性 greedy argmax primitive，但 stop、temperature、top-k/top-p 和生成状态仍由外部 sampler/engine 管理。
+
+**首版执行决策：分别调用 Q/K/V 三个 linear，并分别调用 gate/up 两个 linear。** GGUF 本来就是这些独立权重，这样输出天然是 compact 多行 tensor，可直接连接当前 norm/KV/SwiGLU kernel。fused QKV/gate-up 只作为后续优化；在补齐第 6 节 helper 前不能用于 `T>1` prefill。
 
 ## 2. 全局张量布局和 dtype
 
@@ -63,11 +70,10 @@ Qwen3-8B 中各算子的选择如下：
 | 张量 | shape | 当前 dtype |
 | --- | --- | --- |
 | hidden state | `[T, H]` | FP32 |
-| fused QKV 输出 | `[T, 6144]` | FP32 |
 | compact Q | `[T, 32, 128]` | FP32 |
 | compact K/V | `[T, 8, 128]` | FP32 |
 | attention 输出 | `[T, 32, 128]`，字节上等价于 `[T,H]` | FP32 |
-| fused gate-up 输出 | `[T, 24576]` | FP32 |
+| compact gate/up | 各自 `[T, 12288]` | FP32 |
 | SwiGLU 输出 | `[T, 12288]` | FP32 |
 | 每层 K/V cache | `[max_seq_len, 8, 128]` | FP32 |
 | logits | `[1, 151936]` | FP32 |
@@ -109,6 +115,7 @@ FP32 hidden
 | `qwen3_z200_launch_kv_cache_write` | 连续写入一层 K/V cache | FP32 cache |
 | `qwen3_z200_launch_prefill_gqa_attention` | causal prefill GQA | FP32 `[T,H]` |
 | `qwen3_z200_launch_decode_gqa_attention` | 单 token decode GQA | FP32 `[H]` |
+| `qwen3_z200_launch_greedy_sample` | 对 device logits 做确定性 argmax | device `int32_t[1]` |
 | `qwen3_z200_launch_swiglu` | `silu(gate) * up` | FP32 `[T,I]` |
 | `qwen3_z200_launch_add` | 两个数组相加 | FP32 |
 | `qwen3_z200_launch_add_inplace` | 将 src 累加到 dst | 原地 FP32 |
@@ -220,9 +227,12 @@ if (st != HIPBLAS_STATUS_SUCCESS) {
 
 | 线性层 | M | N | K | 输出 shape |
 | --- | ---: | ---: | ---: | --- |
-| fused QKV | `T` | 6144 | 4096 | `[T,6144]` |
+| Q projection | `T` | 4096 | 4096 | `[T,4096]` |
+| K projection | `T` | 1024 | 4096 | `[T,1024]` |
+| V projection | `T` | 1024 | 4096 | `[T,1024]` |
 | O projection | `T` | 4096 | 4096 | `[T,4096]` |
-| fused gate-up | `T` | 24576 | 4096 | `[T,24576]` |
+| gate projection | `T` | 12288 | 4096 | `[T,12288]` |
+| up projection | `T` | 12288 | 4096 | `[T,12288]` |
 | down projection | `T` | 4096 | 12288 | `[T,4096]` |
 | LM Head | **1** | 151936 | 4096 | `[1,151936]` |
 
@@ -347,9 +357,26 @@ qwen3_z200_launch_add_inplace(residual, branch, T * 4096, stream);
 
 SwiGLU 计算 `silu(gate) * up`。现有接口要求 `gate` 和 `up` 都是独立 compact `[T,12288]`；它不能直接正确读取 `T>1` 的 row-major fused `[T,24576]` 两个半区，相关缺口见下一节。
 
-## 6. 当前源码的两个必要布局缺口
+### 5.9 Greedy argmax
 
-Agent 必须注意：线性层输出虽然数学上可以 `split`，但 C++ 指针偏移不一定得到跨 token compact tensor。当前参考源码还没有下面两个 pack/strided helper；不补齐时 decode 的 `T=1` 可能工作，而 prefill 的 `T>1` 会读错行。
+```cpp
+qwen3_z200_launch_greedy_sample(
+    d_logits, 151936, d_next_token, stream);
+hipMemcpyAsync(
+    &next_token, d_next_token, sizeof(int32_t),
+    hipMemcpyDeviceToHost, stream);
+hipStreamSynchronize(stream);
+```
+
+- `d_logits` 是 LM Head 产生的 FP32 `[151936]`；
+- `d_next_token` 是外部 sampler 初始化时一次性分配的 device `int[1]`，不能每个 decode step 临时 `hipMalloc/hipFree`；
+- kernel 对相同最大值选择较小 token id，适合 `temperature=0` 的确定性基准；
+- stop token、temperature、top-k/top-p、repetition penalty 不属于该 kernel。需要修改 logits 的策略在未实现 GPU logit processor 前走 CPU sampler；
+- kernel、D2H copy 和 forward 使用同一条 runtime stream，确保读取的是刚产生的 logits。
+
+## 6. 可选 fused 优化的两个布局前置条件
+
+首版独立 Q/K/V 和 gate/up 路径不需要本节 helper。若后续为了减少反量化/GEMM 调度而融合权重，必须注意：线性层输出虽然数学上可以 `split`，但 C++ 指针偏移不一定得到跨 token compact tensor。当前参考源码还没有下面两个 pack/strided helper；不补齐时 decode 的 `T=1` 可能工作，而 prefill 的 `T>1` 会读错行。
 
 ### 6.1 Fused QKV 必须 split/pack
 
@@ -363,10 +390,10 @@ row 1: Q1[4096] K1[1024] V1[1024]
 
 仅令 `q = qkv + 0`、`k = qkv + 4096`、`v = qkv + 5120`，三者在 `T>1` 时都不是各自的 compact 多行数组。prefill attention 要求 compact Q，KV writer 要求 compact K/V。
 
-首版 runtime 必须选择一种方式：
+fused 优化必须选择一种方式：
 
 1. **推荐：**补一个 HIP split/pack kernel，将 fused 输出复制为 compact `Q[T,4096]`、`K[T,1024]`、`V[T,1024]`，然后调用现有 per-head norm、RoPE、KV write 和 attention；
-2. 暂时分别执行 Q、K、V 三个线性层，直接得到 compact 输出，但会增加两次完整权重解量化和 GEMM 调度。
+2. 回退到首版的 Q、K、V 三个独立线性层，直接得到 compact 输出，但会增加两次完整权重解量化和 GEMM 调度。
 
 不能只在文档或 C++ 类型中做 reshape 而不搬运数据。必须用 `T>=2` 的递增值测试验证每一行。
 
@@ -382,12 +409,12 @@ row 1: gate1[I] up1[I]
 
 现有 `qwen3_z200_launch_swiglu()` 假设 gate/up 分别 compact。对 `T>1` 仅用 `up = gate_up + I` 会让线性遍历跨入错误半区。
 
-首版 runtime 必须选择：
+fused 优化必须选择：
 
 1. 补一个 strided SwiGLU kernel，输入行 stride 为 `2I`，每行分别读 `row[0:I]` 和 `row[I:2I]`；或
 2. 先把 gate/up pack 为两个 compact buffer，再调用现有 SwiGLU。
 
-这两个布局问题是 prefill 正确性的前置条件，不属于性能优化项。
+对 fused 路径而言，这两个布局问题是 prefill 正确性的前置条件，不是可以忽略的性能细节。
 
 ## 7. 单卡完整调用顺序
 
@@ -404,6 +431,7 @@ allocate reusable FP32 activations/intermediates
 allocate decode scores workspace
 allocate x_fp16_workspace
 allocate shared weight_fp16_workspace
+create external sampler and allocate d_next_token[1]
 ```
 
 所有 workspace 只分配一次。逐层 forward 和逐 token decode 中禁止 `hipMalloc/hipFree`。
@@ -417,8 +445,9 @@ for layer = 0..35:
     residual = x
     RMSNorm(x) -> h
 
-    q8_linear(h, fused_qkv, M=T,N=6144,K=4096) -> qkv_fused
-    split/pack qkv_fused -> q_compact, k_compact, v_compact
+    q8_linear(h, q_weight, M=T,N=4096,K=4096) -> q_compact
+    q8_linear(h, k_weight, M=T,N=1024,K=4096) -> k_compact
+    q8_linear(h, v_weight, M=T,N=1024,K=4096) -> v_compact
     per_head_rms(q_compact) -> q_norm
     per_head_rms(k_compact) -> k_norm
     RoPE(q_norm, start_pos, NEOX)
@@ -431,8 +460,9 @@ for layer = 0..35:
 
     residual = x
     RMSNorm(x) -> h
-    q8_linear(h, gate_up, M=T,N=24576,K=4096) -> gate_up_fused
-    strided SwiGLU 或 pack+SwiGLU -> ffn[T,12288]
+    q8_linear(h, gate_weight, M=T,N=12288,K=4096) -> gate
+    q8_linear(h, up_weight, M=T,N=12288,K=4096) -> up
+    SwiGLU(gate, up) -> ffn[T,12288]
     q8_linear(ffn, down, M=T,N=4096,K=12288) -> down
     add(residual, down) -> x
 
@@ -450,8 +480,7 @@ current_pos = cache.length
 
 for layer = 0..35:
     attention RMSNorm
-    q8 QKV linear, M=1
-    split Q/K/V
+    q8 Q/K/V independent linears, M=1
     per-head Q/K RMSNorm
     Q/K RoPE(position=current_pos)
     write K/V at current_pos
@@ -459,18 +488,18 @@ for layer = 0..35:
     q8 O linear, M=1
     residual add
     FFN RMSNorm
-    q8 gate-up linear, M=1
+    q8 gate/up independent linears, M=1
     SwiGLU
     q8 down linear, M=1
     residual add
 
 final RMSNorm
 q8 LM Head, M=1
-sample
 cache.length = current_pos + 1
+external greedy sampler -> d_next_token[1] -> copy one int32 to host
 ```
 
-T=1 时 fused 段在单行中连续，但仍建议复用与 prefill 相同的 split/pack 接口，减少两条执行路径产生的错误。
+Runtime 在 forward 成功后提交 cache length，并把 logits 交给外部 sampler。后续若启用 fused 路径，decode 也应复用与 prefill 相同的 split/pack 接口，减少两条执行路径产生的错误。
 
 ## 8. 单卡 workspace 与显存规划
 
@@ -484,7 +513,7 @@ T=1 时 fused 段在单行中连续，但仍建议复用与 prefill 相同的 sp
 = 1187 MiB ≈ 1.159 GiB
 ```
 
-gate-up 只需 192 MiB，所以不能以 gate-up 作为全局最大值。LM Head 首版可以不分块；若启动时 `hipMemGetInfo` 显示余量不足，再沿 vocab 行分块解量化和 GEMM。
+首版独立 gate/up 每个只需 96 MiB；可选 fused gate-up 也只有 192 MiB，所以都不能作为全局最大值。LM Head 首版可以不分块；若启动时 `hipMemGetInfo` 显示余量不足，再沿 vocab 行分块解量化和 GEMM。
 
 ### 8.2 激活 workspace
 
@@ -494,9 +523,9 @@ FP32 激活/中间 buffer 应做生命周期复用，但不能让一个 kernel �
 
 - hidden/residual ping-pong `[T,H]`；
 - norm output `[T,H]`；
-- fused QKV 和 compact Q/K/V；
+- compact Q/K/V 独立输出；若启用 fused 优化，再增加 fused QKV 临时区；
 - attention/O projection `[T,H]`；
-- fused gate-up 和 SwiGLU `[T,I]`；
+- compact gate/up 和 SwiGLU `[T,I]`；若启用 fused 优化，再增加 fused gate-up 临时区；
 - logits `[V]`；
 - decode scores `[32,max_seq_len]`。
 
@@ -527,8 +556,8 @@ FP32 激活/中间 buffer 应做生命周期复用，但不能让一个 kernel �
 3. Embedding：包含重复 token，验证只返回对应行；另外测试越界由 runtime 拒绝。
 4. RMSNorm：对比 CPU reference，并分别测试 hidden `[T,4096]` 和 per-head `[T,N,128]`。
 5. RoPE：测试 `start_pos=0` 和非零位置，确认使用 `ROPE_NEOX`。
-6. QKV pack：必须用 `T>=2` 且每一行数值不同，防止 stride 错误被单 token 掩盖。
-7. gate-up/SwiGLU：必须用 `T>=2`，验证每行 gate/up 配对正确。
+6. 独立 Q/K/V：必须用 `T>=2` 且每一行数值不同，验证 compact layout；启用 fused 优化时再增加 pack stride 测试。
+7. 独立 gate/up + SwiGLU：必须用 `T>=2`，验证每行 gate/up 配对；启用 fused 优化时再增加 strided/pack 测试。
 8. KV + attention：比较 prefill 最后位置与逐 token decode 最后位置输出。
 9. 整层：比较 attention residual、FFN residual。
 10. 全模型：固定 prompt 比较最后 logits/greedy token，再做多步 decode。

@@ -71,12 +71,12 @@ DEFAULT_CONCURRENCY_LADDER = (1, 4, 16)
 # We take the median tokens_per_sec as the headline and report stdev so
 # the F-step planner can see whether differences between iterations are
 # larger than the run-to-run noise.
-RUNS_PER_LEVEL = 3
+RUNS_PER_LEVEL = 1
 
 # Drop this many initial requests per run before measuring. Warmup
 # absorbs: first-call kernel compilation, weight preloading, KV cache
 # pool allocation, JIT cache misses.
-WARMUP_REQUESTS = 4
+WARMUP_REQUESTS = 1
 
 # Per-request HTTP timeout (seconds). Generous because long-output
 # prompts can legitimately take 30+ seconds at low concurrency on big

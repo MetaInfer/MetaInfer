@@ -9,7 +9,7 @@
 目标是 **Qwen3-8B Dense、单请求（B=1）、单卡** 的自回归生成：
 
 ```text
-HF config.json + safetensors
+Qwen3-8B Q8_0 GGUF
         ↓
 ModelConfig / WeightLoader
         ↓
@@ -22,11 +22,13 @@ KVCache + BackendOps (GEMM / RMSNorm / RoPE / GQA)
 
 第一版不需要实现 TP、连续批处理、paged allocator、CUDA Graph、LoRA、MoE、speculative decoding 或服务调度。它们是吞吐优化/框架能力；先让单序列的 logits 与参考实现一致。
 
+> **多并发实现覆盖说明：** 本文后续关于单请求 `B=1`、单一 `KVCache::length` 和单行 logits 的描述仅适用于首版 bring-up。要实现多个 HTTP 请求的 continuous batching，必须先阅读并遵守 `09_continuous_batching_contract.md`；其中的 `slot_id`、`RuntimeBatch` 和 `[layer][slot][position][head][dim]` KV 所有权契约覆盖本文的单序列生命周期描述。
+
 虽然来源契约的运行范围是 `B=1, TP=4`，这里的主设计故意采用单卡全量权重。这样没有 all-reduce，也更容易验证数学与权重布局；TP=4 的扩展规则见第 9 节。
 
-## 2. 配置：运行时读取，8B 数字只作校验
+## 2. 配置：固定 Qwen3-8B，GGUF metadata 用于校验
 
-不要把下表硬编码为唯一真相。加载 `config.json`，并校验模型与这些 Qwen3-8B 参考值一致；若没有 `head_dim`，使用 `hidden_size / num_attention_heads`。
+当前小框架不做通用模型注册，只支持固定 Qwen3-8B。下表是 runtime 真值；Loader 读取 GGUF metadata 后逐项校验，任何关键字段不一致都应报错，而不是动态切换到其他尺寸。
 
 | 字段 | Qwen3-8B 参考值 | C++ 用途 |
 | --- | ---: | --- |
@@ -75,12 +77,15 @@ struct ModelConfig {
 
 struct LayerWeights {
     Tensor attn_norm;         // [H]
-    Tensor qkv;               // [Q + K + V, H] = [6144, 4096]
+    Tensor q_proj;            // [Q, H] = [4096, 4096]
+    Tensor k_proj;            // [K, H] = [1024, 4096]
+    Tensor v_proj;            // [Vkv, H] = [1024, 4096]
     Tensor q_norm;            // [D] = [128]
     Tensor k_norm;            // [D] = [128]
     Tensor o_proj;            // [H, H]
     Tensor ffn_norm;          // [H]
-    Tensor gate_up;           // [2I, H] = [24576, 4096]
+    Tensor gate_proj;         // [I, H] = [12288, 4096]
+    Tensor up_proj;           // [I, H] = [12288, 4096]
     Tensor down_proj;         // [H, I] = [4096, 12288]
 };
 
@@ -98,28 +103,28 @@ struct KVCache {
 
 `KVCache::length` 是一个请求的逻辑长度，而不是每层各自维护的计数器。每一层必须在同一个 position 写入 K/V；否则层间会读取不同 token 历史，结果会静默错误。
 
-## 4. 权重加载与融合布局
+## 4. 权重加载布局与可选融合
 
-HF checkpoint 是分离投影，而运行时可将它们融合为较少的 GEMM。这个融合只改变存储/调度，不能改变行段顺序。
+GGUF 为当前目标提供独立 Q/K/V 和 gate/up tensor。首版保持独立，直接匹配现有 compact kernel 接口；后续可以融合为较少的 GEMM，但融合只改变存储/调度，不能改变行段顺序，而且必须补齐 `04_qwen3_z200_operator_contract.md` 第 6 节的布局 helper。
 
 | HF key | HF shape（8B） | C++ 目标 | 操作 |
 | --- | --- | --- | --- |
 | `model.embed_tokens.weight` | `[V, H]` | `embed_tokens` | 直接复制 |
-| `layers.i.self_attn.q_proj.weight` | `[4096, 4096]` | `qkv[0:4096, :]` | 放在 Q 段 |
-| `layers.i.self_attn.k_proj.weight` | `[1024, 4096]` | `qkv[4096:5120, :]` | 紧跟 Q 的 K 段 |
-| `layers.i.self_attn.v_proj.weight` | `[1024, 4096]` | `qkv[5120:6144, :]` | 最后的 V 段 |
+| `layers.i.self_attn.q_proj.weight` | `[4096, 4096]` | `q_proj` | 首版独立保存 |
+| `layers.i.self_attn.k_proj.weight` | `[1024, 4096]` | `k_proj` | 首版独立保存 |
+| `layers.i.self_attn.v_proj.weight` | `[1024, 4096]` | `v_proj` | 首版独立保存 |
 | `layers.i.self_attn.o_proj.weight` | `[4096, 4096]` | `o_proj` | 直接复制 |
 | `layers.i.self_attn.q_norm.weight` | `[128]` | `q_norm` | 直接复制 |
 | `layers.i.self_attn.k_norm.weight` | `[128]` | `k_norm` | 直接复制 |
 | `layers.i.input_layernorm.weight` | `[4096]` | `attn_norm` | 直接复制 |
 | `layers.i.post_attention_layernorm.weight` | `[4096]` | `ffn_norm` | 直接复制 |
-| `layers.i.mlp.gate_proj.weight` | `[12288, 4096]` | `gate_up[0:12288, :]` | gate 在前 |
-| `layers.i.mlp.up_proj.weight` | `[12288, 4096]` | `gate_up[12288:24576, :]` | up 在后 |
+| `layers.i.mlp.gate_proj.weight` | `[12288, 4096]` | `gate_proj` | 首版独立保存 |
+| `layers.i.mlp.up_proj.weight` | `[12288, 4096]` | `up_proj` | 首版独立保存 |
 | `layers.i.mlp.down_proj.weight` | `[4096, 12288]` | `down_proj` | 直接复制 |
 | `model.norm.weight` | `[4096]` | `final_norm` | 直接复制 |
 | `lm_head.weight` | `[V, H]` | `lm_head` | 直接复制；仅配置要求时复用 embedding |
 
-两条不可交换的顺序：
+若后续启用融合，两条不可交换的顺序是：
 
 ```text
 qkv     = concat(Q, K, V, dim=0)       // 不是 Q-V-K
@@ -136,7 +141,9 @@ gate_up = concat(gate, up, dim=0)      // 不是 up-gate
 residual = x
 h        = RMSNorm(x, attn_norm)
 
-[q, k, v] = split(linear(h, qkv), [4096, 1024, 1024])
+q = linear(h, q_proj)
+k = linear(h, k_proj)
+v = linear(h, v_proj)
 q = reshape(q, [T, 32, 128])
 k = reshape(k, [T,  8, 128])
 v = reshape(v, [T,  8, 128])
@@ -152,7 +159,8 @@ x = residual + linear(reshape(a, [T, H]), o_proj)
 
 residual = x
 h        = RMSNorm(x, ffn_norm)
-[gate, up] = split(linear(h, gate_up), [I, I])
+gate = linear(h, gate_proj)
+up   = linear(h, up_proj)
 x = residual + linear(silu(gate) * up, down_proj)
 ```
 
@@ -249,7 +257,7 @@ struct BlockQ8_0 {
 w[i] = fp16_to_fp32(block.d) * fp32(block.qs[i % 32]);
 ```
 
-加载器必须校验 `sizeof(BlockQ8_0) == 34`、被量化矩阵的 `K % 32 == 0`、shape 与 GGUF 元数据一致。QKV 和 gate-up 可通过按输出行拼接已经量化的完整行来融合；不能切开或重排一行内部的 Q8_0 block。
+加载器必须校验 `sizeof(BlockQ8_0) == 34`、被量化矩阵的 `K % 32 == 0`、shape 与 GGUF 元数据一致。首版保持独立 Q/K/V 和 gate/up。若后续融合，只能按输出行拼接已经量化的完整行，不能切开或重排一行内部的 Q8_0 block。
 
 标准 hipBLAS 的 INT8 GEMM 不能直接表达“FP32/FP16 激活 × GGUF Q8_0 权重”：Q8_0 的 scale 沿 K 维每 32 个元素变化。因此首版不要把 `BlockQ8_0*` 直接传给普通 INT8 GEMM。当前正确路径是：
 
@@ -271,8 +279,8 @@ Y[M, N] = X[M, K] @ W[N, K]^T
 
 Agent 生成 runtime 时应在模型初始化阶段完成以下工作，禁止在逐层 forward 中反复 `hipMalloc/hipFree`：
 
-1. 读取配置并执行第 2 节的 shape 校验。
-2. 加载 GGUF Q8_0 tensor；按第 4 节映射或融合 QKV、gate-up，Q8_0 权重常驻 device memory。
+1. 构造固定 Qwen3-8B config，并用 GGUF metadata 执行第 2 节的 shape 校验。
+2. 加载 GGUF Q8_0 tensor；按第 4 节首版独立映射 Q/K/V 和 gate/up，Q8_0 权重常驻 device memory。
 3. 创建一个 hipBLAS handle，并让所有 kernel、cast、dequant、GEMM 使用同一条 HIP stream，依靠流内顺序保证依赖。
 4. 分配可复用的 FP32 激活区、attention/MLP 中间区、logits、KV cache。
 5. 分配一个 FP16 激活 workspace，容量至少为本次最大 GEMM 的 `M * K` 个元素。prefill 太长时应先按 token chunk 限制 `M`，而不是无上限扩大 workspace。
@@ -286,13 +294,13 @@ Qwen3-8B 最大的 FP16 临时权重是 LM Head：
 = 1187 MiB ≈ 1.159 GiB
 ```
 
-作为对比，gate-up 的临时权重为：
+作为对比，首版单个 gate 或 up 的临时权重为：
 
 ```text
-24576 * 4096 * 2 bytes = 192 MiB
+12288 * 4096 * 2 bytes = 96 MiB
 ```
 
-因此只按 gate-up 分配 192 MiB 会在 LM Head 处失败。首版最简单的策略是分配约 1.159 GiB 的单个权重 workspace，让所有线性层复用；若 `hipMemGetInfo` 显示余量不足，再实现第 8.5 节的 LM Head 分块。
+即使后续 fused gate-up 也只有 192 MiB，仍会在 LM Head 处失败。首版最简单的策略是分配约 1.159 GiB 的单个权重 workspace，让所有线性层复用；若 `hipMemGetInfo` 显示余量不足，再实现第 8.5 节的 LM Head 分块。
 
 当前 FP32 KV cache 在 `max_seq_len=4096` 时为：
 
@@ -320,9 +328,12 @@ for layer = 0 .. 35:
   residual = x_fp32
   h = RMSNorm(x_fp32, attn_norm)          // FP32
 
-  qkv = q8_linear(h, qkv_weight,
-                  M=T, N=6144, K=4096)    // 输出 FP32
-  split/pack -> q[T,32,128], k/v[T,8,128] // T>1 时必须搬成 compact，不能只偏移指针
+  q = q8_linear(h, q_weight,
+                M=T, N=4096, K=4096)      // compact FP32 [T,4096]
+  k = q8_linear(h, k_weight,
+                M=T, N=1024, K=4096)      // compact FP32 [T,1024]
+  v = q8_linear(h, v_weight,
+                M=T, N=1024, K=4096)      // compact FP32 [T,1024]
   per_head_rms(q, q_norm)
   per_head_rms(k, k_norm)
   RoPE(q, absolute_positions)
@@ -336,9 +347,11 @@ for layer = 0 .. 35:
 
   residual = x_fp32
   h = RMSNorm(x_fp32, ffn_norm)
-  gate_up = q8_linear(h, gate_up_weight,
-                      M=T, N=24576, K=4096)
-  ffn = strided_SwiGLU(gate_up)            // 或先 pack gate/up 再调用现有 SwiGLU
+  gate = q8_linear(h, gate_weight,
+                   M=T, N=12288, K=4096)
+  up = q8_linear(h, up_weight,
+                 M=T, N=12288, K=4096)
+  ffn = SwiGLU(gate, up)
   down = q8_linear(ffn, down_proj,
                    M=T, N=4096, K=12288)
   x_fp32 = residual + down
@@ -350,7 +363,7 @@ logits[1,V] = q8_linear(last_hidden, lm_head,
 
 关键点是 LM Head 的 `M=1`：prefill 生成只需要最后一个 prompt token 的 logits。绝不能为了取最后一行而计算 `[T, 151936]` 的完整 logits。若将 prompt 分块，还必须确保 attention 保持全局 causal 语义，且最终仅在最后一个 chunk 的最后一个位置执行 LM Head。
 
-这里的 QKV split/pack 和 strided SwiGLU 是 `T>1` prefill 的正确性要求，当前参考源码尚未提供这两个 helper；原因和两种补齐方式见 `04_qwen3_z200_operator_contract.md` 第 6 节。
+首版独立投影直接得到 compact tensor，不需要 QKV split/pack 或 strided SwiGLU。若后续启用 fused QKV/gate-up 优化，这两个 helper 就会成为 `T>1` prefill 的正确性前置条件，详见 `04_qwen3_z200_operator_contract.md` 第 6 节。
 
 ### 8.4 单卡 decode 参考调用流程
 
@@ -361,21 +374,21 @@ token_id -> Q8_0 embedding row -> x_fp32[1,H]
 
 for each layer:
   attn norm
-  q8 qkv linear (M=1)
+  q8 q/k/v independent linears (M=1)
   q/k per-head norm -> RoPE(position=cache.length)
   write K/V at cache.length
   decode GQA over [0, cache.length]
   q8 o linear (M=1) -> residual add
   ffn norm
-  q8 gate-up linear (M=1) -> SwiGLU
+  q8 gate/up independent linears (M=1) -> SwiGLU
   q8 down linear (M=1) -> residual add
 
 final norm
 q8 lm_head linear (M=1) -> logits[V]
-sample -> cache.length += 1
+forward success -> cache.length += 1
 ```
 
-在此正确性版本中，每层的 QKV、O、gate-up、down，以及最终 LM Head 都会在各自调用前解量化一次。不要把“每个算子都解量化”理解成要单独保存 36 层的 FP16 副本；它们按流串行地覆盖同一个权重 workspace。
+在此正确性版本中，每层的 Q/K/V、O、gate、up、down，以及最终 LM Head 都会在各自调用前解量化一次。不要把“每个算子都解量化”理解成要单独保存 36 层的 FP16 副本；它们按流串行地覆盖同一个权重 workspace。
 
 为了先跑通，允许这种重复解量化；为了提高 decode 速度，后续应优先实现直接读取 Q8_0 的 fused GEMV/GEMM（decode 的 `M=1` 特别适合 GEMV），而不是长期依赖“整矩阵解到 FP16 + hipBLAS”。
 
@@ -424,10 +437,10 @@ decode(token_1) → logits      → sample(token_2)
 
 验收按下面顺序做，能最快定位错误：
 
-1. 加载检查：36 层的每个 key 都存在，融合后的 QKV/gate-up shape 正确。
+1. 加载检查：36 层的每个独立 Q/K/V、gate/up key 都存在且 shape 正确；`output.weight` 必须独立存在。
 2. 固定小 prompt，比较 embedding、第一层 Q/K/V、第一层 attention 输出、第一层 MLP 输出、最终最后一行 logits；逐级比较比只比较最终 token 更容易发现布局错误。
 3. 对同一 token 序列，比较「一次性 full prefill 的最后 logits」与「前 `S-1` token prefill + 第 `S` token decode」的最后 logits。两者应在所选 dtype 的允许误差内一致。
-4. 固定 greedy sampling，比较连续生成的 token id；不一致时优先检查 QKV 拼接、gate/up 顺序、Q/K norm、RoPE position、KV 写入索引和残差加法。
+4. 固定 greedy sampling，比较连续生成的 token id；不一致时优先检查 Q/K/V layout、gate/up 配对、Q/K norm、RoPE position、KV 写入索引和残差加法。
 5. 只在正确性通过后，才融合 RMSNorm+residual、QKV GEMM、RoPE、paged attention 或加入 CUDA Graph。
 
 ## 10. 后续 TP=4 扩展（不是第一版前置条件）
@@ -445,9 +458,9 @@ TP 下要保证每个 rank 的 K/V cache 只存自己的两个 KV heads；不要
 
 ## 11. 实现前检查表
 
-- [ ] 从 `config.json` 读取所有字段，并验证 `H == Nq * D`、`Nq % Nkv == 0`。
+- [ ] 使用固定 Qwen3-8B config，并读取 GGUF metadata 验证 `H == Nq * D`、`Nq % Nkv == 0` 和全部目标尺寸。
 - [ ] HF 权重名使用 Qwen3-8B 的 `model.layers.*` 前缀，而非 Qwen3.5/3.6 的 `model.language_model.*`。
-- [ ] QKV 融合顺序是 Q → K → V，gate-up 融合顺序是 gate → up。
+- [ ] 首版 Q/K/V 和 gate/up 权重独立；若后续融合，顺序必须是 Q → K → V、gate → up，并补齐多 token 布局 helper。
 - [ ] 每层拥有独立 K/V cache；K 在 q/k norm 和 RoPE 后写入。
 - [ ] 注意力缩放为 `1/sqrt(head_dim)`，并按 4 个 Q head 共享一个 KV head 实现 GQA。
 - [ ] 两次残差加法均存在：attention 后一次，MLP 后一次。

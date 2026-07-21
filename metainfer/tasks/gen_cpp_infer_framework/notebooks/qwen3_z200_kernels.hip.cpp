@@ -57,6 +57,7 @@ __global__ void cast_fp32_to_fp16_kernel(
     if (tid < n_elements) {
         out[tid] = __float2half(x[tid]);
     }
+    return;
 }
 
 __global__ void dequant_q8_0_to_fp16_kernel(
@@ -445,6 +446,48 @@ __global__ void swiglu_kernel(
     out[tid] = (g / (1.0f + expf(-g))) * up[tid];
 }
 
+__global__ void greedy_argmax_kernel(
+        const float * __restrict__ logits,
+        int vocab_size,
+        int * __restrict__ out_token) {
+    const int tid = threadIdx.x;
+    float best_val = -FLT_MAX;
+    int best_idx = 0;
+
+    for (int i = tid; i < vocab_size; i += blockDim.x) {
+        const float v = logits[i];
+        if (v > best_val || (v == best_val && i < best_idx)) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+
+    __shared__ float s_vals[kBlockSize];
+    __shared__ int s_idxs[kBlockSize];
+
+    s_vals[tid] = best_val;
+    s_idxs[tid] = best_idx;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float other_val = s_vals[tid + stride];
+            const int other_idx = s_idxs[tid + stride];
+            if (other_val > s_vals[tid]
+                    || (other_val == s_vals[tid] && other_idx < s_idxs[tid])) {
+                s_vals[tid] = other_val;
+                s_idxs[tid] = other_idx;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        *out_token = s_idxs[0];
+    }
+    return;
+}
+
 __global__ void add_kernel(
         float * __restrict__ out,
         const float * __restrict__ a,
@@ -454,6 +497,7 @@ __global__ void add_kernel(
     if (tid < n_elements) {
         out[tid] = a[tid] + b[tid];
     }
+    return;
 }
 
 __global__ void add_inplace_kernel(
@@ -464,6 +508,7 @@ __global__ void add_inplace_kernel(
     if (tid < n_elements) {
         dst[tid] += src[tid];
     }
+    return;
 }
 
 } // namespace qwen3_z200
@@ -614,6 +659,9 @@ extern "C" hipblasStatus_t qwen3_z200_q8_linear_fp32(
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
+    // DTK 5.7 exposes the legacy hipBLAS Ex API.  Its matrix and compute
+    // types are all hipblasDatatype_t, so use the HIPBLAS_R_* values rather
+    // than the hipDataType HIP_R_* values used by newer v2 headers.
     status = hipblasGemmEx(
             handle,
             HIPBLAS_OP_T,
@@ -623,16 +671,16 @@ extern "C" hipblasStatus_t qwen3_z200_q8_linear_fp32(
             k,
             &alpha,
             weight_fp16_workspace,
-            HIP_R_16F,
+            HIPBLAS_R_16F,
             k,
             x_fp16_workspace,
-            HIP_R_16F,
+            HIPBLAS_R_16F,
             k,
             &beta,
             out,
-            HIP_R_32F,
+            HIPBLAS_R_32F,
             n,
-            HIPBLAS_COMPUTE_32F,
+            HIPBLAS_R_32F,
             HIPBLAS_GEMM_DEFAULT);
 
     if (restore_pointer_mode) {
@@ -900,5 +948,26 @@ extern "C" hipError_t qwen3_z200_launch_add_inplace(
             dst,
             src,
             n_elements);
+    return hipGetLastError();
+}
+
+extern "C" hipError_t qwen3_z200_launch_greedy_sample(
+        const float * logits,
+        int vocab_size,
+        int * out_token,
+        hipStream_t stream) {
+    if (logits == nullptr || out_token == nullptr || vocab_size <= 0) {
+        return hipErrorInvalidValue;
+    }
+
+    hipLaunchKernelGGL(
+            qwen3_z200::greedy_argmax_kernel,
+            dim3(1),
+            dim3(qwen3_z200::kBlockSize),
+            0,
+            stream,
+            logits,
+            vocab_size,
+            out_token);
     return hipGetLastError();
 }
