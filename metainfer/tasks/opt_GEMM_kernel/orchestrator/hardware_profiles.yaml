@@ -1,0 +1,45 @@
+# System-owned execution profiles for opt_GEMM_kernel.  A WebUI hardware
+# selection resolves both the compiler route and the profiler route here.
+schema_version: 1
+
+profiles:
+  Hygon K100:
+    id: hygon-k100-gfx928
+    backend: hip
+    gpu_arch: gfx928
+
+    build:
+      build_system: cmake
+      compiler_candidates:
+        - /opt/dtk/bin/hipcc
+        - /opt/rocm/bin/hipcc
+        - hipcc
+      host_compiler_candidates: [c++, g++]
+      cmake_candidates: [cmake]
+      generator: Ninja
+      build_tool_candidates: [ninja]
+      release_flags: [-O3]
+      cmake_cache:
+        CMAKE_BUILD_TYPE: Release
+        CMAKE_CXX_STANDARD: "17"
+        CMAKE_HIP_STANDARD: "17"
+        CMAKE_HIP_ARCHITECTURES: gfx928
+
+    profiling:
+      required: true
+      tool_candidates:
+        - /opt/dtk/bin/rocprofv3
+        - /opt/dtk/bin/rocprof
+        - /opt/rocm/bin/rocprofv3
+        - /opt/rocm/bin/rocprof
+        - rocprofv3
+        - rocprof
+      representative_cases:
+        - wq-b-tp4-m1
+        - wq-b-tp4-m16
+        - wq-b-tp4-m4096
+      counter_groups:
+        - [SQ_WAVES, SQ_WAVE_CYCLES, SQ_INSTS_VALU, SQ_INSTS_SALU, SQ_INSTS_MFMA, SQ_INSTS_MMAC]
+        - [TCC_HIT, TCC_MISS, FETCH_SIZE, WRITE_SIZE, FetchSize, WriteSize, L2CacheHit]
+        - [GRBM_COUNT, GRBM_GUI_ACTIVE, GPUBusy]
+      kernel_name_contains: w8a8_scaled_

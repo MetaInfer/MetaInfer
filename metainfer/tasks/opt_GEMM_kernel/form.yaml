@@ -1,0 +1,64 @@
+# UI contract for the independent opt_GEMM_kernel task. Every field is either
+# consumed by the frozen builder/orchestrator or exposed to the optimizer as a
+# public workload constraint.
+
+- key: initial_submission
+  question: "Select the directory containing the initial kernel, launch wrapper/binding, and submission.yaml."
+  header: "Kernel path"
+  required: true
+  form: file
+
+- key: evaluator_bundle
+  question: "Select the task-author-provided harness directory. MetaInfer freezes it as the evaluator bundle; its task.yaml owns dtype, layout, ABI, cases, correctness, and benchmark protocol."
+  header: "Harness path"
+  required: true
+  form: file
+
+- key: weight_bundle
+  question: "Select the model_weights directory containing info.json and one .bin file per tensor. MetaInfer snapshots it privately; the frozen harness may read it, while optimization agents cannot modify it."
+  header: "Weight directory"
+  required: true
+  form: file
+
+- key: kernel_language
+  question: "The Hygon K100 execution profile uses the frozen HIP/DTK build route."
+  header: "Kernel stack"
+  required: true
+  default: "HIP"
+  form: select
+  options:
+    - label: "HIP"
+      description: "System-owned DTK/HIP C++ build for K100"
+
+- key: target_hardware
+  question: "Select the hardware execution profile. It fixes compiler, architecture, build commands, profiler commands, counters, and representative profile cases."
+  header: "Target GPU"
+  required: true
+  default: "Hygon K100"
+  form: select
+  options:
+    - label: "Hygon K100"
+      description: "DTK/HIP gfx928 with fixed CMake + hipcc and rocprof profiling"
+
+- key: gpu_arch
+  question: "Compiler target owned by the selected Hygon K100 profile."
+  header: "GPU arch"
+  required: true
+  default: "gfx928"
+  form: select
+  options:
+    - label: "gfx928"
+      description: "Frozen K100 HIP compiler architecture"
+
+- key: max_iterations
+  question: "Maximum number of plan/implement/compile/correctness/benchmark/review rounds."
+  header: "Max iterations"
+  required: false
+  default: 20
+  form: number
+
+- key: extra_notes
+  question: "Add constraints such as deterministic output, no vendor BLAS, workspace cap, legal approximation, or required fusion."
+  header: "Constraints"
+  required: false
+  form: textarea
