@@ -57,6 +57,8 @@ Qwen3-8B 中各算子的选择如下：
 - hipBLAS 处理所有带权重的线性层；
 - 先保证 prefill/decode 数值正确，再优化 decode 性能。
 
+> **多并发实现覆盖说明：** 上述 `B=1` 是本算子参考实现的基线，不是多请求服务的实现方式。连续批处理必须以 `09_continuous_batching_contract.md` 为准：kernel 需要接收每个 row 的 `slot_id`/`position`，KV cache、scores 和 logits 必须按 slot/row 隔离；不能让多个 host 线程并发调用当前单序列 kernel。
+
 当前源码是**正确性参考 kernel**，不是最终高性能实现。它没有 GGUF loader、模型类、buffer allocator 或完整 sampling policy，也没有 fused Q8_0 GEMV。这些由生成的 C++ runtime 补齐。源码已经提供确定性 greedy argmax primitive，但 stop、temperature、top-k/top-p 和生成状态仍由外部 sampler/engine 管理。
 
 **首版执行决策：分别调用 Q/K/V 三个 linear，并分别调用 gate/up 两个 linear。** GGUF 本来就是这些独立权重，这样输出天然是 compact 多行 tensor，可直接连接当前 norm/KV/SwiGLU kernel。fused QKV/gate-up 只作为后续优化；在补齐第 6 节 helper 前不能用于 `T>1` prefill。

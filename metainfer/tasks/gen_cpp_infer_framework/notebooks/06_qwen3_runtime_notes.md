@@ -4,6 +4,8 @@
 
 前一份 `05_qwen3_gguf_loader_notes.md` 解决“权重、固定 config 校验和 tokenizer metadata 怎么从 GGUF 读出来”。这份文档解决“模型加载后，token ids 怎么跑 prefill，decode 怎么循环，KV cache 怎么维护，sampler/tokenizer 怎么接起来”。最终 HTTP 暴露方式见 `07_qwen3_http_server_contract.md`。
 
+> **多并发实现覆盖说明：** 本文的 `Qwen3RuntimeState`、`reset() -> prefill() -> decode()` 和单份 sampler/KV cache 都是 B=1 的 bring-up 契约。实现多 HTTP 请求 continuous batching 时，必须改读 `09_continuous_batching_contract.md`：它定义 scheduler 是唯一 GPU 调用者、每请求 `SequenceState`/`slot_id`、batched runtime 接口和 kernel 改造要求。不要只移除 mutex 后并行调用本文的单序列 runtime。
+
 目标是一个固定 Qwen3 dense text model 的小型 C++/HIP runtime，不做通用计算图框架。
 
 ## 1. Runtime 的职责

@@ -22,6 +22,8 @@ KVCache + BackendOps (GEMM / RMSNorm / RoPE / GQA)
 
 第一版不需要实现 TP、连续批处理、paged allocator、CUDA Graph、LoRA、MoE、speculative decoding 或服务调度。它们是吞吐优化/框架能力；先让单序列的 logits 与参考实现一致。
 
+> **多并发实现覆盖说明：** 本文后续关于单请求 `B=1`、单一 `KVCache::length` 和单行 logits 的描述仅适用于首版 bring-up。要实现多个 HTTP 请求的 continuous batching，必须先阅读并遵守 `09_continuous_batching_contract.md`；其中的 `slot_id`、`RuntimeBatch` 和 `[layer][slot][position][head][dim]` KV 所有权契约覆盖本文的单序列生命周期描述。
+
 虽然来源契约的运行范围是 `B=1, TP=4`，这里的主设计故意采用单卡全量权重。这样没有 all-reduce，也更容易验证数学与权重布局；TP=4 的扩展规则见第 9 节。
 
 ## 2. 配置：固定 Qwen3-8B，GGUF metadata 用于校验

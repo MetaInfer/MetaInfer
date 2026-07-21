@@ -16,6 +16,7 @@ below when implementing the complete framework.
 | 6 | `06_qwen3_runtime_notes.md` | Runtime buffers, RoPE/KV state, prefill/decode, logits/sampler boundary, and generation state machine. |
 | 7 | `07_qwen3_http_server_contract.md` | C++ HTTP server, OpenAI-compatible schema, `serve.sh`, process lifecycle, and pipeline-C acceptance contract. |
 | 8 | `08_qwen3_z200_numeric_test_contract.md` | C0.1 fast Z200 operator numeric tests, CPU references, CMake target sharing, reports, and build-to-HTTP pipeline integration. |
+| 9 | `09_continuous_batching_contract.md` | Multi-request continuous batching: scheduler, sequence slots, KV-cache ownership, runtime/kernel interfaces, concurrency safety, and acceptance tests. Read this before changing any B=1 runtime/HTTP concurrency rule. |
 
 Reference implementation assets in this directory:
 

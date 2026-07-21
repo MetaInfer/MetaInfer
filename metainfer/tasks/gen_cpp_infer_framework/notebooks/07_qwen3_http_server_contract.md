@@ -302,7 +302,7 @@ enable_thinking = false;
 
 首版 tokenizer 只完整支持单轮 `system + user`。若收到超出当前能力的多轮 `assistant/user` 历史，应返回清晰 `400`；不要错误地把所有 role 文本直接拼接成普通字符串。
 
-## 7. 单卡 Runtime 的并发规则
+## 7. 单卡 Runtime 的并发规则（B=1 基线）
 
 当前 `Qwen3Runtime` 只有一套：
 
@@ -333,7 +333,9 @@ engine.generate(...);
 
 不能只锁单个 decode step，否则请求 A/B 会交替覆盖同一套 KV cache。
 
-流水线 C 顺序发送请求，因此串行首版可以通过正确性测试。性能流水线 E 会并发发送请求；串行服务仍能工作，但吞吐较低。后续要支持真正并发，需要每请求独立 KV/runtime state，或实现 batching/scheduler，这不属于首版正确性的前置条件。
+流水线 C 顺序发送请求，因此串行首版可以通过正确性测试。性能流水线 E 会并发发送请求；串行服务仍能工作，但吞吐较低。
+
+> **continuous batching 实现时，以上“全程 engine mutex”模式不再适用。** 必须以 `09_continuous_batching_contract.md` 为唯一并发规范：HTTP worker 只向有界队列提交请求；一个可 join 的 scheduler 线程独占 runtime/HIP stream；每请求独占 KV slot；scheduler 每个 decode tick 动态合并活跃 slot。不要仅删除 mutex，也不要让多个 HTTP worker 直接调用 runtime。
 
 ## 8. 最小 HTTP/1.1 传输契约
 
@@ -473,6 +475,59 @@ void on_signal(int) {
 
 accept loop 可以使用 `poll/select` 的短超时定期检查 `g_stop`，或者使用 self-pipe 唤醒。不要在 signal handler 里调用 `hipFree`、C++ iostream、mutex 或复杂析构逻辑。
 
+### 11.1 禁止停止状态脱节（2026-07-20 回归记录）
+
+曾出现过如下实现：signal handler 只设置全局 `g_stop`，而 HTTP accept loop 检查的是 `SimpleHttpServer::stop_`。两者没有任何同步路径，因此 SIGTERM 虽然被捕获，服务却永远不会退出，smoke test 最终阻塞在 `wait`，同时长期占用端口和 GPU 显存。
+
+禁止这种“双停止变量”实现：
+
+```cpp
+volatile std::sig_atomic_t g_stop = 0;
+void on_signal(int) { g_stop = 1; }
+
+// BUG: loop 从不读取 g_stop，且没有代码调用 server.stop()。
+while (!stop_) {
+    accept(listen_fd, nullptr, nullptr);
+}
+```
+
+停止状态必须只有一条可证明的传播链。推荐使用以下任一方案：
+
+1. `poll/select` 或 self-pipe：signal handler 只设置 `g_stop` 并写入 self-pipe；accept loop 被唤醒后直接读取同一个 `g_stop`。
+2. 专用 `sigwait` 线程：主线程先 block SIGTERM/SIGINT，等待线程通过 `sigwait` 收到信号后调用 `server.stop()`；`stop()` 设置 `std::atomic<bool>` 并 `shutdown()` 监听 socket，以解除阻塞的 `accept()`。复杂 C++ 清理由正常控制流执行，不在 signal handler 内执行。
+
+无论采用哪种方案，都必须满足：
+
+- `accept()` 返回错误后先检查停止状态；已停止时立即 `break`，不得重试；
+- 不依赖 `SO_RCVTIMEO` 自动解决 shutdown；必须显式证明 loop 会观察到停止状态；
+- SIGTERM 后十秒内进程退出 0 或约定的受控退出码；
+- 析构顺序释放 socket、scheduler/worker、HIP stream/handle、KV cache 与模型权重；
+- Continuous batching 模式还必须唤醒 condition variable、完成或取消 pending/active 请求，并 join scheduler，不能留下 detached thread。
+
+Smoke test 必须同时验证“请求成功”和“能够退出”：
+
+```bash
+bash serve.sh "${PORT}" >server.stdout.log 2>server.stderr.log &
+server_pid=$!
+
+# health / generation checks ...
+
+kill -TERM "${server_pid}"
+for _ in $(seq 1 100); do
+    kill -0 "${server_pid}" 2>/dev/null || break
+    sleep 0.1
+done
+if kill -0 "${server_pid}" 2>/dev/null; then
+    kill -KILL "${server_pid}"
+    wait "${server_pid}" || true
+    echo "server ignored SIGTERM" >&2
+    exit 1
+fi
+wait "${server_pid}"
+```
+
+进程检查不得使用裸 `pgrep -f metainfer_cpp_server` 作为成功判据；`-f` 会匹配检查命令自身或包含该字符串的父 shell，产生看似“不断重生 PID”的假阳性。优先保存并检查 `$!`，需要扫描时使用精确的 `/proc/<pid>/exe`、`ps` 字段或排除检查进程本身。测试应杀 `serve.sh` 通过 `exec` 暴露的真实 server PID；若引入 `timeout`/wrapper，则必须明确杀整个测试进程组，并在 TERM 宽限期后升级到 KILL。
+
 退出 accept loop 后再按正常 C++ 生命周期：
 
 ```text
@@ -578,8 +633,9 @@ wait "${SERVER_PID}"
 - [ ] 支持 `stream:false`、`temperature:0` 和 `max_tokens`。
 - [ ] `choices[0].message.content` 是非空字符串。
 - [ ] 模型输出经过正确 JSON escaping。
-- [ ] 每个请求开始前 reset runtime/KV 状态。
-- [ ] 单卡首版串行执行完整请求，不交叉覆盖 KV cache。
+- [ ] B=1 基线中，每个请求开始前 reset runtime/KV 状态。
+- [ ] B=1 基线中，单卡串行执行完整请求，不交叉覆盖 KV cache；continuous batching 实现改按 `09_continuous_batching_contract.md` 的 slot/KV 隔离与并发验收执行。
 - [ ] EOS/EOG、`max_tokens` 和 context limit 都能停止生成。
-- [ ] SIGTERM 能让服务及时退出并释放 GPU 资源。
-- [ ] 本地 smoke test 后没有残留进程。
+- [ ] SIGTERM 能让服务在十秒内退出并释放 GPU 资源；测试同时覆盖空闲 `accept()` 和请求执行/排队期间的 shutdown。
+- [ ] 停止状态只有一条可证明的传播链，不存在 handler 写 `g_stop`、loop 却只读另一个 `stop_` 的脱节实现。
+- [ ] 本地 smoke test 后没有残留进程；使用保存的真实 PID/进程组验证，不以裸 `pgrep -f` 结果作为判据。

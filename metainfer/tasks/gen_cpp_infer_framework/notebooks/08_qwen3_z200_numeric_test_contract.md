@@ -3,6 +3,8 @@
 > 用途：指导实现 Agent 为生成的 C++/HIP 框架增加一个不加载真实模型、只使用确定性小张量的快速数值测试程序，并指导 MetaInfer 的 C 阶段在编译成功后、启动 HTTP server 前执行它。
 >
 > 本文只定义 **C0.1 快速算子数值测试**。固定 GGUF logits golden、完整模型数值 reference 和 HTTP 语义测试不属于本文范围。
+>
+> 多 slot / continuous batching 的 KV 隔离、batched logits 与 HTTP 并发测试不属于 C0.1；这些实现和验收以 `09_continuous_batching_contract.md` 为准。
 
 参考路径：
 
@@ -10,6 +12,7 @@
 MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/qwen3_z200_kernels.hip.cpp
 MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/04_qwen3_z200_operator_contract.md
 MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/06_qwen3_runtime_notes.md
+MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/09_continuous_batching_contract.md
 MetaInfer/metainfer/tasks/gen_cpp_infer_framework/orchestrator/hardware.py
 MetaInfer/metainfer/tasks/gen_cpp_infer_framework/orchestrator/oracles/correctness.py
 MetaInfer/metainfer/tasks/gen_cpp_infer_framework/orchestrator/pipeline.py
