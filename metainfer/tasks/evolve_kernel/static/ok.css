@@ -1,0 +1,164 @@
+/* evolve-kernel task-specific styles */
+
+.ok-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.ok-panel-full {
+  grid-column: 1 / -1;
+}
+
+.ok-kernel-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.ok-kernel-table th,
+.ok-kernel-table td {
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border-color, #30363d);
+}
+
+.ok-kernel-table th {
+  font-weight: 600;
+  color: var(--muted, #8b949e);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+}
+
+.ok-kernel-table tr:hover td {
+  background: var(--hover-bg, rgba(177, 186, 196, 0.08));
+}
+
+.ok-kernel-table tr.selected td {
+  background: var(--accent-bg, rgba(88, 166, 255, 0.12));
+  border-left: 2px solid var(--accent, #58a6ff);
+}
+
+.ok-score-good {
+  color: #3fb950;
+  font-weight: 600;
+}
+
+.ok-score-ok {
+  color: #d29922;
+}
+
+.ok-score-bad {
+  color: #f85149;
+}
+
+.ok-code-preview {
+  max-height: 300px;
+  overflow: auto;
+  background: var(--code-bg, #0d1117);
+  border: 1px solid var(--border-color, #30363d);
+  border-radius: 6px;
+  padding: 0.75rem;
+  font-family: monospace;
+  font-size: 0.8rem;
+  white-space: pre;
+  line-height: 1.4;
+}
+
+.ok-code-preview.large {
+  max-height: 600px;
+}
+
+.ok-harness-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.ok-harness-status.pass {
+  background: rgba(63, 185, 80, 0.15);
+  color: #3fb950;
+}
+
+.ok-harness-status.fail {
+  background: rgba(248, 81, 73, 0.15);
+  color: #f85149;
+}
+
+.ok-harness-status.pending {
+  background: rgba(210, 153, 34, 0.15);
+  color: #d29922;
+}
+
+.ok-badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background: var(--accent-bg, rgba(88, 166, 255, 0.15));
+  color: var(--accent, #58a6ff);
+}
+
+.ok-badge.green {
+  background: rgba(63, 185, 80, 0.15);
+  color: #3fb950;
+}
+
+.ok-badge.yellow {
+  background: rgba(210, 153, 34, 0.15);
+  color: #d29922;
+}
+
+.ok-flow-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  background: var(--panel-bg, #161b22);
+  border: 1px solid var(--border-color, #30363d);
+  border-radius: 6px;
+  margin-bottom: 0.75rem;
+}
+
+.ok-flow-indicator .ok-phase-label {
+  font-weight: 600;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  background: var(--accent-bg, rgba(88, 166, 255, 0.15));
+}
+
+.ok-flow-indicator .ok-phase-divider {
+  color: var(--muted, #8b949e);
+}
+
+.ok-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.75rem;
+}
+
+.ok-meta-card {
+  padding: 0.75rem;
+  background: var(--panel-bg, #161b22);
+  border: 1px solid var(--border-color, #30363d);
+  border-radius: 6px;
+  text-align: center;
+}
+
+.ok-meta-card .ok-meta-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.ok-meta-card .ok-meta-label {
+  font-size: 0.75rem;
+  color: var(--muted, #8b949e);
+  margin-top: 0.25rem;
+}

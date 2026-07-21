@@ -1,0 +1,34 @@
+# Question bank for the `evolve-kernel` task type .
+# LLM-guided iterative GPU kernel optimization.
+# The user provides a Triton kernel file; the orchestrator generates
+# test harnesses and iteratively optimizes the kernel.
+
+- key: kernel_file_path
+  question: "Path to the Triton kernel .py file (must contain a @triton.jit decorated function):"
+  header: "Kernel file"
+  required: true
+
+- key: kernel_function_name
+  question: "Kernel function name (leave blank to auto-detect):"
+  header: "Fn name"
+  required: false
+  default: ""
+
+- key: max_iterations
+  question: "Max optimization iterations (each iteration = select → optimize → verify → measure):"
+  header: "Max iters"
+  required: false
+  multi: false
+  default: "20"
+  options:
+    - label: "10"
+      description: "Quick test"
+    - label: "20"
+      description: "Standard (recommended)"
+    - label: "50"
+      description: "Deep optimization, long-running"
+
+- key: extra_notes
+  question: "Extra constraints or notes for the optimizer?"
+  header: "Notes"
+  required: false
