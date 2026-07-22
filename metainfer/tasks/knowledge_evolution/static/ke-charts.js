@@ -4,12 +4,9 @@
 
 import { html } from "htm/preact";
 import { useEffect, useRef } from "preact/hooks";
-import {
-  Chart, LineController, LineElement, PointElement,
-  LinearScale, CategoryScale, Title, Tooltip, Legend, Filler,
-} from "chart.js";
+import { Chart, registerables } from "chart.js";
 
-Chart.register(LineController, LineElement, PointElement, LinearScale, CategoryScale, Title, Tooltip, Legend, Filler);
+Chart.register(...registerables);
 
 const PALETTE = ["#58a6ff", "#3fb950", "#d29922", "#f778ba", "#a371f7", "#79c0ff"];
 
