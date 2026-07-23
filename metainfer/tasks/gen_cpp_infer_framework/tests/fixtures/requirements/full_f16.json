@@ -1,0 +1,14 @@
+{
+  "task_id": "fixture-full-f16",
+  "task_type": "gen-cpp-infer-framework",
+  "target_model": "/models/Qwen3-8B-F16.gguf",
+  "target_hardware": "Hygon Z200",
+  "features": [
+    "Paged KV cache",
+    "Continuous batching",
+    "Tensor parallelism"
+  ],
+  "tp_size": 2,
+  "kv_block_size": 16,
+  "max_concurrency": 4
+}

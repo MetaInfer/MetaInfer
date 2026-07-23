@@ -131,6 +131,7 @@ def _render_build_script(selected: str, profile: Dict[str, Any]) -> str:
     build = profile["build"]
     cache = build["cmake_cache"]
     compiler = str(build["compiler"]["command"])
+    parallel_jobs = max(1, int(build.get("parallel_jobs", 4)))
     cache_args = [
         "-DCMAKE_BUILD_TYPE=Release",
         *(f"-D{k}={v}" for k, v in cache.items()),
@@ -159,8 +160,15 @@ if [[ ! -f "$ROOT/CMakeLists.txt" ]]; then
 fi
 
 export HIPCXX="$(command -v "$HIPCC_BIN")"
+if [[ -f "$ROOT/build/CMakeCache.txt" ]]; then
+  CACHE_HOME="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$ROOT/build/CMakeCache.txt" | head -n 1)"
+  if [[ -n "$CACHE_HOME" && "$CACHE_HOME" != "$ROOT" ]]; then
+    echo "discarding copied CMake cache from $CACHE_HOME" >&2
+    rm -rf -- "$ROOT/build"
+  fi
+fi
 cmake -S "$ROOT" -B "$ROOT/build" {quoted_args}
-cmake --build "$ROOT/build" --parallel "${{METAINFER_BUILD_JOBS:-$(nproc)}}"
+cmake --build "$ROOT/build" --parallel "${{METAINFER_BUILD_JOBS:-{parallel_jobs}}}"
 '''
 
 

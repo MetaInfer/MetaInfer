@@ -192,6 +192,12 @@ enter blocking accept loop
 
 流水线把这个接口当成低开销 readiness 检查。不要在这个请求中执行一次模型生成。
 
+选择 Continuous Batching 时，首个 model entry 的 `metainfer` 对象还必须
+暴露 `max_concurrency` 和实时单调计数器 `max_observed_batch_size`。后者只能
+在 Runner 真正执行一次多序列 packed batch 时更新，不能用同时连接的 HTTP
+socket 数量或配置上限填充。不可变验收会先发不同的确定性请求，再并发重放，
+最后重新读取 `/v1/models`，要求 `max_observed_batch_size >= 2`。
+
 ### 5.2 `POST /v1/chat/completions`
 
 这是流水线 C 真正使用的接口。实际请求形状为：
@@ -335,7 +341,7 @@ engine.generate(...);
 
 流水线 C 顺序发送请求，因此串行首版可以通过正确性测试。性能流水线 E 会并发发送请求；串行服务仍能工作，但吞吐较低。
 
-> **continuous batching 实现时，以上“全程 engine mutex”模式不再适用。** 必须以 `09_continuous_batching_contract.md` 为唯一并发规范：HTTP worker 只向有界队列提交请求；一个可 join 的 scheduler 线程独占 runtime/HIP stream；每请求独占 KV slot；scheduler 每个 decode tick 动态合并活跃 slot。不要仅删除 mutex，也不要让多个 HTTP worker 直接调用 runtime。
+> **continuous batching 实现时，以上“全程 engine mutex”模式不再适用。** 必须以 `runtime/continuous_batching.md` 为唯一并发规范：HTTP worker 只向有界队列提交请求；一个可 join 的 scheduler 线程独占 runtime/HIP stream；每请求独占 KV slot；scheduler 每个 decode tick 动态合并活跃 slot。不要仅删除 mutex，也不要让多个 HTTP worker 直接调用 runtime。
 
 ## 8. 最小 HTTP/1.1 传输契约
 
@@ -634,7 +640,7 @@ wait "${SERVER_PID}"
 - [ ] `choices[0].message.content` 是非空字符串。
 - [ ] 模型输出经过正确 JSON escaping。
 - [ ] B=1 基线中，每个请求开始前 reset runtime/KV 状态。
-- [ ] B=1 基线中，单卡串行执行完整请求，不交叉覆盖 KV cache；continuous batching 实现改按 `09_continuous_batching_contract.md` 的 slot/KV 隔离与并发验收执行。
+- [ ] B=1 基线中，单卡串行执行完整请求，不交叉覆盖 KV cache；continuous batching 实现改按 `runtime/continuous_batching.md` 的 slot/KV 隔离与并发验收执行。
 - [ ] EOS/EOG、`max_tokens` 和 context limit 都能停止生成。
 - [ ] SIGTERM 能让服务在十秒内退出并释放 GPU 资源；测试同时覆盖空闲 `accept()` 和请求执行/排队期间的 shutdown。
 - [ ] 停止状态只有一条可证明的传播链，不存在 handler 写 `g_stop`、loop 却只读另一个 `stop_` 的脱节实现。

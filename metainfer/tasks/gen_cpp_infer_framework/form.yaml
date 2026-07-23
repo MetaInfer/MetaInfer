@@ -9,6 +9,25 @@
   question: "Enter the model weight path (path on your storage, not model name on hugging face):"
   header: "Target model path"
   required: true
+  form: file
+
+- key: weight_format
+  question: "Select the stored weight format; auto-detection uses the model path."
+  header: "Weights"
+  required: false
+  multi: false
+  default: "Auto-detect from model path"
+  options:
+    - label: "Auto-detect from model path"
+      description: "Infer F16 or Q8_0 from the filename; an ambiguous directory/path is rejected"
+    - label: "F16 GGUF"
+      description: "Non-quantized FP16 GGUF"
+    - label: "BF16 GGUF"
+      description: "Reserved for a future Loader/Backend contract; currently rejected before task start"
+    - label: "Q8_0 GGUF"
+      description: "8-bit block-quantized GGUF"
+    - label: "Other GGUF"
+      description: "Reserved for future tensor formats; currently rejected before task start"
 
 
 - key: target_hardware
@@ -50,28 +69,53 @@
       description: "In-flight request scheduling"
     - label: "Tensor parallelism"
       description: "Multi-GPU TP"
-    - label: "Speculative decoding"
-      description: "Draft + verify"
 
-- key: perf_target
-  question: "What is the primary performance goal?"
-  header: "Perf goal"
+- key: max_context_length
+  question: "Maximum supported context length in tokens; validated by this task's requirement compiler."
+  header: "Context"
+  required: false
+  form: number
+  default: 4096
+
+- key: kv_block_size
+  question: "Paged KV block size in tokens; used only when Paged KV cache is selected."
+  header: "KV block"
+  required: false
+  form: number
+  default: 16
+
+- key: kv_capacity_policy
+  question: "Choose whether every active request is guaranteed the full context or all requests share one KV token budget; used only when Paged KV cache is selected."
+  header: "KV capacity"
   required: false
   multi: false
-  default: "throughput"
+  default: "Full context per request"
   options:
-    - label: "Throughput"
-      description: "Max tokens/sec aggregate"
-    - label: "Latency"
-      description: "Min per-request TTFT/TPOT"
-    - label: "Memory"
-      description: "Min GPU memory footprint"
+    - label: "Full context per request"
+      description: "Provision enough KV blocks for every active request to reach the configured context limit"
+    - label: "Shared token budget"
+      description: "All active requests share the configured total cached-token budget"
 
-- key: perf_budget
-  question: "What is the acceptance perf bar (vs a reference like vLLM)?"
-  header: "Perf bar"
+- key: max_total_cached_tokens
+  question: "Total cached-token budget across active requests; used only with Paged KV cache and Shared token budget. Use 0 to match one full context."
+  header: "KV tokens"
   required: false
-  default: ">=50% of vLLM throughput"
+  form: number
+  default: 0
+
+- key: max_concurrency
+  question: "Maximum in-flight requests; used only when Continuous batching is selected."
+  header: "Concurrency"
+  required: false
+  form: number
+  default: 4
+
+- key: tp_size
+  question: "Number of ranks and GPUs; used only when Tensor parallelism is selected, and the current validated implementation requires exactly 2."
+  header: "TP size"
+  required: false
+  form: number
+  default: 2
 
 - key: max_iterations
   question: "Max orchestrator iterations to allow (each iteration = plan/implement/test/optimize)?"
@@ -80,6 +124,8 @@
   multi: false
   default: "20"
   options:
+    - label: "6"
+      description: "Short regression run for a previously validated capability set"
     - label: "10"
       description: "Quick prototype"
     - label: "20"

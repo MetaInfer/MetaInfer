@@ -5,13 +5,18 @@ from metainfer.orchestrator.tasks.base import TaskPlugin
 
 DIAGNOSTIC_GLOBS = (
     "oracle-report.json",
+    "oracle-stages.json",
     "server.stdout.log",
     "server.stderr.log",
     "cpp-build.*.log",
+    "numeric-test-report.json",
+    "numeric-test.*.log",
     "*-test.log",
     "test.log",
     "judge.*",
     "*.prompt.txt",
+    "*.status.json",
+    "retrospective.md",
 )
 
 

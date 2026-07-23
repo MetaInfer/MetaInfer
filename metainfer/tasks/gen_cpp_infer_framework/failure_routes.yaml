@@ -1,0 +1,207 @@
+schema_version: 1
+
+defaults:
+  category: unclassified
+  debugger_timeout_s: 900
+  knowledge_context: "runtime correctness debugging"
+  likely_files:
+    - src/**/*.cpp
+    - include/**/*.hpp
+    - serve.sh
+  targeted_checks:
+    - "Run bash build.sh once."
+    - "Reproduce only the failing behavior; do not run the full oracle or test.sh."
+
+routes:
+  - id: build_or_link
+    category: build
+    priority: 120
+    match_any:
+      - "c++ build failed"
+      - "compile error"
+      - "compiler error"
+      - "undefined reference"
+      - "link error"
+      - "cmake error"
+    debugger_timeout_s: 600
+    knowledge_context: "compile compiler cmake hipcc link error undefined reference"
+    likely_files: [CMakeLists.txt, build.sh, "src/**/*", "include/**/*"]
+    targeted_checks:
+      - "Run bash build.sh once and inspect only the first compiler or linker error."
+      - "After the fix, run the affected binary with --help or --version."
+
+  - id: model_path_or_serve_args
+    category: startup
+    priority: 110
+    match_any:
+      - "model file not found"
+      - "could not open model"
+      - "no model path"
+    debugger_timeout_s: 600
+    knowledge_context: "model path serve.sh health http lifecycle gguf"
+    likely_files: [serve.sh, "src/main.cpp", "src/server.cpp", "src/**/*server*"]
+    targeted_checks:
+      - "Run bash build.sh once."
+      - "Start serve.sh once with MODEL_DIR set to the frozen target_model and verify that the process receives that model path."
+
+  - id: gguf_metadata_or_tensor
+    category: model_loading
+    priority: 80
+    match_any:
+      - "vocab_size mismatch"
+      - "gguf header"
+      - "gguf loader"
+      - "gguf parse"
+      - "metadata"
+      - "tensor not found"
+      - "missing tensor"
+      - "shape mismatch"
+      - "data_offset"
+    debugger_timeout_s: 900
+    knowledge_context: "gguf metadata tensor shape weight model loader tokenizer"
+    likely_files: ["src/**/*loader*", "include/**/*loader*", "src/**/*model*", "src/**/*token*"]
+    targeted_checks:
+      - "Run bash build.sh once."
+      - "Run the smallest available GGUF metadata or loader inspection path against the frozen target_model; do not start generation unless loading succeeds."
+
+  - id: vram_or_kv_allocation
+    category: memory
+    priority: 100
+    match_any:
+      - "insufficient vram"
+      - "kv_cache allocation failed"
+      - "kv cache allocation failed"
+      - "hiperroroutofmemory"
+      - "out of memory"
+      - "memory pressure"
+    debugger_timeout_s: 900
+    knowledge_context: "vram memory pressure kv cache allocation paged kv pool resourceexhausted"
+    likely_files: ["src/**/*engine*", "src/**/*kv*", "src/**/*memory*", "include/**/*kv*", serve.sh]
+    targeted_checks:
+      - "Run bash build.sh once."
+      - "Calculate and log weight bytes plus KV/runtime reservation before allocating; perform at most one local server boot after the estimate fits."
+
+  - id: numeric_or_nonfinite
+    category: numerics
+    priority: 100
+    match_any:
+      - "c0.1 numeric"
+      - "numeric tests failed"
+      - "non-finite"
+      - "nonfinite"
+      - "nan"
+      - "inf logits"
+      - "hipblas"
+    debugger_timeout_s: 900
+    knowledge_context: "logits numeric kernel q8_0 dequant hipblas rmsnorm rope attention swiglu nan"
+    likely_files: ["src/**/*kernel*", "src/**/*operator*", "src/**/*model*", "tests/**/*", "include/**/*"]
+    targeted_checks:
+      - "Run bash build.sh once."
+      - "Run build/qwen3_numeric_tests --report with a temporary report path and inspect only the first failing required case."
+
+  - id: tensor_parallel
+    category: distributed
+    priority: 90
+    capabilities_any: [tensor_parallelism]
+    match_any:
+      - "tensor parallel"
+      - "tp_size"
+      - "world_size"
+      - "allreduce"
+      - "all-reduce"
+      - "collective"
+      - "rank startup"
+      - "weight sharding"
+    debugger_timeout_s: 1200
+    knowledge_context: "tensor parallel tp2 world_size allreduce collective rank peer access weight sharding"
+    likely_files: ["src/**/*tp*", "src/**/*distributed*", "src/**/*model*", "include/**/*tp*"]
+    targeted_checks:
+      - "Run bash build.sh once."
+      - "Run only the failing TP rank-startup, collective, or sharded-linear check with the frozen tp_size."
+
+  - id: paged_kv
+    category: paged_kv
+    priority: 90
+    capabilities_any: [paged_kv_cache]
+    match_any:
+      - "paged kv"
+      - "paged attention"
+      - "block table"
+      - "kv pool"
+      - "stale handle"
+      - "stale view"
+      - "resourceexhausted"
+    debugger_timeout_s: 1200
+    knowledge_context: "paged kv paged attention block table kv pool stale handle resourceexhausted"
+    likely_files: ["src/**/*paged*", "src/**/*kv*", "src/**/*attention*", "include/**/*kv*"]
+    targeted_checks:
+      - "Run bash build.sh once."
+      - "Run only the block lifecycle, block-table bounds, or paged-attention numeric case named by the failure."
+
+  - id: continuous_batching
+    category: scheduling
+    priority: 90
+    capabilities_any: [continuous_batching]
+    match_any:
+      - "continuous batching"
+      - "concurrent"
+      - "concurrency"
+      - "scheduler"
+      - "sequence isolation"
+      - "cross-sequence"
+      - "max_observed_batch_size"
+    debugger_timeout_s: 1200
+    knowledge_context: "continuous batching concurrent scheduler sequence isolation slot mutex kv isolation"
+    likely_files: ["src/**/*scheduler*", "src/**/*batch*", "src/**/*request*", "src/**/*runner*"]
+    targeted_checks:
+      - "Run bash build.sh once."
+      - "Run only a two-request admission and sequence-isolation smoke with short outputs."
+
+  - id: http_or_lifecycle
+    category: serving
+    priority: 50
+    match_any:
+      - "server did not become healthy"
+      - "connection refused"
+      - "http 4"
+      - "http 5"
+      - "invalid json"
+      - "/v1/models"
+      - "/v1/chat/completions"
+    debugger_timeout_s: 600
+    knowledge_context: "http json choices chat/completions serve.sh health connection refused sigterm"
+    likely_files: [serve.sh, "src/**/*server*", "src/**/*http*", "src/main.cpp"]
+    targeted_checks:
+      - "Run bash build.sh once."
+      - "Start one owned server process, probe /v1/models and one minimal chat request, then terminate and wait for that captured PID."
+
+  - id: generation_timeout
+    category: generation
+    priority: 70
+    match_any:
+      - "timeouterror"
+      - "timed out"
+      - "generation timeout"
+      - "request timeout"
+    debugger_timeout_s: 900
+    knowledge_context: "generation loop timeout sampler kv state attention logits"
+    likely_files: ["src/**/*engine*", "src/**/*generation*", "src/**/*sampler*", "src/**/*attention*"]
+    targeted_checks:
+      - "Run bash build.sh once."
+      - "Run one short prompt with max_tokens=4 and inspect the exact prefill/decode step where progress stops."
+
+  - id: model_output
+    category: generation
+    priority: 60
+    match_any:
+      - "hard cases failed"
+      - "wrong model output"
+      - "gibberish"
+      - "judge_verdict"
+      - "model-quality probe"
+    debugger_timeout_s: 1200
+    knowledge_context: "wrong logits model output tokenizer generation sampler numeric kernel attention"
+    likely_files: ["src/**/*model*", "src/**/*token*", "src/**/*sampler*", "src/**/*attention*", "src/**/*kernel*"]
+    targeted_checks:
+      - "Run bash build.sh once."
+      - "Run the numeric suite, then send only the first failed oracle prompt with a short output limit and inspect tokens plus logits."

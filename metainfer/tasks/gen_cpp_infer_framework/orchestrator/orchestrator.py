@@ -29,6 +29,7 @@ from metainfer.orchestrator.paths import repo_root as _repo_root
 from metainfer.orchestrator.requirements import req_field_int
 from metainfer.orchestrator.state import StateStore
 from metainfer.orchestrator.token_budget import TokenBudget, resolve_budget_limits
+from .capabilities import CapabilityResolutionError, freeze_resolved_requirements
 from .pipeline import Orchestrator, OrchestratorConfig
 
 
@@ -44,6 +45,7 @@ _NOTEBOOKS_DIR = Path(__file__).resolve().parent.parent / "notebooks"
 #
 #   <state_dir>/               # hidden metadata owned by the server
 #   ├── requirements.json
+#   ├── resolved_requirements.json  # frozen capability/parameter contract
 #   ├── orchestrator.{pid,log}
 #   ├── run.json / timeline.jsonl / agents.json
 #   ├── iterations/<n>.json     # per-iteration records
@@ -69,6 +71,8 @@ def _task_subdirs(state_dir: Path, workspace_dir: Path) -> Dict[str, Path]:
         "logs_root": logs,
         "iterations_state": iterations_state,
         "requirements": state_dir / "requirements.json",
+        "resolved_requirements": state_dir / "resolved_requirements.json",
+        "stable_candidate": state_dir / "stable_candidate.json",
         "pid_file": state_dir / "orchestrator.pid",
         "log_file": state_dir / "orchestrator.log",
         "run_file": state_dir / "run.json",
@@ -128,6 +132,31 @@ def run_with_requirements(
             requirements_path.read_text(encoding="utf-8"), encoding="utf-8"
         )
 
+    store = StateStore(state_dir)
+
+    # Compile the user-facing form fields into a deterministic capability
+    # contract before A can run. Restarts reuse the frozen snapshot; changing
+    # requirements.json underneath a live task is rejected by the compiler.
+    try:
+        resolved_req = freeze_resolved_requirements(req, state_dir)
+    except CapabilityResolutionError as exc:
+        run_status, _is_resume = store.init_or_resume(task_id)
+        note = f"requirements rejected ({exc.field}): {exc}"
+        store.update_run(
+            current_phase="finished",
+            finished=True,
+            final_status="stopped",
+            notes=[*run_status.notes, note],
+        )
+        store.append_timeline(
+            "requirements_rejected",
+            {"field": exc.field, "reason": str(exc)},
+        )
+        print(f"[metainfer] {note}")
+        return 2
+    runtime_req = dict(req)
+    runtime_req["resolved_requirements"] = resolved_req
+
     # Stamp PID file BEFORE doing anything heavy so the WebUI sees us
     # alive immediately.
     write_pid_file(paths["pid_file"], task_id)
@@ -137,7 +166,6 @@ def run_with_requirements(
     logs_root = paths["logs_root"]
     iterations_root = paths["code_root"]
 
-    store = StateStore(state_dir)
     cfg = OrchestratorConfig(
         workdir=state_dir,
         repo_root=repo_root,
@@ -194,7 +222,7 @@ def run_with_requirements(
         #   - workspace_dir: where generated iteration source trees live
         #   - logs_root: where reviewer writes review.md and where the
         #     prev-iter diagnostic snapshot lives
-        extra_add_dirs=[notebooks_dir, repo_root, workspace_dir, logs_root],
+        extra_add_dirs=[notebooks_dir, repo_root, workspace_dir, logs_root, state_dir],
         snapshot_file=paths["agents_file"],
         budget=budget,
     )
@@ -205,7 +233,7 @@ def run_with_requirements(
     # now"). The callback fires exactly once per task lifetime.
     if budget is not None and budget.max_cost_usd_hard is not None:
         budget._on_hard = lambda: manager.shutdown()
-    orch = Orchestrator(req=req, store=store, cfg=cfg, manager=manager,
+    orch = Orchestrator(req=runtime_req, store=store, cfg=cfg, manager=manager,
                         budget=budget)
 
     print(f"[metainfer] task_id        = {task_id}")
@@ -214,6 +242,7 @@ def run_with_requirements(
     print(f"[metainfer] code dir       = {iterations_root}")
     print(f"[metainfer] logs dir       = {logs_root}")
     print(f"[metainfer] notebooks      = {notebooks_dir}")
+    print(f"[metainfer] resolved req   = {paths['resolved_requirements']}")
     print(f"[metainfer] orchestrator starting; WebUI is in a separate process.")
 
     restore_signals = install_subagent_shutdown_handlers(

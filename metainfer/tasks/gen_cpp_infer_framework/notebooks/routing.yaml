@@ -1,0 +1,209 @@
+schema_version: 1
+
+documents:
+  implementation-blueprint:
+    path: reference/implementation_blueprint.md
+    summary: Integrated module ownership, interfaces, data flow, capability branches, and completion definition.
+  implementation-sequence:
+    path: reference/implementation_sequence.md
+    summary: Verified layer-by-layer implementation order, shape/state ledger, transaction boundaries, cleanup, and bounded B-phase checks.
+  capability-checklists:
+    path: validation/capability_checklists.md
+    summary: Exact minimum implementation and immutable evidence checklist for baseline, optional capabilities, and combinations.
+  z200-hardware:
+    path: platform/z200_hardware.md
+    summary: Z200 topology, gfx906 HIP constraints, memory, profiling, and tuning.
+  qwen3-forward:
+    path: model/qwen3/forward_graph.md
+    summary: Qwen3 model graph, tensor shapes, attention, and KV-cache expectations.
+  qwen3-model-contract:
+    path: model/qwen3/qwen3_8b_contract.md
+    summary: Qwen3-8B architecture, tensor naming, and baseline execution contract.
+  z200-operator-contract:
+    path: backend/z200/qwen3_operator_contract.md
+    summary: F16/Q8_0 dtype dispatch, HIP kernels, hipBLAS calls, layouts, and workspaces.
+  gguf-loader:
+    path: formats/gguf/qwen3_loader.md
+    summary: GGUF parsing, tensor validation, device ownership, and tokenizer metadata.
+  single-sequence-runtime:
+    path: runtime/single_sequence_runtime.md
+    summary: Runtime buffers, prefill/decode, KV state, sampler, and generation loop.
+  openai-http-server:
+    path: serving/openai_http_server.md
+    summary: C++ HTTP API, OpenAI schema, serve.sh, build, and lifecycle contract.
+  z200-numeric-tests:
+    path: validation/z200_numeric_tests.md
+    summary: C0.1 CPU-reference numeric tests for every baseline Z200 operator.
+  continuous-batching:
+    path: runtime/continuous_batching.md
+    summary: Dynamic scheduler, chunked prefill, packed batches, sequence isolation, and concurrency tests.
+  paged-kv-cache:
+    path: runtime/paged_kv_cache.md
+    summary: Physical KV block pool, per-sequence block tables, transactional capacity, paged attention, and lifecycle tests.
+  tensor-parallel:
+    path: distributed/tensor_parallel.md
+    summary: Weight-format-aware sharding, ranks, collectives, coordination, and multi-GPU tests.
+  paged-continuous-state-machine:
+    path: runtime/paged_continuous_state_machine.md
+    summary: Transaction order and invariants for Paged KV plus Continuous Batching.
+  tp-paged-kv-contract:
+    path: distributed/tp_paged_kv_contract.md
+    summary: Logical shared state, rank-local KV blocks, group prepare/commit, and TP sharding boundaries.
+  tp-continuous-batching-contract:
+    path: distributed/tp_continuous_batching_contract.md
+    summary: TP rank coordination, dense sequence slots, packed steps, group failure, and optional Paged override.
+  gguf-loader-template:
+    path: reference/gguf_loader_template.hpp
+    kind: reference-source
+    summary: Compiled checked-alignment and GGUF tensor file-range template.
+  scheduler-block-manager-template:
+    path: reference/scheduler_block_manager_template.hpp
+    kind: reference-source
+    summary: Compiled transactional block reservation and capacity-aware admission template.
+  tp-sharding-template:
+    path: reference/tp_sharding_template.hpp
+    kind: reference-source
+    summary: Compiled even-shard, head partition, and column/row TP range template.
+  framework-wiring-template:
+    path: reference/framework_wiring_template.hpp
+    kind: reference-source
+    summary: Compiled frozen config, logical StepPlan, rank-local snapshot, init journal, and transactional Tick template.
+  numeric-harness-template:
+    path: reference/numeric_harness_template.hpp
+    kind: reference-source
+    summary: Compiled capability-aware Numeric case registry, missing-case failure, and JSON report template.
+  verified-008-tp-paged-continuous:
+    path: case_studies/008_tp2_paged_continuous.md
+    kind: verified-case-study
+    summary: Proven TP2, Paged KV, and Continuous Batching integration patterns, evidence, limits, and non-generalizable choices from candidate 008.
+  performance-optimization-playbook:
+    path: performance/optimization_playbook.md
+    summary: Measurement decomposition, format/capability-specific bottlenecks, experiment discipline, and promotion gates.
+  z200-kernel-reference:
+    path: reference/qwen3_z200_kernels.hip.cpp
+    kind: reference-source
+    summary: Correctness-first HIP kernels and F16/Q8_0 hipBLAS wrappers.
+  tokenizer-header-reference:
+    path: reference/tokenizer.hpp
+    kind: reference-source
+    summary: Public Qwen3 byte-level BPE tokenizer data and API contract.
+  tokenizer-source-reference:
+    path: reference/tokenizer.cpp
+    kind: reference-source
+    summary: Byte-level BPE and single-turn Qwen3 chat-template implementation.
+
+role_routes:
+  planner:
+    required: [implementation-blueprint, capability-checklists, qwen3-model-contract, openai-http-server]
+    optional: [gguf-loader, single-sequence-runtime, qwen3-forward, z200-numeric-tests]
+    optional_limit: 2
+  implementer:
+    required:
+      - implementation-sequence
+      - capability-checklists
+      - qwen3-model-contract
+      - z200-operator-contract
+      - gguf-loader
+      - single-sequence-runtime
+      - openai-http-server
+    optional:
+      - implementation-blueprint
+      - qwen3-forward
+      - z200-numeric-tests
+      - z200-kernel-reference
+      - tokenizer-header-reference
+      - tokenizer-source-reference
+      - gguf-loader-template
+      - framework-wiring-template
+      - numeric-harness-template
+    optional_limit: 4
+  reviewer:
+    required: [implementation-blueprint, capability-checklists, qwen3-model-contract, openai-http-server]
+    optional: [implementation-sequence, gguf-loader, z200-operator-contract, single-sequence-runtime, z200-numeric-tests]
+    optional_limit: 2
+  test_writer:
+    required: [capability-checklists, openai-http-server, z200-numeric-tests]
+    optional: [z200-operator-contract, single-sequence-runtime]
+    optional_limit: 1
+  debugger:
+    required: [openai-http-server]
+    optional: [qwen3-model-contract, gguf-loader, z200-operator-contract, single-sequence-runtime]
+    optional_limit: 2
+  perf_tester:
+    required: [performance-optimization-playbook, z200-hardware, z200-operator-contract, single-sequence-runtime]
+    optional: [openai-http-server]
+    optional_limit: 2
+  perf_planner:
+    required: [performance-optimization-playbook, z200-hardware, z200-operator-contract, single-sequence-runtime]
+    optional: [z200-numeric-tests]
+    optional_limit: 2
+  retrospective:
+    required: []
+    optional: [performance-optimization-playbook, z200-hardware, z200-operator-contract, single-sequence-runtime]
+    optional_limit: 1
+  failure_retrospective:
+    required: []
+    optional: [openai-http-server, z200-operator-contract, single-sequence-runtime]
+    optional_limit: 1
+
+requirement_routes:
+  - id: hygon-z200
+    field: target_hardware
+    values: [Hygon Z200]
+    add:
+      planner:
+        required: [z200-operator-contract]
+        optional: [z200-hardware]
+      implementer:
+        optional: [z200-hardware]
+      reviewer:
+        optional: [z200-hardware]
+
+context_routes:
+  - id: build-or-link
+    roles: [planner, implementer, reviewer, debugger, failure_retrospective]
+    match_any: [compile, compiler, cmake, hipcc, link error, undefined reference]
+    required: [implementation-blueprint, z200-hardware, z200-operator-contract, openai-http-server]
+
+  - id: model-or-loader
+    roles: [planner, implementer, reviewer, debugger, failure_retrospective]
+    match_any: [gguf, tensor, shape, weight, model path, metadata]
+    required: [qwen3-model-contract, gguf-loader, gguf-loader-template]
+
+  - id: tokenizer
+    roles: [planner, implementer, reviewer, debugger, failure_retrospective]
+    match_any: [tokenizer, tokenization, bpe, utf-8, chat template, special token]
+    required: [gguf-loader, tokenizer-header-reference, tokenizer-source-reference]
+
+  - id: http-or-lifecycle
+    roles: [planner, implementer, reviewer, debugger, failure_retrospective]
+    match_any: [http, json, choices, chat/completions, serve.sh, health, connection refused, sigterm]
+    required: [openai-http-server]
+
+  - id: numeric-or-kernel
+    roles: [planner, implementer, reviewer, debugger, perf_planner, failure_retrospective]
+    match_any: [logits, q8_0, dequant, hipblas, rmsnorm, rope, attention, swiglu, argmax, nan]
+    required: [capability-checklists, z200-operator-contract, z200-numeric-tests, z200-kernel-reference]
+
+  - id: concurrency
+    roles: [planner, implementer, reviewer, debugger, perf_planner, failure_retrospective]
+    capabilities_any: [continuous_batching]
+    match_any: [concurrent, concurrency, batching, scheduler, race, slot, mutex, kv isolation]
+    required: [single-sequence-runtime, continuous-batching]
+
+  - id: paged-kv
+    roles: [planner, implementer, reviewer, debugger, perf_planner, failure_retrospective]
+    capabilities_any: [paged_kv_cache]
+    match_any: [paged kv, paged attention, block table, kv pool, stale handle, stale view, resourceexhausted]
+    required: [paged-kv-cache, scheduler-block-manager-template]
+
+  - id: tensor-parallel
+    roles: [planner, implementer, reviewer, debugger, perf_planner, failure_retrospective]
+    capabilities_any: [tensor_parallelism]
+    match_any: [tensor parallel, tp2, tp4, world_size, allreduce, all-reduce, collective, rank, peer access]
+    required: [tensor-parallel, tp-sharding-template, z200-hardware]
+
+  - id: memory
+    roles: [planner, implementer, reviewer, debugger, perf_planner, failure_retrospective]
+    match_any: [out of memory, oom, hiperroroutofmemory, vram, memory pressure]
+    required: [z200-hardware, z200-operator-contract, single-sequence-runtime]

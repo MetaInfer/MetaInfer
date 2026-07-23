@@ -45,6 +45,7 @@ Phase = Literal[
 Outcome = Literal[
     "ok",
     "logic_fail",
+    "replan",
     "infra_fail",
     "perf_regression",
     "aborted",
@@ -54,11 +55,14 @@ Outcome = Literal[
 # Runtime constants — useful where you need a value rather than a type.
 OK              : Outcome = "ok"
 LOGIC_FAIL      : Outcome = "logic_fail"
+REPLAN          : Outcome = "replan"
 INFRA_FAIL      : Outcome = "infra_fail"
 PERF_REGRESSION : Outcome = "perf_regression"
 ABORTED         : Outcome = "aborted"
 
-ALL_OUTCOMES: List[Outcome] = [OK, LOGIC_FAIL, INFRA_FAIL, PERF_REGRESSION, ABORTED]
+ALL_OUTCOMES: List[Outcome] = [
+    OK, LOGIC_FAIL, REPLAN, INFRA_FAIL, PERF_REGRESSION, ABORTED,
+]
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,7 @@ class Transition:
 # Flow:
 #   A_plan → B_implement → C_test → D_review ──┬─ C ok  → E_perf_test → F_perf_plan → A_plan (new iter)
 #                                                └─ C fail → B_implement (new iter)
+#                          └─ repeated signature → A_plan (new iter)
 #   B_implement fail → A_plan (new iter, replan with failure carried forward)
 #
 # D_review ALWAYS runs after C (regardless of C outcome). Its egress routing
@@ -122,14 +127,18 @@ class Transition:
 #
 PHASES: List[PhaseMeta] = [
     PhaseMeta("idle",        "idle",     "not started"),
-    PhaseMeta("A_plan",      "A: Plan",  "planner writes plan.md + test_spec.md"),
+    PhaseMeta(
+        "A_plan",
+        "A: Plan",
+        "planner writes plan.md + test_spec.md + plan_manifest.json",
+    ),
     PhaseMeta("B_implement", "B: Implement",
               "implementer writes code + smoke-tests serve.sh"),
     PhaseMeta("C_test",      "C: Correctness Test",
               "run immutable oracle (or test.sh) for correctness only"),
     PhaseMeta("D_review",    "D: Review + Retro",
-              "post-test reviewer writes review.md; advisory, does NOT gate. "
-              "Routes to E on C-pass, back to B on C-fail"),
+              "post-test reviewer writes review.md; explicit PASS gates E. "
+              "NEEDS_FIX or missing verdict routes back to B"),
     PhaseMeta("E_perf_test", "E: Perf Test",
               "agent writes + runs perf.sh (heavier load) → perf_report.json"),
     PhaseMeta("F_perf_plan", "F: Perf Plan",
@@ -154,10 +163,10 @@ PHASE_ORDER: List[Phase] = [
 # pair is treated as "close this iteration and start a fresh one at A_plan"
 # (see pipeline._loop — undefined transitions no longer abort the run).
 #
-# D_review's outcome is set by the orchestrator based on what C's outcome was
-# (NOT on whether the reviewer agent itself succeeded — D is advisory). So:
-#   (D_review, OK)         → E_perf_test   [meaning: C had passed]
-#   (D_review, LOGIC_FAIL) → B_implement   [meaning: C had failed]
+# D_review is a hard gate. C must pass and the reviewer must write an
+# explicit ``Verdict: PASS``. Otherwise D routes back to B:
+#   (D_review, OK)         → E_perf_test
+#   (D_review, LOGIC_FAIL) → B_implement
 # --------------------------------------------------------------------------- #
 
 TRANSITIONS: Dict[Tuple[Phase, Outcome], Transition] = {
@@ -169,11 +178,14 @@ TRANSITIONS: Dict[Tuple[Phase, Outcome], Transition] = {
     ("C_test",       OK):              Transition("C_test",  OK, "D_review",
                                                   label="pass",   carry_failure=False, consume_iteration=False),
     ("C_test",       LOGIC_FAIL):      Transition("C_test",  LOGIC_FAIL, "D_review",
-                                                  label="fail",   carry_failure=False, consume_iteration=False),
+                                                  label="fail",   carry_failure=True, consume_iteration=False),
+    ("C_test",       REPLAN):          Transition("C_test",  REPLAN, "A_plan",
+                                                  label="repeat → replan",
+                                                  carry_failure=True, consume_iteration=True),
     ("C_test",       INFRA_FAIL):      Transition("C_test",  INFRA_FAIL, "D_review",
-                                                  label="infra",  carry_failure=False, consume_iteration=False),
+                                                  label="infra",  carry_failure=True, consume_iteration=False),
     ("C_test",       PERF_REGRESSION): Transition("C_test",  PERF_REGRESSION, "D_review",
-                                                  label="regress", carry_failure=False, consume_iteration=False),
+                                                  label="regress", carry_failure=True, consume_iteration=False),
     ("D_review",     OK):              Transition("D_review", OK, "E_perf_test",
                                                   label="C ok → perf",
                                                   carry_failure=False, consume_iteration=False),
@@ -235,10 +247,11 @@ TRANSITIONS: Dict[Tuple[Phase, Outcome], Transition] = {
                                              carry_failure=True, consume_iteration=True),
 
     # ---- logic failures at A/E/F: redo in place, same folder -------------- #
-    # (SubAgentManager already retried 3× internally; one more redo here with
-    #  a fresh prompt before burning a new iteration folder.)
+    # A carries the task-local validator error so the planner can repair the
+    # exact plan schema/contract violation instead of repeating a blind prompt.
     ("A_plan",       LOGIC_FAIL): Transition("A_plan",       LOGIC_FAIL, "A_plan",
-                                             label="replan", carry_failure=False, consume_iteration=False),
+                                             label="A invalid → rewrite",
+                                             carry_failure=True, consume_iteration=False),
     ("E_perf_test",  LOGIC_FAIL): Transition("E_perf_test",  LOGIC_FAIL, "E_perf_test",
                                              label="redo",   carry_failure=False, consume_iteration=False),
     ("F_perf_plan",  LOGIC_FAIL): Transition("F_perf_plan",  LOGIC_FAIL, "F_perf_plan",
@@ -321,6 +334,7 @@ def outcome_label(o: Outcome) -> str:
     return {
         OK: "ok",
         LOGIC_FAIL: "logic fail",
+        REPLAN: "replan",
         INFRA_FAIL: "infra fail",
         PERF_REGRESSION: "perf regression",
         ABORTED: "aborted",

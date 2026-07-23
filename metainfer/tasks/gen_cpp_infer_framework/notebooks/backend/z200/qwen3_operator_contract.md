@@ -2,17 +2,22 @@
 
 > 用途：给生成 C++ 单卡推理框架的 Agent 一份可以直接照着实现和接线的算子知识库。本文描述当前算子的真实接口、Q8_0 反量化路径、张量布局、workspace 生命周期、prefill/decode 调用顺序和已知缺口。
 >
-> 算子参考源码（实现事实来源）：`MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/qwen3_z200_kernels.hip.cpp`
+> 算子参考源码（实现事实来源）：`notebooks/reference/qwen3_z200_kernels.hip.cpp`
 >
-> 模型数学与权重 shape：`MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/03_qwen3_8b_contract.md`
+> 模型数学与权重 shape：`notebooks/model/qwen3/qwen3_8b_contract.md`
 
-## 0. 核心约定：矩阵乘统一调用 hipBLAS
+## 0. 核心约定：按冻结权重格式调用 hipBLAS
 
-**所有带权重的矩阵乘都调用 hipBLAS，不在自定义 HIP kernel 中手写 GEMM。** Runtime 不直接调用一个裸的 Q8_0 GEMM，而是统一调用参考源码中的：
+**所有带权重的矩阵乘都调用 hipBLAS，不在自定义 HIP kernel 中手写 GEMM。** Runtime
+先读取冻结的 `weight_format`：
 
 ```cpp
-qwen3_z200_q8_linear_fp32(..., M, N, K, stream);
+Q8_0 -> qwen3_z200_q8_linear_fp32(..., M, N, K, stream);
+F16  -> qwen3_z200_f16_linear_fp32(..., M, N, K, stream);
 ```
+
+两条路径都把 FP32 activation cast 为 FP16 并使用 FP32 accumulation；只有 Q8_0 路径
+额外反量化 weight workspace。F16 权重常驻 device，不能错误调用 Q8_0 wrapper。
 
 这个 wrapper 内部已经按同一条 stream 串联：
 
@@ -28,7 +33,9 @@ x_fp16 @ W_fp16^T
     -> y_fp32[M,N]
 ```
 
-Qwen3-8B 中各算子的选择如下：
+下表列出 Q8_0 分支的入口；F16 分支保持相同 M/N/K，把每个
+`qwen3_z200_q8_linear_fp32` 替换为 `qwen3_z200_f16_linear_fp32`，Embedding 替换为
+`qwen3_z200_launch_embedding_lookup_f16`：
 
 | 模型算子 | 是否调用 hipBLAS | 实际入口 |
 | --- | --- | --- |
@@ -48,16 +55,21 @@ Qwen3-8B 中各算子的选择如下：
 
 ## 1. 首版目标和硬件边界
 
-目标运行环境是一张 Hygon Z200：`gfx906`、64 CU、wavefront 64、Fast F16、约 15.98 GiB device memory。首版支持：
+目标运行环境是一张 Hygon Z200：`gfx906`、64 CU、wavefront 64、Fast F16、约 15.98 GiB device memory。当前支持：
 
 - Qwen3-8B Dense；
 - 单卡、单请求、`B=1`；
-- Q8_0 权重常驻 device memory；
+- F16 或 Q8_0 权重常驻 device memory；
 - 自定义 HIP kernel 处理 Embedding、RMSNorm、RoPE、KV cache、GQA attention、SwiGLU 和残差；
 - hipBLAS 处理所有带权重的线性层；
 - 先保证 prefill/decode 数值正确，再优化 decode 性能。
 
-> **多并发实现覆盖说明：** 上述 `B=1` 是本算子参考实现的基线，不是多请求服务的实现方式。连续批处理必须以 `09_continuous_batching_contract.md` 为准：kernel 需要接收每个 row 的 `slot_id`/`position`，KV cache、scores 和 logits 必须按 slot/row 隔离；不能让多个 host 线程并发调用当前单序列 kernel。
+> **多并发实现覆盖说明：** 上述 `B=1` 是本算子参考实现的基线。选择 Continuous Batching
+> 时以 `runtime/continuous_batching.md` 为准，kernel 按 row 的 position、token row 和 KV view
+> 隔离 scratch、scores 与 logits；Continuous-only 使用 dense sequence slots，只有同时选择
+> Paged KV 时才使用 block tables 和 Paged Attention。
+
+> **Tensor Parallel 覆盖说明：** 本文的 `qwen3_z200_q8_linear_fp32()` 是单卡 Q8_0 基线。基础 TP 任务使用 `distributed/tensor_parallel.md` 定义的非量化 F16 Rank-local 权重，直接调用 local hipBLAS GEMM，不先运行 Q8_0 整矩阵反量化 wrapper。本文的 gfx906、Wave64、stream、workspace 和非线性 HIP kernel 约束仍然有效。
 
 当前源码是**正确性参考 kernel**，不是最终高性能实现。它没有 GGUF loader、模型类、buffer allocator 或完整 sampling policy，也没有 fused Q8_0 GEMV。这些由生成的 C++ runtime 补齐。源码已经提供确定性 greedy argmax primitive，但 stop、temperature、top-k/top-p 和生成状态仍由外部 sampler/engine 管理。
 
@@ -75,9 +87,9 @@ Qwen3-8B 中各算子的选择如下：
 | attention 输出 | `[T, 32, 128]`，字节上等价于 `[T,H]` | FP32 |
 | compact gate/up | 各自 `[T, 12288]` | FP32 |
 | SwiGLU 输出 | `[T, 12288]` | FP32 |
-| 每层 K/V cache | `[max_seq_len, 8, 128]` | FP32 |
+| dense K/V cache | `[max_seq_len, 8, 128]` | FP32；Paged/Continuous scalable path 为 FP16 |
 | logits | `[1, 151936]` | FP32 |
-| 模型矩阵权重 | `[N,K]`，HF 的 `[out,in]` | Q8_0 |
+| 模型矩阵权重 | `[N,K]`，HF 的 `[out,in]` | 冻结格式 F16 或 Q8_0 |
 | hipBLAS 激活/权重 workspace | `[M,K]` / `[N,K]` | FP16 |
 
 线性层统一采用：
@@ -107,6 +119,8 @@ FP32 hidden
 | `qwen3_z200_launch_cast_fp32_to_fp16` | FP32 激活转 FP16 | FP16 |
 | `qwen3_z200_launch_dequant_q8_0_to_fp16` | 整个 Q8_0 矩阵解到 FP16 workspace | FP16 |
 | `qwen3_z200_launch_embedding_lookup_q8_0` | 查找 token 行并在读取时解量化 | FP32 `[T,H]` |
+| `qwen3_z200_launch_embedding_lookup_f16` | 从常驻 F16 embedding 查找 token 行 | FP32 `[T,H]` |
+| `qwen3_z200_f16_linear_fp32` | activation cast + resident F16 `hipblasGemmEx` | FP32 `[M,N]` |
 | `qwen3_z200_q8_linear_fp32` | cast + dequant + `hipblasGemmEx` | FP32 `[M,N]` |
 | `qwen3_z200_launch_embedding_lookup` | FP32 embedding 查表备用路径 | FP32 `[T,H]` |
 | `qwen3_z200_launch_rms_norm` | hidden/最终 RMSNorm | FP32 `[rows,dim]` |
@@ -422,7 +436,7 @@ fused 优化必须选择：
 
 ```text
 read config -> 校验 H/I/L/Nq/Nkv/D/V
-read GGUF -> 校验并上传所有 Q8_0 权重
+read GGUF -> 校验并上传冻结格式的 F16/Q8_0 权重
 create HIP stream + hipBLAS handle
 hipblasSetStream(handle, stream)
 build cos/sin RoPE table
@@ -531,13 +545,16 @@ FP32 激活/中间 buffer 应做生命周期复用，但不能让一个 kernel �
 
 ### 8.3 KV cache
 
-当前 FP32 cache 在 4096 context 时：
+当前单序列/TP-only dense FP32 cache 在 4096 context 时：
 
 ```text
 2 * 36 * 4096 * 8 * 128 * 4 bytes = 1.125 GiB
 ```
 
-40960 context 会达到 11.25 GiB，单卡无法再同时容纳 Q8_0 模型和线性 workspace。首版默认 context 建议 4096 或更小，并在启动时按实际空闲显存拒绝不安全配置。后续可把 K/V kernel 统一改成 FP16，把 cache 占用减半。
+40960 context 会达到 11.25 GiB，单卡无法再同时容纳 Q8_0 模型和线性 workspace。默认
+context 建议 4096 或更小，并在启动时按实际空闲显存拒绝不安全配置。选择 Paged KV 或
+Continuous Batching 时，冻结合同改为 FP16 KV，并必须使用对应 FP16 writer/attention，不能
+只按 FP16 预算却继续分配 `float*`。
 
 ## 9. Stream、错误处理和同步
 
@@ -562,7 +579,8 @@ FP32 激活/中间 buffer 应做生命周期复用，但不能让一个 kernel �
 9. 整层：比较 attention residual、FFN residual。
 10. 全模型：固定 prompt 比较最后 logits/greedy token，再做多步 decode。
 
-静态源码契约测试只能检查接口和关键配置存在，不能替代 `gfx906` 实卡编译与数值测试。目标机至少执行：
+静态源码契约测试只能检查接口和关键配置存在，不能替代 `gfx906` 实卡编译与数值测试。
+以下命令只展示 system-owned `build.sh` 内部应产生的编译效果，Implementer 不得直接执行：
 
 ```bash
 hipcc --offload-arch=gfx906 -c qwen3_z200_kernels.hip.cpp \
@@ -578,6 +596,7 @@ hipcc --offload-arch=gfx906 -c qwen3_z200_kernels.hip.cpp \
 3. 优化 decode/prefill attention，替换当前朴素 softmax kernel；
 4. 将 QKV split、Q/K norm、RoPE、KV write 做适度融合；
 5. 实测显存不足时再做 LM Head vocab 分块；
-6. 最后再考虑多请求、paged KV cache、图捕获和 TP。
+6. 对当前任务未选择的多请求、Paged KV、图捕获或 TP 不做隐式扩展；已选择的能力必须在
+   correctness vertical slice 中实现，不能被当作“以后再考虑”。
 
 不要在正确性测试通过前同时改量化格式、attention 算法和执行调度，否则最终 logits 出错时很难定位生产者/消费者。

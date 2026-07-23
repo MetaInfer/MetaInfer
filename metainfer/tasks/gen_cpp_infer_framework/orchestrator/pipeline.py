@@ -37,9 +37,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,6 +66,18 @@ from metainfer.orchestrator.state import StateStore
 from metainfer.orchestrator.subagent_manager import AgentSpec, SubAgentManager
 from metainfer.orchestrator.token_budget import TokenBudget
 from .iteration_record import IterationRecord
+from .acceptance import (
+    AcceptanceContract,
+    annotate_development_gate,
+    audit_iteration,
+    performance_gate,
+    read_review_verdict,
+    validate_implementation_artifacts,
+    validate_plan_artifacts,
+)
+from .execution_policy import validate_code_writer_commands
+from .failure_routing import classify_failure
+from .promotion import load_stable_candidate, promote_stable_candidate
 
 
 def _load_iter(store: StateStore, n: int) -> Optional[IterationRecord]:
@@ -85,6 +100,23 @@ MAX_PHASE_ATTEMPTS = 3
 
 # Relative drop in the primary perf metric that counts as a regression.
 PERF_REGRESSION_THRESHOLD = 0.20
+
+
+class CppInferIterationWorkspace(IterationWorkspace):
+    """Keep ad-hoc server captures out of the copied source workspace."""
+
+    _RUNTIME_ARTIFACT_PATTERNS = ("server*.log", "server*.pid")
+
+    def _copy_code_tree(self, src: Path, dst: Path) -> None:
+        super()._copy_code_tree(src, dst)
+        for entry in dst.iterdir():
+            if not entry.is_file():
+                continue
+            if any(
+                fnmatch(entry.name, pattern)
+                for pattern in self._RUNTIME_ARTIFACT_PATTERNS
+            ):
+                entry.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -225,7 +257,7 @@ class Orchestrator:
                 *([cfg.logs_root] if cfg.logs_root else []),
             ],
         )
-        self.workspace = IterationWorkspace(
+        self.workspace = CppInferIterationWorkspace(
             cfg.iterations_root, logs_root=cfg.logs_root,
             diagnostic_globs=PLUGIN.diagnostic_globs,
         )
@@ -305,9 +337,30 @@ class Orchestrator:
 
         Returns a dict with ``iter_num``, ``start_phase``, and any context
         we can recover from the prior iteration (carried failure, last
-        outcome). The folder for an incomplete top iteration is deleted,
-        along with its state-store record (after we read its start_phase).
+        outcome). An iteration that reached the system-owned C_test phase
+        after a durable successful B phase is resumed in place. Other
+        incomplete iterations are deleted and recreated from their original
+        start phase because agent-owned files may be only partially written.
         """
+        latest = self.workspace.latest_number()
+        latest_rec = _load_iter(self.store, latest) if latest else None
+        if self._can_resume_c_test_in_place(latest, latest_rec):
+            self.store.append_timeline(
+                "iteration_resume_in_place",
+                {
+                    "iteration": latest,
+                    "phase": "C_test",
+                    "reason": "A and B completed; C has no persisted outcome",
+                },
+            )
+            return {
+                "iter_num": latest,
+                "start_phase": "C_test",
+                "carried_failure": None,
+                "last_outcome": P.OK,
+                "resume_existing": True,
+            }
+
         # 1. If the top iteration folder lacks the completion sentinel,
         #    discard it and archive its record as failed/interrupted —
         #    it was abandoned mid-flight. The archived record stays
@@ -343,13 +396,44 @@ class Orchestrator:
             iter_num = discarded
             carried_failure = None
             last_outcome: Optional[P.Outcome] = None
+            # An in-place phase retry may have produced a more useful
+            # failure than the iteration that originally opened this
+            # workspace. Prefer that latest durable phase result when the
+            # orchestrator is restarted mid-retry.
+            if old_rec is not None:
+                completed_phases = [
+                    phase_data
+                    for phase_data in old_rec.phases.values()
+                    if isinstance(phase_data, dict)
+                    and phase_data.get("failure")
+                ]
+                if completed_phases:
+                    latest_phase = max(
+                        completed_phases,
+                        key=lambda data: data.get("ended_at", data.get("started_at", 0)),
+                    )
+                    carried_failure = str(latest_phase["failure"])
+                    phase_outcome = latest_phase.get("outcome")
+                    if phase_outcome is not None:
+                        last_outcome = phase_outcome
+                elif old_rec.failure_reason:
+                    # An interrupted retry may retain only its fresh
+                    # `started_at` phase entry. Keep the preceding in-place
+                    # validator result via the record-level fallback.
+                    carried_failure = old_rec.failure_reason
             # Look at the iteration just before the discarded one to recover
             # context (failure reason, outcome) so the retry has the same
             # starting point as the original attempt.
             prev_rec = _load_iter(self.store, iter_num - 1) if iter_num > 1 else None
             if prev_rec is not None:
-                last_outcome = prev_rec.outcome
-                if start_phase == "B_implement" and prev_rec.outcome != P.OK:
+                if last_outcome is None:
+                    last_outcome = prev_rec.outcome
+                # Recreate the context with which the interrupted iteration
+                # originally opened. A fresh A plan needs the preceding
+                # failure just as much as a B redo does; otherwise a restart
+                # silently turns a failure-driven replan into a context-free
+                # plan and repeats the same implementation path.
+                if carried_failure is None and prev_rec.outcome != P.OK:
                     carried_failure = prev_rec.failure_reason
         else:
             # All existing iterations complete → start a fresh next one
@@ -372,7 +456,35 @@ class Orchestrator:
             "start_phase": start_phase,
             "carried_failure": carried_failure,
             "last_outcome": last_outcome,
+            "resume_existing": False,
         }
+
+    def _can_resume_c_test_in_place(
+        self,
+        iteration: int,
+        rec: Optional[IterationRecord],
+    ) -> bool:
+        """Return whether crash recovery can safely rerun C in the same tree.
+
+        C is system-owned and does not edit implementation artifacts. Once B
+        has a persisted OK outcome, discarding that tree would throw away a
+        complete implementation merely because the oracle process crashed.
+        The narrow checks below deliberately exclude A/B/D/E/F interruptions.
+        """
+        if iteration < 1 or rec is None or self.workspace.is_complete(iteration):
+            return False
+        if rec.status != "running" or not self.workspace.iter_dir(iteration).is_dir():
+            return False
+        a_phase = rec.phases.get("A_plan", {})
+        b_phase = rec.phases.get("B_implement", {})
+        c_phase = rec.phases.get("C_test", {})
+        return bool(
+            a_phase.get("outcome") == P.OK
+            and b_phase.get("outcome") == P.OK
+            and c_phase.get("started_at")
+            and not c_phase.get("ended_at")
+            and c_phase.get("outcome") is None
+        )
 
     @staticmethod
     def _phase_after(rec: Optional[IterationRecord]) -> P.Phase:
@@ -411,18 +523,30 @@ class Orchestrator:
 
         if resume_from is not None:
             phase: P.Phase = resume_from["start_phase"]
-            # iter_num is set to one less than the target so the first
-            # pass through the loop's "open a fresh folder" branch
-            # increments to the right number.
-            iter_num = resume_from["iter_num"] - 1
             ctx.failure = resume_from.get("carried_failure")
             ctx.last_outcome = resume_from.get("last_outcome")
+            if resume_from.get("resume_existing"):
+                iter_num = resume_from["iter_num"]
+                iter_dir: Optional[Path] = self.workspace.iter_dir(iter_num)
+                iter_rec: Optional[IterationRecord] = _load_iter(
+                    self.store, iter_num
+                )
+                if iter_rec is None:
+                    raise RuntimeError(
+                        f"cannot resume iteration {iter_num}: state record missing"
+                    )
+            else:
+                # iter_num is set to one less than the target so the first
+                # pass through the loop's "open a fresh folder" branch
+                # increments to the right number.
+                iter_num = resume_from["iter_num"] - 1
+                iter_dir = None
+                iter_rec = None
         else:
             phase = "A_plan"
             iter_num = 0
-
-        iter_dir: Optional[Path] = None
-        iter_rec: Optional[IterationRecord] = None
+            iter_dir = None
+            iter_rec = None
         final_status: Optional[str] = None
 
         while not self._stop and not P.is_terminal(phase):
@@ -434,7 +558,13 @@ class Orchestrator:
                     # ran out; it did NOT give up. Record as "stopped" if
                     # the last attempt didn't happen to land on OK, but
                     # never as "failed" — there is no Fail state.
-                    final_status = "success" if ctx.last_outcome == P.OK else "stopped"
+                    audit = self._run_final_audit()
+                    final_status = "success" if audit["passed"] else "stopped"
+                    self.store.append_timeline("final_audit", audit)
+                    if not audit["passed"]:
+                        self.store.update_run(
+                            notes=[f"FinalAudit: {failure}" for failure in audit.get("failures", [])]
+                        )
                     phase = "finished"
                     break
                 iter_num += 1
@@ -450,6 +580,11 @@ class Orchestrator:
                     started_at=time.time(),
                     start_phase=phase,
                 )
+                # Persist restored context immediately. If this first retry
+                # is interrupted before it produces a phase result, the next
+                # restart must still inherit the validator/runtime failure
+                # that caused the retry.
+                iter_rec.failure_reason = ctx.failure
                 _write_iter(self.store, iter_rec)
                 # Reset per-iteration session state — the new iteration's
                 # code tree is a fresh starting point, so resuming from
@@ -481,15 +616,46 @@ class Orchestrator:
             ctx.last_outcome = outcome
             ctx.phase_attempts[phase] = ctx.phase_attempts.get(phase, 0) + 1
 
-            # record phase outcome into the iteration record
+            # _run_agent persists role-specific metadata while the phase is
+            # running. Reload before writing the phase result so that a stale
+            # in-memory IterationRecord cannot erase that metadata. Persist
+            # immediately: in-place retries do not close the iteration, and
+            # crash recovery needs their latest failure context.
+            persisted_rec = _load_iter(self.store, iter_num)
+            if persisted_rec is not None:
+                iter_rec = persisted_rec
             phase_rec = iter_rec.phases.setdefault(phase, {})
             phase_rec["outcome"] = outcome
             phase_rec["attempts"] = ctx.phase_attempts[phase]
             phase_rec["ended_at"] = time.time()
             if failure:
                 phase_rec["failure"] = failure
+                # Mirror the latest in-place failure at record level so a
+                # subsequently interrupted retry cannot erase its context.
+                iter_rec.failure_reason = failure
+            else:
+                phase_rec.pop("failure", None)
+                iter_rec.failure_reason = None
             if perf:
                 phase_rec["perf"] = perf
+            _write_iter(self.store, iter_rec)
+
+            performance_required = bool(performance_gate(self.req, None)["required"])
+            should_promote = (
+                phase == "D_review" and outcome == P.OK and not performance_required
+            ) or (
+                phase == "E_perf_test" and outcome == P.OK and performance_required
+            )
+            if should_promote:
+                promotion = promote_stable_candidate(
+                    self.req,
+                    self.cfg.state_dir,
+                    iter_num,
+                    iter_dir,
+                    self._logs_dir_for(iter_num),
+                    iter_rec.to_dict(),
+                )
+                self.store.append_timeline("stable_candidate_promotion", promotion)
 
             # ---- token-budget circuit breaker ------------------------------ #
             # After every phase, check whether the task's cost budget has
@@ -643,7 +809,16 @@ class Orchestrator:
             # Loop exited because phase reached "finished" (shouldn't happen
             # in practice — no transition goes to finished) or self._stop
             # was set externally. Either way: never "failed".
-            final_status = "success" if ctx.last_outcome == P.OK else "stopped"
+            if self._stop:
+                final_status = "aborted"
+            else:
+                audit = self._run_final_audit()
+                final_status = "success" if audit["passed"] else "stopped"
+                self.store.append_timeline("final_audit", audit)
+                if not audit["passed"]:
+                    self.store.update_run(
+                        notes=[f"FinalAudit: {failure}" for failure in audit.get("failures", [])]
+                    )
         self.store.update_run(
             finished=True,
             final_status=final_status,
@@ -695,6 +870,14 @@ class Orchestrator:
             timeout=self.cfg.plan_timeout_s,
         )
         if ok:
+            errors = validate_plan_artifacts(
+                iter_dir,
+                self.req,
+                iteration=n,
+                prior_failure=ctx.failure,
+            )
+            if errors:
+                return P.LOGIC_FAIL, None, "A plan validation failed: " + "; ".join(errors)
             return P.OK, None, None
         return _failure_outcome(mode), None, err
 
@@ -746,6 +929,20 @@ class Orchestrator:
             ctx.b_session_id = sid
         if not ok:
             return _failure_outcome(mode), None, f"B (implement) failed: {err}"
+        command_errors = validate_code_writer_commands(
+            self._logs_dir_for(n), f"iter{n}-implementer"
+        )
+        if command_errors:
+            ctx.b_session_id = None
+            return (
+                P.LOGIC_FAIL,
+                None,
+                "B execution policy failed: " + "; ".join(command_errors),
+            )
+        errors = validate_implementation_artifacts(iter_dir, self.req)
+        if errors:
+            ctx.b_session_id = None
+            return P.LOGIC_FAIL, None, "B artifact validation failed: " + "; ".join(errors)
         # On clean pass, drop the session — the next B (if any) will be a
         # new iteration's fresh start, not a redo of this one.
         ctx.b_session_id = None
@@ -753,16 +950,11 @@ class Orchestrator:
 
     # ---- D: review + retro ---------------------------------------------- #
     #
-    # D runs AFTER every C (any outcome). It is advisory — the reviewer's
-    # verdict never gates anything. Its job is to write review.md with
-    # concrete improvement suggestions that go into ctx.review_feedback for
-    # the next iteration.
+    # D runs AFTER every C (any outcome). Its explicit verdict is a hard gate;
+    # review.md also carries concrete feedback into the next iteration.
     #
-    # D's "outcome" is DERIVED from C's outcome (not from whether the reviewer
-    # agent itself succeeded). The transition table maps:
-    #   (D_review, OK)         → E_perf_test   [meaning: C had passed]
-    #   (D_review, LOGIC_FAIL) → B_implement   [meaning: C had failed]
-    # So we set D's outcome to OK iff ctx.last_outcome (C's outcome) was OK.
+    # D returns OK only when C passed, the reviewer agent completed, and
+    # review.md contains an explicit PASS verdict.
 
     def _do_review(
         self, n: int, iter_dir: Path, ctx: IterationContext,
@@ -770,7 +962,7 @@ class Orchestrator:
         # Pull the failure + perf from C's outcome (already in ctx).
         c_outcome = ctx.last_outcome
         c_failure = ctx.failure
-        c_perf = ctx.last_perf
+        c_perf = ctx.this_iter_perf
         ok, _err, _mode, _sid = self._run_agent(
             name=f"iter{n}-reviewer", role="reviewer", iteration=n, iter_dir=iter_dir,
             prompt=review_prompt(
@@ -801,12 +993,18 @@ class Orchestrator:
              "feedback_captured": feedback is not None,
              "reviewer_agent_ok": ok},
         )
-        # D's outcome drives the next-phase routing. C passed → OK → E.
-        # C failed (any flavor) → LOGIC_FAIL → B (new iter). Reviewer agent
-        # failure does NOT change the routing — D is advisory.
-        if c_outcome == P.OK:
-            return P.OK, None, None
-        return P.LOGIC_FAIL, None, None
+        # D is a hard gate now. C must pass and the reviewer must explicitly
+        # write PASS; missing or NEEDS_FIX reviews route back to B.
+        if c_outcome != P.OK:
+            return P.LOGIC_FAIL, None, c_failure or "C correctness did not pass"
+        verdict = read_review_verdict(review_path)
+        if not ok:
+            return P.LOGIC_FAIL, None, f"D reviewer agent failed: {_err or 'unknown error'}"
+        if verdict != "PASS":
+            return P.LOGIC_FAIL, None, (
+                f"D review gate is {verdict or 'missing'}; expected explicit PASS"
+            )
+        return P.OK, None, None
 
     # ---- E: perf test (only on C-pass) ---------------------------------- #
 
@@ -892,20 +1090,27 @@ class Orchestrator:
         # The oracle writes perf_report.json; reuse the existing parser.
         perf = self._read_perf_report(n, iter_dir)
         e_ok = bool(perf) and perf.get("tokens_per_sec", 0) > 0
+        gate = performance_gate(self.req, perf)
         e_error = None if e_ok else (report.notes or "perf oracle produced no usable data")
+        if gate["required"] and not gate["passed"]:
+            e_ok = False
+            e_error = gate["reason"]
 
         self._write_retrospective(
             n=n, iter_dir=iter_dir, ctx=ctx, rec=rec,
             this_perf=perf, e_ok=e_ok, e_error=e_error,
         )
 
-        if not e_ok:
+        if not e_ok and gate["required"]:
             # Treat as INFRA_FAIL rather than a logic failure — a perf
             # oracle that can't get numbers usually means the server
             # wouldn't boot or answer, which is the same class of problem
             # as a crashed C step. Don't burn a C-repair slot on it.
             return P.INFRA_FAIL, perf, f"E (perf oracle): {e_error}"
-        return P.OK, perf, None
+        # Performance is informational by default. A missing/zero benchmark
+        # must not erase a functionally correct implementation unless the
+        # task explicitly supplied enforce_performance=true.
+        return P.OK, perf, e_error if e_error else None
 
     def _write_retrospective(
         self,
@@ -1133,10 +1338,11 @@ class Orchestrator:
         # a debugger sub-agent is dispatched in the SAME iteration folder to
         # fix the code, and the test is re-run. After the budget is exhausted
         # the final LOGIC_FAIL is returned and the transition table routes
-        # to D_review → B_implement (new iter). INFRA_FAIL and PERF_REGRESSION
-        # surface immediately without consuming repair attempts (the former
-        # is an environment issue, the latter is a perf-only signal where the
-        # code is already correct).
+        # to D_review → B_implement (new iter). If the same deterministic
+        # failure signature survives one targeted repair, C returns REPLAN
+        # and goes directly to A in a fresh iteration. INFRA_FAIL and
+        # PERF_REGRESSION surface immediately without consuming repair
+        # attempts.
         #
         # The correctness oracle is THIS task's own oracle — imported directly
         # from the plugin's oracles/ subpackage. No global registry, no
@@ -1169,6 +1375,8 @@ class Orchestrator:
         last_outcome: Optional[P.Outcome] = None
         last_perf: Optional[Dict[str, float]] = None
         last_failure: Optional[str] = None
+        signature_counts: Dict[str, int] = {}
+        pending_repair_route: Optional[Dict[str, Any]] = None
         # ccb conversation UUID shared across all debugger turns in this C
         # step. Attempt 1 mints a fresh session and we capture its id;
         # attempts 2..N pass it back via --resume so the debugger keeps its
@@ -1187,14 +1395,23 @@ class Orchestrator:
             pass
 
         for attempt in range(1, max_attempts + 1):
+            target_route = (
+                str(pending_repair_route.get("route_id"))
+                if pending_repair_route else None
+            )
             self.store.append_timeline("c_test_attempt", {
                 "iteration": n, "attempt": attempt, "max": max_attempts,
                 "mode": "oracle" if oracle is not None else "test.sh",
+                "target_route": target_route,
             })
 
             t_attempt_start = time.time()
             if oracle is not None:
-                outcome, perf, failure = self._run_oracle_once(n, iter_dir, ctx, oracle)
+                outcome, perf, failure = self._run_oracle_once(
+                    n, iter_dir, ctx, oracle,
+                    repair_route=pending_repair_route,
+                )
+                pending_repair_route = None
             else:
                 outcome, perf, failure = self._run_test_once(n, iter_dir, ctx)
             last_outcome, last_perf, last_failure = outcome, perf, failure
@@ -1242,6 +1459,51 @@ class Orchestrator:
                 )
                 return outcome, perf, failure
 
+            # Classify before spending another agent turn. A repeated stable
+            # signature means the prior targeted repair did not move the
+            # failure, so another resumed debugger turn and full oracle run
+            # would repeat the same expensive path. Replan in a fresh
+            # iteration instead.
+            classification = classify_failure(failure, self.req)
+            classification_data = classification.to_dict()
+            signature_count = signature_counts.get(classification.signature, 0) + 1
+            signature_counts[classification.signature] = signature_count
+            self.store.append_timeline("c_failure_classified", {
+                "iteration": n,
+                "attempt": attempt,
+                "route_id": classification.route_id,
+                "category": classification.category,
+                "signature": classification.signature,
+                "signature_count": signature_count,
+                "matched_term": classification.matched_term,
+            })
+            if signature_count >= 2:
+                repeated_failure = (
+                    "C repeated failure signature "
+                    f"{classification.signature} ({classification.route_id}) "
+                    "after a targeted repair; replan from A instead of "
+                    "repeating the same debugger/oracle cycle. Last failure: "
+                    f"{failure or '<missing>'}"
+                )
+                self.store.append_timeline("c_repeated_failure_replan", {
+                    "iteration": n,
+                    "attempt": attempt,
+                    "route_id": classification.route_id,
+                    "signature": classification.signature,
+                })
+                self._append_repair_record(
+                    repair_log_path, n, attempt,
+                    input_failure=failure, repair_md=None,
+                    debugger_ok=False,
+                    debugger_err="repeated failure signature",
+                    test_outcome=P.REPLAN, test_perf=perf,
+                    test_failure=repeated_failure,
+                    duration_s=attempt_duration,
+                    note="same signature repeated; route directly to A_plan",
+                    failure_classification=classification_data,
+                )
+                return P.REPLAN, perf, repeated_failure
+
             # LOGIC_FAIL: dispatch debugger and re-run, unless budget exhausted.
             if attempt >= max_attempts:
                 self.store.append_timeline("c_test_budget_exhausted", {
@@ -1255,6 +1517,7 @@ class Orchestrator:
                     test_outcome=outcome, test_perf=perf,
                     test_failure=failure, duration_s=attempt_duration,
                     note="repair budget exhausted, surfacing to D",
+                    failure_classification=classification_data,
                 )
                 break
 
@@ -1262,8 +1525,18 @@ class Orchestrator:
                 "iteration": n, "attempt": attempt,
                 "reason": (failure or "")[:500],
                 "resuming_session": c_session_id is not None,
+                "route_id": classification.route_id,
+                "category": classification.category,
+                "signature": classification.signature,
+                "debugger_timeout_s": min(
+                    self.cfg.impl_timeout_s, classification.debugger_timeout_s
+                ),
             })
             dbg_name = f"iter{n}-c-debugger.attempt{attempt}"
+            repair_md_path = (
+                self._logs_dir_for(n) / f"c-repair-attempt{attempt}.md"
+            )
+            repair_md_path.unlink(missing_ok=True)
             t_repair_start = time.time()
             # First repair turn: full bootstrap prompt (knowledge base
             # hints, framework rules, deliverable contract, etc.) +
@@ -1278,18 +1551,24 @@ class Orchestrator:
                     notebooks_dir=self.cfg.notebooks_dir,
                     iteration=n, attempt=attempt, max_attempts=max_attempts,
                     failure=failure, logs_dir=self._logs_dir_for(n),
+                    failure_route=classification_data,
                 )
             else:
                 prompt = c_repair_followup_prompt(
+                    req=self.req,
+                    notebooks_dir=self.cfg.notebooks_dir,
                     iteration=n, attempt=attempt, max_attempts=max_attempts,
                     new_failure=failure, logs_dir=self._logs_dir_for(n),
+                    failure_route=classification_data,
                 )
             ok, err, mode, sid = self._run_agent(
                 name=dbg_name,
                 role="c_debugger",
                 iteration=n, iter_dir=iter_dir,
                 prompt=prompt,
-                timeout=self.cfg.impl_timeout_s,
+                timeout=min(
+                    self.cfg.impl_timeout_s, classification.debugger_timeout_s
+                ),
                 resume_session_id=c_session_id,
             )
             # Capture the session id from the first turn so later turns
@@ -1299,7 +1578,6 @@ class Orchestrator:
             if sid:
                 c_session_id = sid
             repair_duration = time.time() - t_repair_start
-            repair_md_path = self._logs_dir_for(n) / f"c-repair-attempt{attempt}.md"
             repair_md = None
             if repair_md_path.is_file():
                 try:
@@ -1314,10 +1592,29 @@ class Orchestrator:
             except Exception:  # noqa: BLE001
                 pass
 
+            command_errors = validate_code_writer_commands(
+                self._logs_dir_for(n), dbg_name
+            )
+            if command_errors:
+                ok = False
+                mode = "logic"
+                err = "C debugger execution policy failed: " + "; ".join(
+                    command_errors
+                )
+            elif ok and not repair_md:
+                ok = False
+                mode = "logic"
+                err = (
+                    "C debugger did not write the required structured repair "
+                    f"log {repair_md_path.name}"
+                )
+
             if not ok:
                 self.store.append_timeline("c_test_repair_agent_fail", {
                     "iteration": n, "attempt": attempt,
                     "error": err, "mode": mode,
+                    "route_id": classification.route_id,
+                    "signature": classification.signature,
                 })
             # Record this repair attempt even if the debugger crashed — the
             # forensics log is for understanding what was tried, not just
@@ -1329,8 +1626,20 @@ class Orchestrator:
                 debugger_mode=mode, debugger_final=dbg_final,
                 test_outcome=None, test_perf=None, test_failure=None,
                 duration_s=repair_duration,
-                note="debugger crashed" if not ok else "debugger done, re-run pending",
+                note=(
+                    "debugger contract failed"
+                    if not ok else "debugger done, re-run pending"
+                ),
+                failure_classification=classification_data,
             )
+            if not ok:
+                replan_failure = (
+                    f"C debugger could not complete route {classification.route_id} "
+                    f"for signature {classification.signature}: "
+                    f"{err or 'unknown debugger failure'}"
+                )
+                return P.REPLAN, perf, replan_failure
+            pending_repair_route = classification_data
 
         # Budget exhausted: return the last LOGIC_FAIL. Transition table
         # routes (C_test, LOGIC_FAIL) → D_review → B_implement (new iter).
@@ -1353,6 +1662,7 @@ class Orchestrator:
         test_failure: Optional[str],
         duration_s: float,
         note: str = "",
+        failure_classification: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Append one structured record to ``<logs_dir>/c-repairs.jsonl``.
 
@@ -1369,6 +1679,7 @@ class Orchestrator:
             "attempt": attempt,
             "timestamp": time.time(),
             "input_failure": (input_failure or "")[:2000],
+            "failure_classification": failure_classification,
             "repair": None,
             "debugger": {
                 "ok": debugger_ok,
@@ -1404,15 +1715,25 @@ class Orchestrator:
         iter_dir: Path,
         ctx: IterationContext,
         oracle,
+        *,
+        repair_route: Optional[Dict[str, Any]] = None,
     ) -> Tuple[P.Outcome, Optional[Dict[str, float]], Optional[str]]:
         report_dir = self._logs_dir_for(n)
         report_dir.mkdir(parents=True, exist_ok=True)
         self.store.append_timeline("oracle_start",
-                                   {"iteration": n, "oracle": oracle.task_type})
+                                   {
+                                       "iteration": n,
+                                       "oracle": oracle.task_type,
+                                       "target_route": (
+                                           repair_route.get("route_id")
+                                           if repair_route else None
+                                       ),
+                                   })
         try:
             result = oracle.run(
                 iter_dir=iter_dir, req=self.req, report_dir=report_dir,
                 timeout_s=self.cfg.impl_timeout_s, manager=self.manager,
+                repair_route=repair_route,
             )
         except Exception as exc:  # noqa: BLE001
             err = f"oracle exception: {exc!r}"
@@ -1420,18 +1741,33 @@ class Orchestrator:
                                        {"iteration": n, "passed": False, "error": err})
             return P.INFRA_FAIL, None, err
 
+        development_gate = annotate_development_gate(
+            report_dir / "oracle-report.json",
+            iter_dir,
+            self.req,
+            iteration=n,
+        )
+
         self.store.append_timeline("oracle_end", {
-            "iteration": n, "passed": result.passed,
+            "iteration": n,
+            "passed": development_gate["passed"],
+            "full_contract_passed": result.passed,
+            "active_suites": development_gate["required_suites"],
+            "deferred_suites": development_gate["deferred_suites"],
             "judge_mode": result.judge_mode,
             "cases_total": len(result.cases),
             "cases_passed": sum(1 for c in result.cases if c.judge_verdict == "pass"),
             "failure_reason": result.failure_reason,
         })
 
-        if not result.passed:
+        if not development_gate["passed"]:
             # Map to LOGIC_FAIL; the repair loop in _do_test will decide
             # whether to retry in-place or surface.
-            return P.LOGIC_FAIL, result.perf or None, self._render_oracle_failure(n, result)
+            gate_failure = "; ".join(development_gate.get("errors", []))
+            detail = self._render_oracle_failure(n, result)
+            return P.LOGIC_FAIL, result.perf or None, (
+                f"development milestone gate failed: {gate_failure}\n{detail}"
+            )
 
         return P.OK, result.perf or None, None
 
@@ -1505,6 +1841,8 @@ class Orchestrator:
         )
         lines.append(f"  - {snap / 'oracle-report.json'}  "
                      "(full structured verdict + per-case responses)")
+        lines.append(f"  - {snap / 'oracle-stages.json'}  "
+                     "(C0-C4 stage timing, target route, and first failed layer)")
         lines.append(f"  - {snap / 'server.stderr.log'}   "
                      "(server error output — first place to look for crashes)")
         lines.append(f"  - {snap / 'server.stdout.log'}   "
@@ -1543,6 +1881,16 @@ class Orchestrator:
         logs_dir.mkdir(parents=True, exist_ok=True)
         prompt_file = logs_dir / f"{name}.prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
+        extra_args = list(self.cfg.extra_claude_args)
+        env_overrides: Dict[str, str] = {}
+        if role in {"implementer", "c_debugger"}:
+            extra_args.extend([
+                "--settings", str(self._implementer_policy_settings()),
+                "--disallowedTools", "Agent,Task,TaskOutput,Explore",
+            ])
+            env_overrides["METAINFER_COMMAND_POLICY_AUDIT"] = str(
+                logs_dir / f"{name}.policy-denials.jsonl"
+            )
         spec = AgentSpec(
             name=name,
             role=role,
@@ -1551,7 +1899,9 @@ class Orchestrator:
             log_dir=logs_dir,
             timeout_s=timeout,
             stuck_timeout_s=self.cfg.stuck_timeout_s,
-            extra_args=list(self.cfg.extra_claude_args),
+            max_retries=0 if role == "c_debugger" else 2,
+            extra_args=extra_args,
+            env_overrides=env_overrides,
             session_id=session_id,
             resume_session_id=resume_session_id,
         )
@@ -1591,6 +1941,31 @@ class Orchestrator:
              "session_id": result.session_id},
         )
         return result.success, result.error, result.failure_mode, result.session_id
+
+    def _implementer_policy_settings(self) -> Path:
+        """Materialize the B/C code-writer PreToolUse hook as local state."""
+        path = self.cfg.state_dir / "implementer_policy_settings.json"
+        hook_script = Path(__file__).with_name("pre_tool_policy.py").resolve()
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(hook_script))}"
+        payload = {
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": command}],
+                }],
+            },
+        }
+        encoded = json.dumps(payload, indent=2) + "\n"
+        try:
+            current = path.read_text(encoding="utf-8")
+        except OSError:
+            current = None
+        if current != encoded:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(encoded, encoding="utf-8")
+            os.replace(tmp, path)
+        return path
 
     # ------------------------------------------------------------------ #
     # Phase / iteration bookkeeping
@@ -1644,6 +2019,72 @@ class Orchestrator:
             {"iteration": rec.iteration, "status": status, "outcome": outcome,
              "perf": perf, "failure_reason": failure, "duration_s": rec.duration_s},
         )
+
+    def _run_final_audit(self) -> Dict[str, Any]:
+        """Audit the newest valid stable candidate, not merely the last trial."""
+        records = [
+            record for record in self.store.load_all_iterations()
+            if isinstance(record, dict) and isinstance(record.get("iteration"), int)
+            and not record.get("interrupted", False)
+        ]
+        if not records:
+            return {"passed": False, "failures": ["no iteration record exists"]}
+        by_iteration = {int(record["iteration"]): record for record in records}
+        latest_iteration = max(by_iteration)
+        candidate_numbers = set()
+        stable = load_stable_candidate(self.cfg.state_dir)
+        if stable and isinstance(stable.get("iteration"), int):
+            candidate_numbers.add(int(stable["iteration"]))
+        for iteration in sorted(by_iteration, reverse=True):
+            record = by_iteration[iteration]
+            phases = record.get("phases", {}) if isinstance(record, dict) else {}
+            if (
+                isinstance(phases, dict)
+                and (phases.get("C_test") or {}).get("outcome") == P.OK
+                and (phases.get("D_review") or {}).get("outcome") == P.OK
+            ):
+                candidate_numbers.add(iteration)
+
+        failed_candidates = []
+        for iteration in sorted(candidate_numbers, reverse=True):
+            record = by_iteration.get(iteration)
+            if record is None:
+                failed_candidates.append(
+                    {"iteration": iteration, "failures": ["iteration record is missing"]}
+                )
+                continue
+            audit = audit_iteration(
+                self.req,
+                self.workspace.iter_dir(iteration),
+                self._logs_dir_for(iteration),
+                record,
+                require_success_status=False,
+            )
+            if audit["passed"]:
+                return {
+                    **audit,
+                    "audited_iteration": iteration,
+                    "latest_iteration": latest_iteration,
+                    "used_stable_candidate": iteration != latest_iteration,
+                }
+            failed_candidates.append(
+                {"iteration": iteration, "failures": audit.get("failures", [])}
+            )
+
+        latest_record = by_iteration[latest_iteration]
+        latest_audit = audit_iteration(
+            self.req,
+            self.workspace.iter_dir(latest_iteration),
+            self._logs_dir_for(latest_iteration),
+            latest_record,
+        )
+        return {
+            **latest_audit,
+            "audited_iteration": latest_iteration,
+            "latest_iteration": latest_iteration,
+            "used_stable_candidate": False,
+            "candidate_failures": failed_candidates,
+        }
 
     def _resolve_max_iterations(self) -> int:
         """Resolve the iteration cap. cfg.max_iterations is itself seeded

@@ -182,9 +182,14 @@ LDS per CU           = 64 KB
 
 ## 2. 编译与构建环境
 
+> **任务级构建优先级：** 本节的 `hipcc`、CMake 和反汇编命令用于说明 system-owned
+> `build.sh`、`CMakeLists.txt` 或人工平台诊断应采用的参数。gen-cpp Implementer 只能编辑
+> `CMakeLists.txt`/源码并执行 `bash build.sh`，不得直接运行 `cmake`、`hipcc`、`make` 或
+> `ninja`；直接执行会触发 `bypass-system-build-sh` 策略。
+
 ### 2.1 hipcc 编译
 
-推荐命令：
+system-owned build path 内部对应的命令形态：
 
 ```bash
 hipcc -O3 \
@@ -381,7 +386,7 @@ buffer_load_dwordx4
 
 不能仅根据 C++ 类型判断最终 ISA。
 
-应查看反汇编：
+需要人工平台诊断时可查看反汇编；Implementer 任务内不要直接运行下面的编译命令：
 
 ```bash
 hipcc -O3 \
@@ -1203,6 +1208,8 @@ rocprof --list-derived
 ---
 
 ## 10. ISA 与反汇编检查
+
+本节同样属于平台维护/人工诊断附录，不授权 Implementer 绕过 `bash build.sh`。
 
 ### 10.1 保存中间文件
 

@@ -95,7 +95,7 @@ Global tensors:
 | lm head | `output.weight` | `{n_embd, n_vocab}` | optional, can tie to token embedding |
 | rerank/classifier head | `cls.output.weight` | `{n_embd, n_cls_out}` | optional |
 
-上表的 `output.weight optional` 是通用 llama.cpp 架构兼容行为，不是当前固定模型的 Loader 契约。当前 Qwen3-8B 的 `tie_word_embeddings=false`，所以 `05_qwen3_gguf_loader_notes.md` 必须要求独立 `output.weight`；缺失时不能回退到 token embedding。
+上表的 `output.weight optional` 是通用 llama.cpp 架构兼容行为，不是当前固定模型的 Loader 契约。当前 Qwen3-8B 的 `tie_word_embeddings=false`，所以 `formats/gguf/qwen3_loader.md` 必须要求独立 `output.weight`；缺失时不能回退到 token embedding。
 
 Per-layer tensors, for layer `i`:
 

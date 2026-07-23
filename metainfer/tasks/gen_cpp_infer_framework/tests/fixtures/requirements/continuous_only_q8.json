@@ -1,0 +1,8 @@
+{
+  "task_id": "fixture-continuous-q8",
+  "task_type": "gen-cpp-infer-framework",
+  "target_model": "/models/Qwen3-8B-Q8_0.gguf",
+  "target_hardware": "Hygon Z200",
+  "features": ["Continuous batching"],
+  "max_concurrency": 8
+}

@@ -7,9 +7,9 @@ from pathlib import Path
 
 
 TASK_DIR = Path(__file__).parents[1]
-TOKENIZER_CPP = TASK_DIR / "notebooks" / "tokenizer.cpp"
-TOKENIZER_HPP = TASK_DIR / "notebooks" / "tokenizer.hpp"
-LOADER_NOTES = TASK_DIR / "notebooks" / "05_qwen3_gguf_loader_notes.md"
+TOKENIZER_CPP = TASK_DIR / "notebooks" / "reference" / "tokenizer.cpp"
+TOKENIZER_HPP = TASK_DIR / "notebooks" / "reference" / "tokenizer.hpp"
+LOADER_NOTES = TASK_DIR / "notebooks" / "formats" / "gguf" / "qwen3_loader.md"
 
 
 def test_qwen3_tokenizer_source_uses_gguf_bpe_contract():

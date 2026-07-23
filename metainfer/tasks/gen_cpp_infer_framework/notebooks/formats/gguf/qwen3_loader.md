@@ -2,7 +2,10 @@
 
 这份文档给后续 agent 参考，用来在当前小型 C++/HIP 推理框架里实现一个最小可用的 Qwen3-8B GGUF loader。
 
-先把 `Qwen3-8B-Q8_0.gguf` 的权重和必要配置读出来，接到现有 Qwen3/HIP forward 与 `qwen3_z200_kernels.hip.cpp`。
+当前支持 F16 或 Q8_0 GGUF。Loader 必须先读取真实 tensor type，再按冻结的
+`weight_format` 校验并接到对应的 F16 direct GEMM 或 Q8_0 dequant + GEMM 路径。
+
+> **Tensor Parallel 覆盖说明：** 上述 Q8_0 是单卡基线。当任务选择 Tensor Parallel 时，首版应读取非量化 GGUF，并按 `distributed/tensor_parallel.md` 将 F16 主矩阵物化为 Rank-local shards。此时 Loader 不得强制 `output.weight` 或其他主矩阵为 Q8_0；遇到 Q8_0 主矩阵则返回清晰的 unsupported TP dtype，直到后续实现量化 TP 扩展。F32 权重可在物化时显式转换为 F16；BF16 需 Loader 和 Backend 另行声明支持。
 
 ## 1. 实现范围
 
@@ -12,7 +15,7 @@
 - GGUF 版本：优先支持 GGUF v3。
 - tensor 类型：`F32`、`F16`、`Q8_0`。
 - 权重加载：按 tensor name 建表，上传到 GPU。
-- tokenizer：从同一个 GGUF 的 metadata 构造 `Qwen3TokenizerData`，交给 `tokenizer.cpp` 的 byte-level BPE 实现。
+- tokenizer：从同一个 GGUF 的 metadata 构造 `Qwen3TokenizerData`，交给 `reference/tokenizer.cpp` 的 byte-level BPE 实现。
 
 第一版不做：
 
@@ -34,12 +37,12 @@ memory_map_weights(w, config, d_weight)
 GGUF 不能这样读，因为每个 tensor 都有自己的名字、shape、type 和 offset：
 
 ```text
-token_embd.weight              Q8_0 or F16/F32
-blk.0.attn_q.weight            Q8_0
+token_embd.weight              Q8_0 or F16
+blk.0.attn_q.weight            Q8_0 or F16
 blk.0.attn_norm.weight         F32/F16
 blk.0.attn_q_norm.weight       F32/F16
 output_norm.weight             F32/F16
-output.weight                  Q8_0, required for this fixed Qwen3-8B
+output.weight                  Q8_0 or F16, required for this fixed Qwen3-8B
 ```
 
 所以 GGUF loader 的核心是：
@@ -152,7 +155,7 @@ struct BlockQ8_0 {
 };
 ```
 
-每个 block 是 34 bytes，必须和 `qwen3_z200_kernels.hip.cpp` 里的 `BlockQ8_0` byte layout 一致。
+每个 block 是 34 bytes，必须和 `reference/qwen3_z200_kernels.hip.cpp` 里的 `BlockQ8_0` byte layout 一致。
 
 Q8_0 tensor size 不能按 `numel` 算，要按 row 算：
 
@@ -549,7 +552,7 @@ rope_theta == value from qwen3.rope.freq_base
 
 ## 14. 和现有 kernel 的对接
 
-当前 `qwen3_z200_kernels.hip.cpp` 已经有：
+当前 `reference/qwen3_z200_kernels.hip.cpp` 已经有：
 
 ```text
 Q8_0 embedding lookup
@@ -568,15 +571,20 @@ greedy argmax sampler primitive
 
 当前 kernel 文件已经导出 `qwen3_z200_launch_greedy_sample()`。Loader 不调用采样器；runtime forward 产出 `[151936]` FP32 device logits 后，由外部 sampler 在同一条 HIP stream 上调用 GPU argmax，并只把一个 token id 拷回 CPU。完整 logits 复制只用于 top-k/top-p、repetition penalty 或 correctness 调试。
 
-loader 只负责把 tensor 指针准备好。forward 根据 tensor type 选择：
+Loader 负责把 tensor 指针和 validated dtype 准备好。Forward 根据冻结格式选择完整路径：
 
 ```cpp
 if (weight.type == Q8_0) {
     qwen3_z200_q8_linear_fp32(...);
-} else if (weight.type == F16/F32) {
-    // Later: hipBLAS GEMM directly, or convert once.
+} else if (weight.type == F16) {
+    qwen3_z200_f16_linear_fp32(...); // cast activation, direct F16 weight GEMM
+} else if (weight.type == F32) {
+    // Loader converts the matrix once to F16 before rank-local materialization.
 }
 ```
+
+不能把 F16 分支留成 stub 或 `Later`：F16 GGUF 是当前受支持的 baseline，也是 TP2 的唯一
+真实模型格式。`f16_linear` numeric case 必须调用与 Server 相同的 wrapper。
 
 Norm 权重给 `qwen3_z200_launch_rms_norm` 和 `qwen3_z200_launch_per_head_rms_norm` 时，第一版最好统一成 device float pointer。
 
@@ -595,7 +603,7 @@ Norm 权重给 `qwen3_z200_launch_rms_norm` 和 `qwen3_z200_launch_per_head_rms_
 
 ## 16. Tokenizer metadata 交接
 
-GGUF parser 读取完 metadata 后，应构造 `tokenizer.hpp` 定义的：
+GGUF parser 读取完 metadata 后，应构造 `reference/tokenizer.hpp` 定义的：
 
 ```cpp
 Qwen3TokenizerData tokenizer_data;

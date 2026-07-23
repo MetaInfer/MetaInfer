@@ -2,20 +2,21 @@
 
 > 用途：指导实现 Agent 为生成的 C++/HIP 框架增加一个不加载真实模型、只使用确定性小张量的快速数值测试程序，并指导 MetaInfer 的 C 阶段在编译成功后、启动 HTTP server 前执行它。
 >
-> 本文只定义 **C0.1 快速算子数值测试**。固定 GGUF logits golden、完整模型数值 reference 和 HTTP 语义测试不属于本文范围。
->
-> 多 slot / continuous batching 的 KV 隔离、batched logits 与 HTTP 并发测试不属于 C0.1；这些实现和验收以 `09_continuous_batching_contract.md` 为准。
+> 本文定义 **C0.1 reduced numeric binary** 的 baseline operator cases，以及选中能力时追加的
+> reduced capability cases。固定 GGUF logits golden、完整模型 reference 和 HTTP 语义测试不在
+> C0.1 中。Paged、Continuous 和 TP 的 case 仍由各专题合同定义算法细节，但必须在同一个
+> `qwen3_numeric_tests` binary 中真实执行，不能 skip。
 
 参考路径：
 
 ```text
-MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/qwen3_z200_kernels.hip.cpp
-MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/04_qwen3_z200_operator_contract.md
-MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/06_qwen3_runtime_notes.md
-MetaInfer/metainfer/tasks/gen_cpp_infer_framework/notebooks/09_continuous_batching_contract.md
-MetaInfer/metainfer/tasks/gen_cpp_infer_framework/orchestrator/hardware.py
-MetaInfer/metainfer/tasks/gen_cpp_infer_framework/orchestrator/oracles/correctness.py
-MetaInfer/metainfer/tasks/gen_cpp_infer_framework/orchestrator/pipeline.py
+notebooks/reference/qwen3_z200_kernels.hip.cpp
+notebooks/backend/z200/qwen3_operator_contract.md
+notebooks/runtime/single_sequence_runtime.md
+notebooks/runtime/continuous_batching.md
+metainfer/tasks/gen_cpp_infer_framework/orchestrator/hardware.py
+metainfer/tasks/gen_cpp_infer_framework/orchestrator/oracles/correctness.py
+metainfer/tasks/gen_cpp_infer_framework/orchestrator/pipeline.py
 ```
 
 ## 1. C0.1 的目标和边界
@@ -51,6 +52,9 @@ C0.1 不能单独证明：
 - 36 层完整 Qwen3-8B 的最终 logits 与可信 reference 一致；
 - tokenizer/chat template 正确；
 - HTTP JSON、`serve.sh` 和生成文本正确。
+
+选择能力后追加的 reduced cases 可以证明 block/slot/rank 小张量合同，但同样不能代替真实
+8B 模型和 HTTP 行为验证。
 
 因此完整 C 流程应是：
 
@@ -113,7 +117,7 @@ add_library(qwen3_core STATIC
 )
 
 # qwen3_core 在这里统一链接 HIP runtime/hipBLAS，并使用系统 build.sh
-# 注入的 gfx906、Release 和编译器设置。
+# 注入的 gfx906、Release 和编译器设置。Implementer 不直接执行 cmake。
 
 add_executable(metainfer_cpp_server
     src/main.cpp
@@ -132,11 +136,8 @@ enable_testing()
 add_test(NAME qwen3_numeric COMMAND qwen3_numeric_tests)
 ```
 
-`qwen3_numeric_tests` 不能使用 `EXCLUDE_FROM_ALL`，因为 system-owned `build.sh` 只执行默认的：
-
-```bash
-cmake --build "$ROOT/build"
-```
+`qwen3_numeric_tests` 不能使用 `EXCLUDE_FROM_ALL`，因为 system-owned `build.sh` 只构建
+CMake 默认 target。Implementer 始终通过 `bash build.sh` 验证，不能复制内部 CMake 命令。
 
 ## 3. 测试程序 CLI 和返回契约
 
@@ -447,6 +448,23 @@ for (int m = 0; m < M; ++m) {
 - 输出布局确实是 row-major `[M,N]`，不是转置的 `[N,M]`；
 - `beta=0`，预填充的输出 canary 不应参与结果。
 
+### 5.4a F16 Embedding 与 Linear
+
+F16 任务不运行 Q8 dequant case，但必须运行真实 `f16_linear`，并让 Server 使用同一入口：
+
+```cpp
+qwen3_z200_launch_embedding_lookup_f16(...);
+qwen3_z200_f16_linear_fp32(...);
+```
+
+Linear 使用与 Q8 case 相同的 `M=2,N=3,K=32` row-major 数学，但 `W[N,K]` 直接是
+resident F16。CPU reference 先把 FP32 activation round 到 FP16，再与 F16 weight 做 FP32
+累加。检查 activation workspace 太小会拒绝、输出布局为 `[M,N]`、wrapper 没有分配或填充
+Q8 weight-dequant workspace。
+
+Embedding 使用 `vocab=4, hidden=64, token_ids=[3,1,3]`，确认 F16 row 转为 FP32、重复
+token 输出相同且非法 token 由 Runtime 在 launch 前拒绝。
+
 ### 5.5 Hidden RMSNorm
 
 入口：
@@ -728,7 +746,7 @@ auto cache_index = [=](int pos, int head, int dim) {
 B 实现 Agent 的顺序：
 
 ```text
-read 01/03/04/06/08 contracts
+read the routed model/operator/loader/runtime/numeric contracts
   -> create qwen3_core
   -> create server target
   -> create qwen3_numeric_tests target linked to qwen3_core
@@ -751,7 +769,7 @@ bash build.sh
 
 如果快速测试失败，B 应先修具体 operator，不要启动并加载 8B 模型浪费时间。
 
-## 9. C 阶段的准确插入点
+## 9. C 阶段的不可变执行位置
 
 当前 immutable C oracle 的主路径是：
 
@@ -763,7 +781,7 @@ materialize_hardware_binding
   -> HTTP cases + judge
 ```
 
-当前代码尚未自动运行 C0.1。接入后应变为：
+immutable C oracle 现在自动运行 C0.1，主路径为：
 
 ```text
 materialize_hardware_binding
@@ -775,13 +793,13 @@ materialize_hardware_binding
   -> HTTP cases + judge
 ```
 
-建议在：
+当前 task-local immutable Oracle 已经在以下实现中完成该接线：
 
 ```text
-MetaInfer/metainfer/tasks/gen_cpp_infer_framework/orchestrator/oracles/correctness.py
+metainfer/tasks/gen_cpp_infer_framework/orchestrator/oracles/correctness.py
 ```
 
-中 `_run_build_check()` 成功之后、`_start_server()` 之前调用：
+它在 `_run_build_check()` 成功之后、`_start_server()` 之前运行等价逻辑：
 
 ```python
 numeric_bin = iter_dir / "build" / "qwen3_numeric_tests"
@@ -829,7 +847,8 @@ with stdout_path.open("wb") as stdout_fp, stderr_path.open("wb") as stderr_fp:
     )
 ```
 
-C 必须：
+以下是 Oracle 的行为合同，不是 Implementer 的编辑任务。Implementer 不得修改
+`orchestrator/oracles/correctness.py`。C 必须：
 
 - 每次 C attempt 都重新运行 numeric binary；
 - 检查 binary 存在且是普通文件；
@@ -877,6 +896,21 @@ report: <logs>/numeric-test-report.json
 | greedy | 全 vocab 扫描、reduction、相同值取较小 id |
 
 ## 11. 通过条件
+
+`--report` JSON 使用固定 case id：
+
+```text
+基础：cast_fp32_to_fp16, rms_norm, per_head_rms_norm, rope_neox,
+      kv_write, prefill_gqa, swiglu, greedy
+F16：f16_linear
+Q8_0：dequant_q8_0, q8_embedding, q8_linear
+Paged KV：paged_attention
+Continuous Batching：packed_sequence_isolation
+TP：tp_collective, tp_sharded_linear
+```
+
+根对象必须包含 `passed: true` 和 `cases` 数组；每个必需 case 必须包含
+对应 `id` 与 `passed: true`。`skipped: true` 永远不能替代通过。
 
 C0.1 只有同时满足以下条件才算通过：
 

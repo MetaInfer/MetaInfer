@@ -1,0 +1,8 @@
+{
+  "task_id": "fixture-tp2-f16",
+  "task_type": "gen-cpp-infer-framework",
+  "target_model": "/models/Qwen3-8B-F16.gguf",
+  "target_hardware": "Hygon Z200",
+  "features": ["Tensor parallelism"],
+  "tp_size": 2
+}

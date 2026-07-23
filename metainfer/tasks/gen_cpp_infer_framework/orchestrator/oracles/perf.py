@@ -51,6 +51,7 @@ from metainfer.orchestrator.requirements import req_field
 import yaml
 
 from .gpu import GpuTelemetry
+from ..acceptance import AcceptanceContract
 from ..hardware import (
     HardwareProfileError,
     execution_environment,
@@ -162,6 +163,8 @@ class PerfReport:
     total_wall_s: float = 0.0
     concurrency: int = 0
     num_requests: int = 0
+    errors_total: int = 0
+    error_rate: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         d = self.__dict__.copy()
@@ -654,7 +657,7 @@ class PerfOracle:
             iteration=iteration,
             measured_at=time.time(),
             methodology={
-                "concurrency_ladder": list(self.concurrency_ladder),
+                "concurrency_ladder": list(_resolve_concurrency_ladder(req, self.concurrency_ladder)),
                 "runs_per_level": self.runs_per_level,
                 "warmup_requests": self.warmup_requests,
                 "request_timeout_s": REQUEST_TIMEOUT_S,
@@ -738,7 +741,7 @@ class PerfOracle:
                     return report
 
                 # Per-level sweep.
-                for c in self.concurrency_ladder:
+                for c in _resolve_concurrency_ladder(req, self.concurrency_ladder):
                     level_runs: List[PerfRunResult] = []
                     for run_idx in range(self.runs_per_level):
                         result = _run_one_level(
@@ -782,6 +785,10 @@ class PerfOracle:
             report.total_wall_s = primary["wall_s_sum"]
             report.concurrency = primary["concurrency"]
             report.num_requests = int(primary["num_requests_sum"])
+            report.errors_total = int(primary.get("errors_total", 0) or 0)
+            report.error_rate = round(
+                report.errors_total / report.num_requests, 6
+            ) if report.num_requests else 1.0
 
         # Target comparison (optional).
         target_tps = req.get("target_tokens_per_sec")
@@ -817,6 +824,7 @@ class PerfOracle:
         self._write_report(report, iter_dir, report_dir)
         return report
 
+
     def _write_report(
         self, report: PerfReport, iter_dir: Path, report_dir: Path,
     ) -> None:
@@ -834,6 +842,22 @@ class PerfOracle:
                 tmp.replace(p)
             except OSError:
                 pass
+
+
+def _resolve_concurrency_ladder(
+    req: Dict[str, Any], default: Tuple[int, ...]
+) -> Tuple[int, ...]:
+    """Compile the benchmark load from the selected runtime capability."""
+    contract = AcceptanceContract.from_request(req)
+    if not contract.requires("continuous_batching"):
+        return (1,)
+    configured = int(
+        contract.capability_parameters.get("continuous_batching", {}).get(
+            "max_concurrency", max(default)
+        ) or 1
+    )
+    values = [1, min(4, configured), configured]
+    return tuple(dict.fromkeys(max(1, value) for value in values))
 
 
 def _summarize_level(concurrency: int, runs: List[PerfRunResult]) -> Dict[str, Any]:

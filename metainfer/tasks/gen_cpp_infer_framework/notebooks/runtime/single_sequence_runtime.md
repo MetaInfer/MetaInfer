@@ -2,9 +2,9 @@
 
 这份文档给后续 agent 参考，用来实现一个不依赖 GGML 的 Qwen3-8B 推理 runtime。
 
-前一份 `05_qwen3_gguf_loader_notes.md` 解决“权重、固定 config 校验和 tokenizer metadata 怎么从 GGUF 读出来”。这份文档解决“模型加载后，token ids 怎么跑 prefill，decode 怎么循环，KV cache 怎么维护，sampler/tokenizer 怎么接起来”。最终 HTTP 暴露方式见 `07_qwen3_http_server_contract.md`。
+前一份 `formats/gguf/qwen3_loader.md` 解决“权重、固定 config 校验和 tokenizer metadata 怎么从 GGUF 读出来”。这份文档解决“模型加载后，token ids 怎么跑 prefill，decode 怎么循环，KV cache 怎么维护，sampler/tokenizer 怎么接起来”。最终 HTTP 暴露方式见 `serving/openai_http_server.md`。
 
-> **多并发实现覆盖说明：** 本文的 `Qwen3RuntimeState`、`reset() -> prefill() -> decode()` 和单份 sampler/KV cache 都是 B=1 的 bring-up 契约。实现多 HTTP 请求 continuous batching 时，必须改读 `09_continuous_batching_contract.md`：它定义 scheduler 是唯一 GPU 调用者、每请求 `SequenceState`/`slot_id`、batched runtime 接口和 kernel 改造要求。不要只移除 mutex 后并行调用本文的单序列 runtime。
+> **多并发实现覆盖说明：** 本文的 `Qwen3RuntimeState`、`reset() -> prefill() -> decode()` 和单份 sampler/KV cache 都是 B=1 的 bring-up 契约。实现多 HTTP 请求 continuous batching 时，必须改读 `runtime/continuous_batching.md`：它定义 scheduler 是唯一 GPU 调用者、每请求 `SequenceState`/`slot_id`、batched runtime 接口和 kernel 改造要求。不要只移除 mutex 后并行调用本文的单序列 runtime。
 
 目标是一个固定 Qwen3 dense text model 的小型 C++/HIP runtime，不做通用计算图框架。
 
@@ -55,19 +55,19 @@ loadmodel.cu
 新的 Qwen3 runtime 可以替代这些职责：
 
 ```text
-05_qwen3_gguf_loader_notes.md
+formats/gguf/qwen3_loader.md
   -> Qwen3GgufModel: config + typed weights
 
-06_qwen3_runtime_notes.md
+runtime/single_sequence_runtime.md
   -> Qwen3Runtime: buffers + KV cache + prefill/decode + logits
 
-qwen3_z200_kernels.hip.cpp
+reference/qwen3_z200_kernels.hip.cpp
   -> actual kernels and hipBLAS Q8_0 linear wrapper
 
-tokenizer.hpp / tokenizer.cpp
+reference/tokenizer.hpp / reference/tokenizer.cpp
   -> existing Qwen3 byte-level BPE + single-turn chat prompt
 
-07_qwen3_http_server_contract.md
+serving/openai_http_server.md
   -> Qwen3Engine + sampler + OpenAI-compatible HTTP server
 ```
 
@@ -362,7 +362,7 @@ K: [max_seq_len, n_kv_head, head_dim]
 V: [max_seq_len, n_kv_head, head_dim]
 ```
 
-总大小：
+本节的 dense baseline 使用 FP32 cache，总大小：
 
 ```cpp
 kv_bytes = n_layer * 2 * max_seq_len * n_kv_head * head_dim * sizeof(float);
@@ -383,7 +383,10 @@ kv_dim = 8 * 128 = 1024
 
 用 `dim` 分配会多 4 倍。
 
-第一版 KV cache 用 FP32，直接适配当前 attention kernels。后面要省显存，可以改 FP16 KV cache，同时修改 attention kernel 的读类型。
+单序列和 TP-only 的 dense baseline 使用 FP32，直接适配当前 reference attention kernels。
+选择 Continuous Batching 或 Paged KV 时，冻结 resource contract 使用 FP16 KV：对应 runtime
+必须改用 FP16 writer/attention，并按 sequence slot 或 block table 寻址。不得只把显存公式
+改成 FP16 而继续分配 `float*`。
 
 `max_seq_len=4096` 时的精确占用为：
 
@@ -657,9 +660,22 @@ hipblasSetStream(handle, stream);
 
 禁止两个 linear 并发使用共享 workspace，也不要在另一个线程同时修改同一 hipBLAS handle 的 stream 或 pointer mode。逐层路径中禁止 `hipMalloc/hipFree`；所有 workspace 在初始化时分配一次。
 
+对 F16 权重调用：
+
+```cpp
+qwen3_z200_f16_linear_fp32(
+    handle, out, x, weight_f16,
+    x_fp16_workspace, x_workspace_elements,
+    m, n, k, stream);
+```
+
+F16 路径只 cast activation，不分配或填充 Q8_0 weight-dequant workspace。Embedding 使用
+`qwen3_z200_launch_embedding_lookup_f16()`。Loader、Numeric 和 Server 必须共享同一 dtype
+dispatch，不能让 `f16_linear` 测试走一条 Server 从不调用的实现。
+
 ## 13. Sampler
 
-当前 `qwen3_z200_kernels.hip.cpp` 已导出：
+当前 `reference/qwen3_z200_kernels.hip.cpp` 已导出：
 
 ```cpp
 extern "C" hipError_t qwen3_z200_launch_greedy_sample(
@@ -744,7 +760,7 @@ if (contains(effective_stop_ids, next_token)) {
 
 ## 14. Tokenizer 和 Detokenizer
 
-Tokenizer 已由本目录的 `tokenizer.hpp` / `tokenizer.cpp` 实现，是 CPU 侧 `Qwen3Engine` 功能，不属于 GPU forward。GGUF loader 构造：
+Tokenizer 已由 `reference/tokenizer.hpp` / `reference/tokenizer.cpp` 实现，是 CPU 侧 `Qwen3Engine` 功能，不属于 GPU forward。GGUF loader 构造：
 
 ```text
 tokenizer.ggml.model
@@ -986,8 +1002,9 @@ failure -> state.current_pos = old_pos; state.valid = false; state.has_logits = 
 7. 用固定 token ids 做 logits/KV 数值验证。
 8. 接现有 `Qwen3Tokenizer` 和单轮 chat template。
 9. 为 top-k/top-p、temperature、repetition penalty 和调试接完整 logits 的 CPU sampler。
-10. 接 `07_qwen3_http_server_contract.md` 的 C++ HTTP server。
-11. 再考虑 chunked prefill、GPU logit processors、FP16 KV、paged KV、性能优化。
+10. 接 `serving/openai_http_server.md` 的 C++ HTTP server。
+11. 接入任务已经选择的 Continuous/Paged/TP 分支；未选择能力才留作后续扩展。
+12. 正确性 vertical slice 通过后再做 GPU logit processors 和性能优化。
 
 ## 19. 固定生成状态机
 
@@ -1109,4 +1126,4 @@ whether any buffer has NaN
 
 端到端比较时必须使用同一份 Q8_0 GGUF、完全相同的 token ids 和 greedy 参数。先比较 logits/top-1，再比较生成 token；不要只用“同一句 prompt”，因为 chat template、thinking mode 或 BOS 差异会改变实际输入 token。
 
-HTTP 层的额外验收见 `07_qwen3_http_server_contract.md`。
+HTTP 层的额外验收见 `serving/openai_http_server.md`。

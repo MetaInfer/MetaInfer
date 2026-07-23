@@ -1,0 +1,145 @@
+schema_version: 1
+
+defaults:
+  required_documents: [implementation-blueprint, capability-checklists]
+  reference_templates: []
+  root_cause_checks:
+    - "Identify the first failed oracle layer and the first concrete error, not a later warning."
+    - "Confirm the failing capability is selected by the frozen requirements before editing it."
+  evidence_required:
+    - "Record the exact failing case, command, and bounded output in c-repair-attemptN.md."
+    - "After the minimal fix, record the route's narrow verification result."
+
+routes:
+  build_or_link:
+    required_documents: [z200-hardware, implementation-blueprint]
+    reference_templates: []
+    root_cause_checks:
+      - "Use the first compiler or linker error; later errors are usually cascades."
+      - "Check target source ownership, include paths, symbol signature, and HIP architecture."
+    evidence_required:
+      - "bash build.sh exits zero and produces both required binaries."
+
+  model_path_or_serve_args:
+    required_documents: [openai-http-server, gguf-loader]
+    reference_templates: [gguf-loader-template]
+    root_cause_checks:
+      - "Trace positional $2, MODEL_DIR, and frozen default model path in that order."
+      - "Distinguish a regular GGUF file path from a directory before resolving files."
+    evidence_required:
+      - "One owned serve.sh process receives the frozen target_model and reaches the loader."
+
+  gguf_metadata_or_tensor:
+    required_documents: [qwen3-model-contract, gguf-loader]
+    reference_templates: [gguf-loader-template]
+    root_cause_checks:
+      - "Verify data_base = align_up(tensor_info_end, general.alignment)."
+      - "Verify absolute tensor range uses data_base + relative tensor.offset with overflow checks."
+      - "Compare required tensor names, dtype, rank, and shape before uploading weights."
+    evidence_required:
+      - "A known tensor byte/value fingerprint comes from the aligned tensor data blob."
+      - "The smallest loader inspection reports the frozen Qwen config and all required tensors."
+
+  vram_or_kv_allocation:
+    required_documents: [implementation-blueprint, capability-checklists, single-sequence-runtime]
+    reference_templates: [scheduler-block-manager-template]
+    root_cause_checks:
+      - "Separate model weight bytes, rank-local KV bytes, workspace bytes, and temporary upload copies."
+      - "Check that TP uses local KV heads and that capacity policy matches frozen concurrency."
+      - "Check allocation lifetime; host staging or duplicate device weights may survive too long."
+    evidence_required:
+      - "Log a per-rank byte budget before the first full-model boot."
+      - "One bounded boot either fits or returns a specific ResourceExhausted error without fallback."
+
+  numeric_or_nonfinite:
+    required_documents: [capability-checklists, z200-operator-contract, z200-numeric-tests]
+    reference_templates: [gguf-loader-template, numeric-harness-template]
+    capability_templates:
+      paged_kv_cache: [scheduler-block-manager-template]
+      continuous_batching: [scheduler-block-manager-template]
+      tensor_parallelism: [tp-sharding-template]
+    root_cause_checks:
+      - "Read numeric-test-report.json and isolate the first missing, skipped, or failed required case."
+      - "For a missing kv_capacity_contract, instantiate the frozen capacity policy; do not add a name-only PASS."
+      - "For non-finite forward output, clear Loader fingerprint and the first failing layer before changing later kernels."
+      - "Write the exact hipBLAS transA/transB/M/N/K/lda/ldb/ldc before changing layout."
+    evidence_required:
+      - "The exact required case ID exists, executes, and compares output/state against an independent reference."
+      - "qwen3_numeric_tests exits zero with no required skip."
+
+  tensor_parallel:
+    required_documents: [tensor-parallel, capability-checklists]
+    reference_templates: [tp-sharding-template]
+    combination_documents:
+      tp_with_paged_kv: [tp-paged-kv-contract]
+      tp_with_continuous_batching: [tp-continuous-batching-contract]
+      tp_with_paged_kv_and_continuous_batching: [tp-paged-kv-contract, paged-continuous-state-machine]
+    root_cause_checks:
+      - "Check frozen tp_size, device ids, head divisibility, shard dimension, and local tensor byte range."
+      - "Compare every rank's logical StepPlan and collective sequence before investigating numeric drift."
+      - "Never use a full-model TP1 run as the repair reference."
+    evidence_required:
+      - "Reduced tp_sharded_linear and tp_collective cases pass at the frozen topology."
+      - "Runtime metadata and logs prove every required rank initialized without TP1 fallback."
+
+  paged_kv:
+    required_documents: [paged-kv-cache, capability-checklists]
+    reference_templates: [scheduler-block-manager-template]
+    combination_documents:
+      paged_kv_with_continuous_batching: [paged-continuous-state-machine]
+      tp_with_paged_kv: [tp-paged-kv-contract]
+      tp_with_paged_kv_and_continuous_batching: [tp-paged-kv-contract]
+    root_cause_checks:
+      - "Check block_size, block-table bounds, generation, reserved capacity, and committed length separately."
+      - "Verify batch Reserve is all-or-nothing and failed exhaustion leaves free_blocks unchanged."
+      - "Verify each attention row reads its own block table and past length."
+    evidence_required:
+      - "paged_attention and kv_capacity_contract pass without skip."
+      - "Long-context allocate/reuse returns the pool to its baseline free count."
+
+  continuous_batching:
+    required_documents: [continuous-batching, capability-checklists]
+    reference_templates: [scheduler-block-manager-template]
+    combination_documents:
+      paged_kv_with_continuous_batching: [paged-continuous-state-machine]
+      tp_with_continuous_batching: [tp-continuous-batching-contract]
+      tp_with_paged_kv_and_continuous_batching: [tp-continuous-batching-contract, tp-paged-kv-contract]
+    root_cause_checks:
+      - "Separate HTTP concurrency from actual Runner batch membership."
+      - "Check SequenceId ownership, row-local KV/sampling state, and Apply-after-Forward ordering."
+      - "Check cancel/disconnect is delivered to the single Scheduler owner."
+    evidence_required:
+      - "packed_sequence_isolation and kv_capacity_contract pass without skip."
+      - "Distinct concurrent outputs match their sequential baselines and max_observed_batch_size is at least 2."
+
+  http_or_lifecycle:
+    required_documents: [openai-http-server, implementation-blueprint]
+    reference_templates: []
+    root_cause_checks:
+      - "Check process ownership, foreground blocking, port propagation, and bounded shutdown."
+      - "Validate request JSON and the exact OpenAI response shape before changing model code."
+      - "Use server stderr to distinguish startup failure from an HTTP parser error."
+    evidence_required:
+      - "One owned process passes /v1/models and one minimal chat request, then exits cleanly."
+
+  generation_timeout:
+    required_documents: [single-sequence-runtime, implementation-blueprint]
+    reference_templates: [scheduler-block-manager-template, framework-wiring-template]
+    root_cause_checks:
+      - "Locate the last completed prefill/decode step and determine whether Scheduler, KV, Collective, or HTTP wait stopped progress."
+      - "Check impossible requests are rejected instead of remaining queued forever."
+      - "Check every in-flight flag has success, error, cancel, and timeout clearing paths."
+    evidence_required:
+      - "A short max_tokens=4 request completes within the bounded route timeout."
+
+  model_output:
+    required_documents: [qwen3-model-contract, qwen3-forward, z200-numeric-tests]
+    reference_templates: [gguf-loader-template, numeric-harness-template]
+    capability_templates:
+      tensor_parallelism: [tp-sharding-template]
+    root_cause_checks:
+      - "Verify tokenizer/chat input, Loader fingerprint, finite logits, and input dependence in that order."
+      - "Find the first layer whose invariant differs from a reduced reference; do not tune the prompt."
+      - "Check Rank 0 sampling and token broadcast before changing stopping logic."
+    evidence_required:
+      - "All required Numeric cases pass and the first failed oracle prompt produces finite, input-dependent tokens."

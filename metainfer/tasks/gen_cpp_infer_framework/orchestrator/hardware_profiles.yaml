@@ -10,7 +10,7 @@ profiles:
   Hygon Z200:
     id: hygon-z200sm80-gfx906
     status: initial-validation
-    source_notebook: notebooks/01_Hardware.md
+    source_notebook: notebooks/platform/z200_hardware.md
 
     detection:
       required_commands:
@@ -26,6 +26,7 @@ profiles:
 
     build:
       build_system: cmake
+      parallel_jobs: 4
       languages: [CXX, HIP]
       artifact: build/metainfer_cpp_server
       cmake_cache:

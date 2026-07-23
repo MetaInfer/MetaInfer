@@ -8,27 +8,35 @@ from pathlib import Path
 KERNEL_SOURCE = (
     Path(__file__).parents[1]
     / "notebooks"
+    / "reference"
     / "qwen3_z200_kernels.hip.cpp"
 )
 MODEL_CONTRACT = (
     Path(__file__).parents[1]
     / "notebooks"
-    / "03_qwen3_8b_contract.md"
+    / "model"
+    / "qwen3"
+    / "qwen3_8b_contract.md"
 )
 OPERATOR_CONTRACT = (
     Path(__file__).parents[1]
     / "notebooks"
-    / "04_qwen3_z200_operator_contract.md"
+    / "backend"
+    / "z200"
+    / "qwen3_operator_contract.md"
 )
 LOADER_CONTRACT = (
     Path(__file__).parents[1]
     / "notebooks"
-    / "05_qwen3_gguf_loader_notes.md"
+    / "formats"
+    / "gguf"
+    / "qwen3_loader.md"
 )
 RUNTIME_CONTRACT = (
     Path(__file__).parents[1]
     / "notebooks"
-    / "06_qwen3_runtime_notes.md"
+    / "runtime"
+    / "single_sequence_runtime.md"
 )
 
 
@@ -40,6 +48,8 @@ def test_q8_0_layout_and_required_entrypoints_are_present():
     assert "qwen3_z200_launch_dequant_q8_0_to_fp16" in source
     assert "qwen3_z200_launch_cast_fp32_to_fp16" in source
     assert "qwen3_z200_launch_embedding_lookup_q8_0" in source
+    assert "qwen3_z200_launch_embedding_lookup_f16" in source
+    assert "qwen3_z200_f16_linear_fp32" in source
     assert "qwen3_z200_q8_linear_fp32" in source
     assert "qwen3_z200_launch_greedy_sample" in source
 
@@ -59,13 +69,26 @@ def test_q8_linear_uses_fp16_inputs_and_fp32_accumulation():
     assert "HIPBLAS_OP_N" in linear
 
 
+def test_f16_linear_reuses_resident_weight_without_q8_dequant():
+    source = KERNEL_SOURCE.read_text(encoding="utf-8")
+    linear = source.split(
+        'extern "C" hipblasStatus_t qwen3_z200_f16_linear_fp32', 1
+    )[1].split(
+        '// Compute row-major Y[M, N] = X[M, K] * W[N, K]^T.', 1
+    )[0]
+
+    assert "qwen3_z200_launch_cast_fp32_to_fp16" in linear
+    assert "hipblasGemmEx(" in linear
+    assert "qwen3_z200_launch_dequant_q8_0_to_fp16" not in linear
+
+
 def test_single_gpu_contract_documents_the_runnable_q8_flow():
     model_contract = MODEL_CONTRACT.read_text(encoding="utf-8")
     operator_contract = OPERATOR_CONTRACT.read_text(encoding="utf-8")
 
-    assert "04_qwen3_z200_operator_contract.md" in model_contract
+    assert "backend/z200/qwen3_operator_contract.md" in model_contract
     assert "qwen3_z200_kernels.hip.cpp" in operator_contract
-    assert "## 0. 核心约定：矩阵乘统一调用 hipBLAS" in operator_contract
+    assert "## 0. 核心约定：按冻结权重格式调用 hipBLAS" in operator_contract
     assert "所有带权重的矩阵乘都调用 hipBLAS" in operator_contract
     assert "hipblasGemmEx(FP16, FP16, FP32 compute)" in operator_contract
     assert "qwen3_z200_launch_embedding_lookup_q8_0" in operator_contract

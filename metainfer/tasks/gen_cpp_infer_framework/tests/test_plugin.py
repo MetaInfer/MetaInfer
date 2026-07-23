@@ -32,6 +32,8 @@ from metainfer.tasks.gen_cpp_infer_framework.orchestrator.hardware import (
     resolve_hardware_profile,
 )
 from metainfer.server.registry import get as _get_web_plugin
+from metainfer.tasks.gen_cpp_infer_framework.orchestrator import phases
+from metainfer.tasks.gen_cpp_infer_framework.orchestrator.plugin import PLUGIN
 
 
 def test_feature_picker_only_contains_optional_runtime_capabilities():
@@ -46,8 +48,23 @@ def test_feature_picker_only_contains_optional_runtime_capabilities():
         "Paged KV cache",
         "Continuous batching",
         "Tensor parallelism",
-        "Speculative decoding",
     }
+
+
+def test_capability_parameters_are_declared_by_the_task_form():
+    form_path = Path(__file__).parents[1] / "form.yaml"
+    fields = yaml.safe_load(form_path.read_text(encoding="utf-8"))
+    by_key = {field["key"]: field for field in fields}
+
+    assert by_key["tp_size"]["form"] == "number"
+    assert by_key["kv_block_size"]["form"] == "number"
+    assert by_key["max_total_cached_tokens"]["form"] == "number"
+    assert by_key["max_concurrency"]["form"] == "number"
+    assert by_key["kv_capacity_policy"]["default"] == "Full context per request"
+    assert "used only when" in by_key["tp_size"]["question"]
+    assert "perf_target" not in by_key
+    assert "perf_reference" not in by_key
+    assert by_key["weight_format"]["default"] == "Auto-detect from model path"
 
 
 def test_task_plugin_registered():
@@ -58,6 +75,26 @@ def test_task_plugin_registered():
     assert plugin.phases_module == (
         "metainfer.tasks.gen_cpp_infer_framework.orchestrator.phases"
     )
+
+
+def test_failure_diagnostics_are_copied_to_the_next_iteration():
+    assert "retrospective.md" in PLUGIN.diagnostic_globs
+    assert "*.status.json" in PLUGIN.diagnostic_globs
+    assert "oracle-stages.json" in PLUGIN.diagnostic_globs
+
+
+def test_c_failures_are_carried_into_the_hard_review_gate():
+    for outcome in (
+        phases.LOGIC_FAIL, phases.INFRA_FAIL, phases.PERF_REGRESSION,
+    ):
+        transition = phases.next_transition("C_test", outcome)
+        assert transition is not None
+        assert transition.to_phase == "D_review"
+        assert transition.carry_failure is True
+    review_fix = phases.next_transition("D_review", phases.LOGIC_FAIL)
+    assert review_fix is not None
+    assert review_fix.to_phase == "B_implement"
+    assert review_fix.consume_iteration is True
 
 
 def test_web_plugin_registered():
@@ -84,6 +121,8 @@ def test_state_and_generated_workspace_are_separate(tmp_path: Path):
     assert paths["code_root"] == workspace_dir
     assert paths["logs_root"] == state_dir / "logs"
     assert paths["iterations_state"] == state_dir / "iterations"
+    assert paths["resolved_requirements"] == state_dir / "resolved_requirements.json"
+    assert paths["stable_candidate"] == state_dir / "stable_candidate.json"
     assert workspace_dir.is_dir()
     assert not (state_dir / "code").exists()
 
@@ -154,6 +193,8 @@ def test_z200_hardware_profile_binds_system_build_and_profiler(tmp_path: Path):
     build_sh = tmp_path / "build.sh"
     assert "SYSTEM-OWNED FILE" in build_sh.read_text(encoding="utf-8")
     assert "-DCMAKE_HIP_ARCHITECTURES=gfx906" in build_sh.read_text(encoding="utf-8")
+    assert "CMAKE_HOME_DIRECTORY:INTERNAL" in build_sh.read_text(encoding="utf-8")
+    assert 'METAINFER_BUILD_JOBS:-4' in build_sh.read_text(encoding="utf-8")
     # Re-materializing restores the system command path after an agent edit.
     build_sh.write_text("agent override", encoding="utf-8")
     materialize_hardware_binding(req, tmp_path)

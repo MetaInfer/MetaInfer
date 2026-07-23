@@ -38,9 +38,12 @@ def read_iterations(state_dir: Path) -> List[Dict[str, Any]]:
     if not iters_dir.exists():
         return []
     out: List[Dict[str, Any]] = []
+    stable = _load_json(state_dir / "stable_candidate.json", {}) or {}
+    stable_iteration = stable.get("iteration")
     for p in sorted(iters_dir.glob("*.json")):
         data = _load_json(p, None)
         if data is not None:
+            data["is_stable_candidate"] = data.get("iteration") == stable_iteration
             out.append(data)
     return out
 

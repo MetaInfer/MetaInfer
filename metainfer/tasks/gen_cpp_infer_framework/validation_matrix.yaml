@@ -1,0 +1,206 @@
+schema_version: 1
+
+cases:
+  - id: base-q8
+    requirements:
+      target_model: /models/Qwen3-8B-Q8_0.gguf
+      target_hardware: Hygon Z200
+      features: []
+    expected_optional_required: []
+    expected_disabled: [paged_kv_cache, continuous_batching, tensor_parallelism, speculative_decoding]
+    expected_combinations: []
+    required_documents: []
+    forbidden_documents: [paged-kv-cache, continuous-batching, tensor-parallel]
+
+  - id: base-f16
+    requirements:
+      target_model: /models/Qwen3-8B-F16.gguf
+      target_hardware: Hygon Z200
+      features: []
+    expected_optional_required: []
+    expected_disabled: [paged_kv_cache, continuous_batching, tensor_parallelism, speculative_decoding]
+    expected_combinations: []
+    required_documents: [z200-operator-contract, gguf-loader]
+    forbidden_documents: [paged-kv-cache, continuous-batching, tensor-parallel]
+
+  - id: paged-only-q8
+    requirements:
+      target_model: /models/Qwen3-8B-Q8_0.gguf
+      target_hardware: Hygon Z200
+      features: [Paged KV cache]
+      kv_block_size: 32
+    expected_optional_required: [paged_kv_cache]
+    expected_disabled: [continuous_batching, tensor_parallelism, speculative_decoding]
+    expected_combinations: []
+    expected_resource:
+      kv_capacity_policy: full_context_per_request
+      max_active_requests: 1
+      kv_blocks_per_full_context_request: 128
+      kv_total_blocks_per_rank: 128
+      max_total_cached_tokens: 4096
+      guaranteed_full_context_requests: 1
+    required_documents: [paged-kv-cache]
+    forbidden_documents: [continuous-batching, tensor-parallel]
+
+  - id: continuous-only-q8
+    requirements:
+      target_model: /models/Qwen3-8B-Q8_0.gguf
+      target_hardware: Hygon Z200
+      features: [Continuous batching]
+      max_concurrency: 8
+    expected_optional_required: [continuous_batching]
+    expected_disabled: [paged_kv_cache, tensor_parallelism, speculative_decoding]
+    expected_combinations: []
+    expected_resource:
+      kv_capacity_policy: per_sequence_allocation
+      max_active_requests: 8
+      max_total_cached_tokens: 32768
+      guaranteed_full_context_requests: 8
+    required_documents: [continuous-batching]
+    forbidden_documents: [paged-kv-cache, tensor-parallel]
+
+  - id: tp2-f16
+    requirements:
+      target_model: /models/Qwen3-8B-F16.gguf
+      target_hardware: Hygon Z200
+      features: [Tensor parallelism]
+      tp_size: 2
+    expected_optional_required: [tensor_parallelism]
+    expected_disabled: [paged_kv_cache, continuous_batching, speculative_decoding]
+    expected_combinations: []
+    required_documents: [tensor-parallel]
+    forbidden_documents: [paged-kv-cache, continuous-batching]
+
+  - id: paged-continuous-q8
+    requirements:
+      target_model: /models/Qwen3-8B-Q8_0.gguf
+      target_hardware: Hygon Z200
+      features: [Paged KV cache, Continuous batching]
+      kv_block_size: 16
+      max_concurrency: 4
+    expected_optional_required: [paged_kv_cache, continuous_batching]
+    expected_disabled: [tensor_parallelism, speculative_decoding]
+    expected_combinations: [paged_kv_with_continuous_batching]
+    required_documents: [paged-kv-cache, continuous-batching]
+    forbidden_documents: [tensor-parallel]
+
+  - id: tp2-paged-continuous-f16
+    requirements:
+      target_model: /models/Qwen3-8B-F16.gguf
+      target_hardware: Hygon Z200
+      features: [Paged KV cache, Continuous batching, Tensor parallelism]
+      kv_block_size: 16
+      max_concurrency: 4
+      tp_size: 2
+    expected_optional_required: [paged_kv_cache, continuous_batching, tensor_parallelism]
+    expected_disabled: [speculative_decoding]
+    expected_combinations:
+      - paged_kv_with_continuous_batching
+      - tp_with_paged_kv
+      - tp_with_continuous_batching
+      - tp_with_paged_kv_and_continuous_batching
+    expected_resource:
+      kv_capacity_policy: full_context_per_request
+      max_active_requests: 4
+      kv_blocks_per_full_context_request: 256
+      kv_total_blocks_per_rank: 1024
+      max_total_cached_tokens: 16384
+      guaranteed_full_context_requests: 4
+      kv_bytes_per_token_per_rank: 73728
+      kv_pool_bytes_per_rank: 1207959552
+    required_documents: [paged-kv-cache, continuous-batching, tensor-parallel]
+    forbidden_documents: []
+
+  - id: tp2-paged-f16
+    requirements:
+      target_model: /models/Qwen3-8B-F16.gguf
+      target_hardware: Hygon Z200
+      features: [Paged KV cache, Tensor parallelism]
+      kv_block_size: 16
+      tp_size: 2
+    expected_optional_required: [paged_kv_cache, tensor_parallelism]
+    expected_disabled: [continuous_batching, speculative_decoding]
+    expected_combinations: [tp_with_paged_kv]
+    required_documents: [paged-kv-cache, tensor-parallel, tp-paged-kv-contract]
+    forbidden_documents: [continuous-batching, tp-continuous-batching-contract]
+
+  - id: tp2-continuous-f16
+    requirements:
+      target_model: /models/Qwen3-8B-F16.gguf
+      target_hardware: Hygon Z200
+      features: [Continuous batching, Tensor parallelism]
+      max_concurrency: 4
+      tp_size: 2
+    expected_optional_required: [continuous_batching, tensor_parallelism]
+    expected_disabled: [paged_kv_cache, speculative_decoding]
+    expected_combinations: [tp_with_continuous_batching]
+    expected_resource:
+      kv_capacity_policy: per_sequence_allocation
+      max_active_requests: 4
+      max_total_cached_tokens: 16384
+      guaranteed_full_context_requests: 4
+    required_documents: [continuous-batching, tensor-parallel, tp-continuous-batching-contract]
+    forbidden_documents: [paged-kv-cache, tp-paged-kv-contract]
+
+  - id: paged-continuous-shared-q8
+    requirements:
+      target_model: /models/Qwen3-8B-Q8_0.gguf
+      target_hardware: Hygon Z200
+      features: [Paged KV cache, Continuous batching]
+      kv_block_size: 16
+      kv_capacity_policy: Shared token budget
+      max_total_cached_tokens: 8192
+      max_concurrency: 4
+    expected_optional_required: [paged_kv_cache, continuous_batching]
+    expected_disabled: [tensor_parallelism, speculative_decoding]
+    expected_combinations: [paged_kv_with_continuous_batching]
+    expected_resource:
+      kv_capacity_policy: shared_token_budget
+      max_active_requests: 4
+      kv_total_blocks_per_rank: 512
+      max_total_cached_tokens: 8192
+      guaranteed_full_context_requests: 2
+      kv_pool_bytes_per_rank: 1207959552
+    required_documents: [paged-kv-cache, continuous-batching]
+    forbidden_documents: [tensor-parallel]
+
+  - id: invalid-tp2-q8
+    requirements:
+      target_model: /models/Qwen3-8B-Q8_0.gguf
+      target_hardware: Hygon Z200
+      features: [Tensor parallelism]
+      tp_size: 2
+    expected_error:
+      field: weight_format
+      contains: Q8_0 TP
+
+  - id: invalid-bf16
+    requirements:
+      target_model: /models/Qwen3-8B-BF16.gguf
+      target_hardware: Hygon Z200
+      features: []
+    expected_error:
+      field: weight_format
+      contains: supports F16 or Q8_0 GGUF only
+
+  - id: invalid-tp4
+    requirements:
+      target_model: /models/Qwen3-8B-F16.gguf
+      target_hardware: Hygon Z200
+      features: [Tensor parallelism]
+      tp_size: 4
+    expected_error:
+      field: tp_size
+      contains: tp_size must be <= 2
+
+  - id: invalid-shared-kv-budget
+    requirements:
+      target_model: /models/Qwen3-8B-Q8_0.gguf
+      target_hardware: Hygon Z200
+      features: [Paged KV cache, Continuous batching]
+      kv_capacity_policy: shared_token_budget
+      max_context_length: 4096
+      max_total_cached_tokens: 2048
+    expected_error:
+      field: max_total_cached_tokens
+      contains: at least max_context_length

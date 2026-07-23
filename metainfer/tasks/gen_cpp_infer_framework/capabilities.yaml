@@ -1,0 +1,314 @@
+schema_version: 1
+
+# Qwen3-8B values used only to compile a preflight KV memory contract. The
+# generated loader must still validate the real GGUF metadata at runtime.
+resource_model:
+  num_layers: 36
+  num_kv_heads: 8
+  head_dim: 128
+  dense_kv_dtype: fp32
+  dense_kv_dtype_bytes: 4
+  scalable_kv_dtype: fp16
+  scalable_kv_dtype_bytes: 2
+
+selection:
+  required_field: features
+  allowed_field: allowed_features
+  unselected_optional_state: disabled
+
+global_parameters:
+  target_model:
+    source_field: target_model
+    type: path
+    required: true
+  target_hardware:
+    source_field: target_hardware
+    type: string
+    required: true
+  weight_format:
+    source_field: weight_format
+    type: enum
+    default: auto
+    choices:
+      Auto-detect from model path: auto
+      F16 GGUF: f16_gguf
+      BF16 GGUF: bf16_gguf
+      Q8_0 GGUF: q8_0_gguf
+      Other GGUF: gguf_other
+  max_context_length:
+    source_field: max_context_length
+    type: integer
+    default: 4096
+    minimum: 1
+
+performance_parameters:
+  objective:
+    source_field: perf_target
+    type: enum
+    default: throughput
+    choices:
+      Throughput: throughput
+      Latency: latency
+      Memory: memory
+  reference:
+    source_field: perf_reference
+    type: enum
+    default: vllm
+    choices:
+      vLLM: vllm
+      Sequential framework baseline: sequential_baseline
+      Absolute target only: none
+  minimum_reference_ratio:
+    source_field: perf_min_ratio
+    type: number
+    default: 0.5
+    minimum: 0
+  minimum_tokens_per_second:
+    source_field: perf_min_tokens_per_second
+    type: number
+    default: 0
+    minimum: 0
+  maximum_error_rate:
+    source_field: perf_max_error_rate
+    type: number
+    default: 0
+    minimum: 0
+    maximum: 1
+  concurrency:
+    source_field: perf_concurrency
+    type: integer
+    default: 4
+    minimum: 1
+  input_tokens:
+    source_field: perf_input_tokens
+    type: integer
+    default: 128
+    minimum: 1
+  output_tokens:
+    source_field: perf_output_tokens
+    type: integer
+    default: 128
+    minimum: 1
+
+capabilities:
+  cpp_build:
+    label: Native C++ build
+    selection: baseline
+    maturity: supported
+    dependencies: []
+    knowledge: {}
+    correctness_suites: [base.build_and_lifecycle]
+    first_iteration_suites: [base.build_and_lifecycle]
+    metrics: []
+
+  model_loading:
+    label: GGUF model loading
+    selection: baseline
+    maturity: supported
+    dependencies: [cpp_build]
+    knowledge: {}
+    correctness_suites: [base.real_model_loading]
+    first_iteration_suites: [base.real_model_loading]
+    metrics: [model_load_time_ms, model_resident_memory_bytes]
+
+  model_forward:
+    label: Model forward pass
+    selection: baseline
+    maturity: supported
+    dependencies: [model_loading]
+    knowledge:
+      perf_tester: [z200-operator-contract]
+      perf_planner: [z200-operator-contract]
+    correctness_suites: [base.operator_numerics, base.forward_numerics]
+    first_iteration_suites: [base.operator_numerics, base.forward_numerics]
+    metrics: [prefill_tokens_per_second, decode_tokens_per_second]
+
+  tokenization:
+    label: Qwen tokenizer
+    selection: baseline
+    maturity: supported
+    dependencies: [model_loading]
+    knowledge: {}
+    correctness_suites: [base.tokenizer_and_chat_template]
+    first_iteration_suites: [base.tokenizer_and_chat_template]
+    metrics: []
+
+  kv_cache:
+    label: Single-sequence KV cache
+    selection: baseline
+    maturity: supported
+    dependencies: [model_forward]
+    knowledge:
+      perf_tester: [single-sequence-runtime]
+      perf_planner: [single-sequence-runtime]
+    correctness_suites: [base.single_sequence_generation]
+    first_iteration_suites: [base.single_sequence_generation]
+    metrics: [kv_cache_bytes]
+
+  openai_http_api:
+    label: OpenAI-compatible HTTP API
+    selection: baseline
+    maturity: supported
+    dependencies: [tokenization, kv_cache]
+    knowledge: {}
+    correctness_suites: [base.openai_http_api]
+    first_iteration_suites: [base.openai_http_api]
+    metrics: [ttft_ms, tpot_ms, request_latency_ms]
+
+  paged_kv_cache:
+    label: Paged KV cache
+    selection: optional
+    maturity: supported
+    dependencies: [kv_cache]
+    parameters:
+      block_size:
+        source_field: kv_block_size
+        type: integer
+        default: 16
+        minimum: 1
+      capacity_policy:
+        source_field: kv_capacity_policy
+        type: enum
+        default: full_context_per_request
+        choices:
+          Full context per request: full_context_per_request
+          Shared token budget: shared_token_budget
+      max_total_cached_tokens:
+        source_field: max_total_cached_tokens
+        type: integer
+        default: 0
+        minimum: 0
+    knowledge:
+      planner: [paged-kv-cache]
+      implementer: [paged-kv-cache, scheduler-block-manager-template]
+      reviewer: [paged-kv-cache]
+      test_writer: [paged-kv-cache]
+      debugger: [paged-kv-cache]
+      perf_tester: [paged-kv-cache]
+      perf_planner: [paged-kv-cache]
+    correctness_suites: [paged_kv.block_lifecycle, paged_kv.paged_attention]
+    first_iteration_suites: [paged_kv.block_lifecycle]
+    metrics: [kv_block_usage, kv_block_fragmentation]
+
+  continuous_batching:
+    label: Continuous batching
+    selection: optional
+    maturity: supported
+    dependencies: [openai_http_api]
+    parameters:
+      max_concurrency:
+        source_field: max_concurrency
+        type: integer
+        default: 4
+        minimum: 1
+    knowledge:
+      planner: [continuous-batching]
+      implementer: [continuous-batching]
+      reviewer: [continuous-batching]
+      test_writer: [continuous-batching]
+      debugger: [continuous-batching]
+      perf_tester: [continuous-batching]
+      perf_planner: [continuous-batching]
+    correctness_suites: [continuous_batching.admission, continuous_batching.sequence_isolation]
+    first_iteration_suites: [continuous_batching.admission]
+    metrics: [batch_size_histogram, active_requests, aggregate_tokens_per_second]
+
+  tensor_parallelism:
+    label: Tensor parallelism
+    selection: optional
+    maturity: supported
+    dependencies: [model_forward]
+    parameters:
+      tp_size:
+        source_field: tp_size
+        type: integer
+        default: 2
+        minimum: 2
+        maximum: 2
+    knowledge:
+      planner: [tensor-parallel]
+      implementer: [tensor-parallel, tp-sharding-template]
+      reviewer: [tensor-parallel]
+      test_writer: [tensor-parallel]
+      debugger: [tensor-parallel]
+      perf_tester: [tensor-parallel]
+      perf_planner: [tensor-parallel]
+    correctness_suites: [tensor_parallel.rank_startup, tensor_parallel.sharding, tensor_parallel.numeric_parity]
+    first_iteration_suites: [tensor_parallel.rank_startup, tensor_parallel.sharding]
+    metrics: [per_rank_vram_bytes, collective_time_ms]
+
+  speculative_decoding:
+    label: Speculative decoding
+    selection: optional
+    maturity: unavailable
+    unavailable_reason: No dedicated implementation contract or immutable acceptance suite exists yet.
+    dependencies: [model_forward, tokenization]
+    parameters:
+      draft_model:
+        source_field: draft_model
+        type: path
+        required: true
+    knowledge: {}
+    correctness_suites: []
+    metrics: []
+
+combination_contracts:
+  - id: paged_kv_with_continuous_batching
+    capabilities_all: [paged_kv_cache, continuous_batching]
+    maturity: supported
+    knowledge:
+      planner: [paged-continuous-state-machine]
+      implementer: [paged-continuous-state-machine]
+      reviewer: [paged-continuous-state-machine]
+      debugger: [paged-continuous-state-machine]
+    correctness_suites: [integration.paged_kv_continuous_batching]
+    first_iteration_suites: [integration.paged_kv_continuous_batching]
+    metrics: [kv_block_usage, batch_size_histogram]
+
+  - id: tp_with_paged_kv
+    capabilities_all: [tensor_parallelism, paged_kv_cache]
+    maturity: supported
+    knowledge:
+      planner: [tp-paged-kv-contract]
+      implementer: [tp-paged-kv-contract]
+      reviewer: [tp-paged-kv-contract]
+      debugger: [tp-paged-kv-contract]
+    correctness_suites: [integration.tp_paged_kv]
+    first_iteration_suites: [integration.tp_paged_kv]
+    metrics: [per_rank_vram_bytes, collective_time_ms, kv_block_usage]
+
+  - id: tp_with_continuous_batching
+    capabilities_all: [tensor_parallelism, continuous_batching]
+    maturity: supported
+    knowledge:
+      planner: [tp-continuous-batching-contract]
+      implementer: [tp-continuous-batching-contract]
+      reviewer: [tp-continuous-batching-contract]
+      debugger: [tp-continuous-batching-contract]
+    correctness_suites: [integration.tp_continuous_batching]
+    first_iteration_suites: [integration.tp_continuous_batching]
+    metrics: [per_rank_vram_bytes, collective_time_ms, batch_size_histogram]
+
+  - id: tp_with_paged_kv_and_continuous_batching
+    capabilities_all: [tensor_parallelism, paged_kv_cache, continuous_batching]
+    maturity: supported
+    knowledge:
+      implementer: [verified-008-tp-paged-continuous]
+    correctness_suites: [integration.tp_paged_kv_continuous_batching]
+    first_iteration_suites: [integration.tp_paged_kv_continuous_batching]
+    metrics: [per_rank_vram_bytes, collective_time_ms, kv_block_usage, batch_size_histogram]
+
+compatibility_rules:
+  - id: tp_requires_f16_gguf
+    capabilities_all: [tensor_parallelism]
+    parameter_values:
+      weight_format: [bf16_gguf, q8_0_gguf, gguf_other, gguf_unknown, auto]
+    maturity: unavailable
+    message: Tensor parallelism currently supports non-quantized F16 GGUF only; Q8_0 TP remains a future extension.
+
+  - id: unsupported_baseline_weight_format
+    capabilities_all: []
+    parameter_values:
+      weight_format: [bf16_gguf, gguf_other, gguf_unknown, auto]
+    maturity: unavailable
+    message: The current generated runtime supports F16 or Q8_0 GGUF only; select the stored format explicitly when it cannot be inferred from the model path.

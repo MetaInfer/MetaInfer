@@ -22,28 +22,59 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
-from metainfer.orchestrator.requirements import req_field
+from metainfer.orchestrator.requirements import req_field, req_field_int
 from .hardware import render_hardware_profile
+from .knowledge import render_knowledge_route
 
 
-NOTEBOOKS_HINT = """A knowledge base of reference designs, known pitfalls, and worked
-examples lives in the `notebooks/` directory.
+NOTEBOOKS_HINT = """The task knowledge base contains reference designs, binding
+contracts, known pitfalls, tests, and worked source examples.
 
-Read it EFFICIENTLY:
+Read it deterministically and efficiently:
 - Use the Read tool directly. Do NOT spawn sub-agents (no Agent / Task /
   TaskOutput / Explore tool calls) — each sub-agent cold-starts a separate
   `claude -p` process and burns 1-3 minutes of startup time per call,
   which dominates your budget without producing better answers.
-- Start with `Glob notebooks/**/*.md` to see the layout, then Read only
-  the files whose names match this iteration's task (typically 3-6 files).
-  Do NOT read every notebook "to be complete".
+- Read every item in the REQUIRED route injected below. The required set is
+  selected by the orchestrator and is not part of the optional-reading cap.
+- Treat routed binding contracts and reference source as authoritative. Prior
+  reviews and retrospectives are diagnostic hypotheses; when one conflicts
+  with a routed contract, verify the source and follow the contract.
+- After that, choose no more than the stated number of OPTIONAL items. Use
+  `Glob notebooks/**/*.md` only when the routed candidates are insufficient.
 - Do not re-read a file you have already read in this session — its
-  contents are already in your context window.
-- Hard cap: at most ~8 Read calls to notebooks for planning, ~4 for
-  implement / review / perf-plan."""
+  contents are already in your context window. A resumed session retains it."""
+
+
+def _knowledge_context(*values: Any) -> str:
+    parts: List[str] = []
+    for value in values:
+        if value is None or value == "":
+            continue
+        if isinstance(value, str):
+            parts.append(value)
+        else:
+            parts.append(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    return "\n".join(parts)
+
+
+def _knowledge_section(
+    req: Dict[str, Any],
+    notebooks_dir: Path,
+    *,
+    role: str,
+    context: Optional[str] = None,
+    required_document_ids: Iterable[str] = (),
+) -> str:
+    return (
+        f"{NOTEBOOKS_HINT}\n"
+        f"Knowledge base path: {notebooks_dir}\n\n"
+        f"{render_knowledge_route(req, notebooks_dir, role=role, context=context, required_document_ids=tuple(required_document_ids))}"
+    )
 
 
 # Subdirectory (relative to iter_dir/.metainfer-logs/) where the previous
@@ -108,6 +139,9 @@ CPP_BUILD_TEST_MANDATE = """# SYSTEM-OWNED C++ build path (gen-cpp-infer-framewo
 It owns the compiler, HIP architecture, CMake cache variables, Release flags,
 and build parallelism. **Do not edit, replace, or bypass `build.sh`; do not
 invoke `cmake` or `hipcc` directly.**
+Do not run `make -j$(nproc)`, `cmake --build`, or broad cleanup commands such
+as `rm -rf *`. `build.sh` safely handles a copied cross-iteration CMake cache
+and uses the profile's bounded parallelism.
 
 Your responsibility is limited to writing a valid `CMakeLists.txt` and C++
 sources that fit the selected backend constraints. Before booting the server:
@@ -163,105 +197,18 @@ reading this same prompt. Save everyone the round-trip."""
 # The orchestrator runs a preflight before C and E boots, but it CANNOT
 # intercept the agent's own bash smoke tests during B. So the agent MUST
 # run the same check itself before every `bash serve.sh` / manual engine run.
-GPU_PREFLIGHT_MANDATE = """# MANDATORY: free the GPU before every boot (gen-cpp-infer-framework)
-Before EVERY local command that loads model weights into VRAM — including
-your B-phase smoke tests (`bash serve.sh $PORT`, `bash build.sh` if it
-links/runs GPU probes, any manual `./build/metainfer_cpp_server ...` run
-for debugging) — you MUST first verify the GPU is clean. If a previous
-experiment crashed without freeing VRAM, the leftover allocation will
-make your new boot fail with "out of memory" and you will waste the rest
-of this iteration chasing a phantom bug.
+GPU_PREFLIGHT_MANDATE = """# MANDATORY: read-only GPU preflight before every boot
+Before a command that loads model weights, inspect VRAM with `rocm-smi` or
+`nvidia-smi`. This check is READ-ONLY: never use `pkill`, `killall`, `pgrep -f`,
+or kill a PID selected from a global process scan. A process is yours only
+when the SAME Bash tool call started it, captured `server_pid=$!`, installed a
+cleanup trap, and waits for that exact PID before returning.
 
-Required preflight recipe (run it as a separate Bash turn BEFORE the boot):
-
-  **CRITICAL — never kill your own ancestors.** You run inside a process
-  tree: `orchestrator (python) → ccb / claude → this agent's bash`. If
-  any of those ancestors appears in the GPU pid list (e.g. the orchestrator
-  touched GPU once for a probe), killing them kills the entire task — the
-  dashboard freezes, agents.json stops updating, and the iteration is
-  lost. The recipe below walks `$$`'s ancestor chain and EXCLUDES every
-  PID in it before any kill.
-
-  ```bash
-  # Build the ancestor PID set ONCE: this bash → claude/ccb → orchestrator → ...
-  # Never kill any of these — killing an ancestor kills the whole iteration.
-  ancestors=" $$"
-  _p=$PPID
-  while [ "$_p" -gt 1 ] 2>/dev/null; do
-    ancestors="$ancestors $_p"
-    _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
-    [ -z "$_p" ] && break
-  done
-  is_ancestor() { case " $ancestors " in *" $1 "*) return 0;; *) return 1;; esac; }
-
-  # NVIDIA
-  if command -v nvidia-smi >/dev/null; then
-      nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits \
-        | awk -F', ' '$2+0 >= 128 {print $1}' \
-        | while read pid; do
-            if is_ancestor "$pid"; then echo "SKIP ancestor pid=$pid (do not kill)"; continue; fi
-            echo "killing orphan GPU pid=$pid"
-            kill -TERM "$pid" 2>/dev/null || true
-          done
-      sleep 3
-  fi
-
-  # AMD ROCm (this host's primary platform)
-  if command -v rocm-smi >/dev/null; then
-      rocm-smi --showpids 2>/dev/null \
-        | grep -oE '\\b[0-9]{4,}\\b' \
-        | while read pid; do
-            if is_ancestor "$pid"; then echo "SKIP ancestor pid=$pid (do not kill)"; continue; fi
-            # Only kill processes you can attribute to python / ccb / metainfer
-            cmd=$(ps -o comm= -p "$pid" 2>/dev/null || true)
-            case "$cmd" in
-              python*|ccb*|claude*) echo "killing orphan GPU pid=$pid ($cmd)"; kill -TERM "$pid" 2>/dev/null || true ;;
-            esac
-          done
-      sleep 3
-  fi
-
-  # Also scan /proc/*/fd for any process holding /dev/dri/renderD* open
-  # (catches orphans the tools miss).
-  for f in /proc/[0-9]*/fd/*; do
-    tgt=$(readlink "$f" 2>/dev/null || true)
-    case "$tgt" in
-      /dev/dri/renderD*|/dev/nvidia*)
-        pid=$(echo "$f" | awk -F/ '{print $3}')
-        if is_ancestor "$pid"; then continue; fi
-        cmd=$(ps -o comm= -p "$pid" 2>/dev/null || true)
-        case "$cmd" in
-          python*|ccb*|claude*) kill -TERM "$pid" 2>/dev/null || true ;;
-        esac ;;
-    esac
-  done
-  sleep 2
-
-  # Verify clean
-  if command -v nvidia-smi >/dev/null; then nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; fi
-  if command -v rocm-smi >/dev/null; then rocm-smi --showmemuse; fi
-  ```
-
-Rules:
-1. **Run this every time before booting**, not just once at the start of
-   B. Your own prior manual C++ server run may have crashed and left VRAM
-   behind; the next boot will collide with it.
-2. **Never kill your own ancestors.** The `is_ancestor` guard above is
-   mandatory; without it, a stray `python*` match on the orchestrator or
-   `ccb*` match on your parent kills the whole task. If you rewrite the
-   recipe, keep the ancestor-exclusion walk.
-3. **Only kill python / ccb / claude processes that are NOT your
-   ancestors.** Never kill X, your shell, or unrelated daemons that
-   happen to hold the render node for display.
-4. **If the preflight shows zero occupants, proceed immediately** — don't
-   waste the turn. The point is to catch orphans, not to make you do
-   ceremony.
-5. **If `kill -TERM` doesn't free the VRAM after 3 seconds, escalate**:
-   `kill -9 $pid`. CUDA/ROCm contexts sometimes need a hard kill.
-   Re-check `is_ancestor` before the `-9` — never SIGKILL an ancestor.
-6. **The orchestrator's C and E oracles already run this same check** —
-   you don't need to add anything to serve.sh itself. The check is YOUR
-   responsibility only during local B-phase debugging."""
+If unexplained VRAM is already occupied, stop the B turn and report the PID or
+memory evidence as infrastructure failure. The orchestrator owns cross-turn
+GPU cleanup before authoritative C/E execution. For local smoke tests, use one
+bounded foreground shell lifecycle such as `timeout`, or start/capture/probe/
+terminate/wait in the same command. Never leave a background server behind."""
 
 
 # Process-safety mandate (gen-cpp-infer-framework).
@@ -380,6 +327,122 @@ server. Focus on deterministic request handling and graceful SIGTERM
 shutdown so the system-owned profiler can flush its artifacts."""
 
 
+_EVENT_SUCCESS_PATTERN = (
+    r"(?:SUMMARY passed=\d+ failed=0|\b16/16\b|\[PASS\]\s+[A-Za-z0-9_]+|"
+    r"response looks good|Content:\s*[\"']?Paris\b|"
+    r"[\"']content[\"']\s*:\s*[\"'][^\"']*Paris\b|"
+    r"finish_reason[\"']?\s*[:=]\s*[\"']stop[\"']|Finish:\s*stop|"
+    r"completion_tokens[\"']?\s*[:=]\s*[1-9]\d*|"
+    r"completion\s*=\s*[1-9]\d*|num_seq_rows\s*=\s*[2-9]\d*|"
+    r"max_observed_batch_size[\"']?\s*[:=]\s*[2-9]\d*|"
+    r"HTTP(?: status)?\s*[:=]?\s*200)"
+)
+_EVENT_SUCCESS_RE = re.compile(_EVENT_SUCCESS_PATTERN, re.IGNORECASE)
+_EVENT_EVIDENCE_RE = re.compile(
+    r"(?:\bNaN\b|\bInf\b|non-finite|all zeros?|fixed token|always token|"
+    r"token 33|!{2,}|input-independent|attention output|"
+    r"embedding (?:works|output|produces)|"
+    r"logits|tensor.{0,40}offset|offset.{0,40}tensor|data[- ]section|"
+    + _EVENT_SUCCESS_PATTERN + r")",
+    re.IGNORECASE,
+)
+
+
+def _event_evidence_excerpt(logs_dir: Optional[Path]) -> str:
+    """Extract a bounded diagnostic digest from prior Implementer events."""
+    if logs_dir is None or not logs_dir.is_dir():
+        return ""
+
+    snippets: list[tuple[int, str]] = []
+    seen: set[str] = set()
+
+    def visit(value: Any, origin: str = "agent-narrative") -> Iterable[tuple[str, str]]:
+        if isinstance(value, Mapping):
+            value_type = str(value.get("type") or "").casefold()
+            if value_type == "tool_result":
+                origin = "tool-result"
+            elif value_type == "result":
+                origin = "agent-result"
+            for key, child in value.items():
+                if key in {"thinking", "text", "content"} and isinstance(child, str):
+                    yield origin, child
+                elif isinstance(child, (Mapping, list)):
+                    yield from visit(child, origin)
+        elif isinstance(value, list):
+            for child in value:
+                yield from visit(child, origin)
+
+    for path in sorted(logs_dir.glob("iter*-implementer.attempt*.events.jsonl")):
+        try:
+            lines = path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with lines:
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                for origin, text in visit(event):
+                    compact = " ".join(text.split())
+                    candidates: list[tuple[int, str]] = []
+                    for match in _EVENT_EVIDENCE_RE.finditer(compact):
+                        start = max(0, match.start() - 140)
+                        end = min(len(compact), match.end() + 220)
+                        excerpt = compact[start:end]
+                        if start:
+                            excerpt = "..." + excerpt
+                        if end < len(compact):
+                            excerpt += "..."
+                        lowered = excerpt.casefold()
+                        score = 0
+                        if re.search(r"\bnan\b|non-finite|!{2,}|all zeros?", lowered):
+                            score += 6
+                        success_hits = len(_EVENT_SUCCESS_RE.findall(excerpt))
+                        score += min(24, success_hits * 6)
+                        if re.search(
+                            r"warning.{0,80}(?:thinking|truncated|failed)|"
+                            r"thinking mode still active",
+                            lowered,
+                        ):
+                            score -= 10
+                        if origin == "tool-result":
+                            score += 4
+                        elif origin == "agent-result":
+                            score += 2
+                        if "[tp debug]" in lowered:
+                            score += 4
+                        if re.search(r"tensor.{0,40}offset|offset.{0,40}tensor|data[- ]section", lowered):
+                            score += 3
+                        if re.search(r"embedding[^:]{0,30}:\s*-?\d", lowered):
+                            score += 3
+                        candidates.append((score, excerpt))
+                    if candidates:
+                        ranked_candidates = sorted(
+                            enumerate(candidates),
+                            key=lambda item: (item[1][0], item[0]),
+                            reverse=True,
+                        )[:3]
+                        for _, (score, excerpt) in reversed(ranked_candidates):
+                            key = excerpt.casefold()
+                            if key not in seen:
+                                seen.add(key)
+                                snippets.append((
+                                    score,
+                                    f"- {path.name} [{origin}]: {excerpt}",
+                                ))
+
+    # Prefer concrete runtime/numeric evidence over source excerpts that only
+    # happen to contain words such as "embedding". Recency breaks ties.
+    ranked = sorted(
+        enumerate(snippets),
+        key=lambda item: (item[1][0], item[0]),
+        reverse=True,
+    )[:12]
+    ranked.sort(key=lambda item: item[0])
+    return "\n".join(item[1][1] for item in ranked)
+
+
 def _prev_logs_section(
     prev_failure: Optional[str],
     prev_logs_dir: Optional[Path] = None,
@@ -417,10 +480,40 @@ def _prev_logs_section(
         p_stdout = snap / "server.stdout.log"
         p_judge = snap / "judge.*.log"
         loc_phrase = f"`{snap}/`"
+    p_retro = f"{snap}/retrospective.md"
+    p_status = f"{snap}/*-*.status.json"
+    p_events = None
+    event_evidence = ""
+    if prev_logs_dir is not None:
+        try:
+            current_iteration = int(prev_logs_dir.parent.name)
+        except (TypeError, ValueError):
+            current_iteration = 0
+        if current_iteration > 1:
+            original_prev_logs = (
+                prev_logs_dir.parent.parent / f"{current_iteration - 1:03d}"
+            )
+            p_events = original_prev_logs / "iter*-implementer.attempt*.events.jsonl"
+            event_evidence = _event_evidence_excerpt(original_prev_logs)
+    events_entry = ""
+    if p_events is not None:
+        events_entry = f"""  - {p_events}
+    Original Implementer event streams. Do not read these multi-megabyte
+    files in full. Search them for `NaN`, `Inf`, non-finite values, fixed or
+    repeated tokens, HTTP responses, model-loading offsets, GPU errors, and
+    the last successful checkpoint; then read only the relevant matches and
+    tail."""
+    event_digest = ""
+    if event_evidence:
+        event_digest = f"""
+## Bounded Implementer evidence digest (machine-extracted)
+{event_evidence}
+Use this digest as a routing hint, then verify it against source and the
+referenced event stream."""
     return f"""
 
 # Previous iteration's diagnostic logs (READ BEFORE CODING)
-The previous C step failed. Its diagnostic artifacts have been copied into
+The previous iteration failed. Its compact diagnostic artifacts have been copied into
 {loc_phrase}:
 
   - {p_oracle}
@@ -436,11 +529,54 @@ The previous C step failed. Its diagnostic artifacts have been copied into
     messages. Useful for confirming whether the server even started.
   - {p_judge}
     The LLM-judge sub-agent's raw output per case (when judge_mode=llm).
+  - {p_retro}
+    The task-local failure retrospective. Treat claims as hypotheses and
+    cross-check them against structured status/events before acting.
+  - {p_status}
+    Agent completion status, timeout, retry count, and failure mode.
+{events_entry}
 
 The `prev_failure` text above is a condensed summary. BEFORE writing any
-code, open these files (especially `server.stderr.log` and the failing
-cases' entries in `oracle-report.json`) and identify the concrete root
-cause. Quote the relevant lines in your plan/commit message.
+code, inspect the artifacts that actually exist and identify the concrete
+root cause. Quote the relevant evidence in your plan/commit message. If the
+iteration failed before C and no passing `oracle-report.json` exists, no
+correctness suite may be described as already passing merely because source
+code or a compiled binary exists. In that case you MUST perform the bounded
+search of the Implementer event streams described above. Reading only the
+retrospective or status file is insufficient: they may omit the last
+numerical/runtime observations.
+{event_digest}
+"""
+
+
+def _prior_implementer_evidence_section(
+    logs_dir: Optional[Path],
+    iteration: int,
+) -> str:
+    """Keep prior runtime evidence visible after a successful A transition.
+
+    A success clears ``ctx.failure`` by design, but B still needs the bounded
+    runtime evidence that motivated the recovery plan. This section is used
+    only when the larger previous-failure block is absent.
+    """
+    if logs_dir is None or iteration <= 1:
+        return ""
+    prior_logs = logs_dir.parent / f"{iteration - 1:03d}"
+    evidence = _event_evidence_excerpt(prior_logs)
+    if not evidence:
+        return ""
+    return f"""
+
+# Prior Implementer runtime evidence (machine-extracted)
+{evidence}
+
+Treat this as a bounded routing hint and verify it against the generated
+source. For GGUF recovery, a finite or non-zero embedding does not prove the
+tensor bytes are correct: first verify
+`data_offset = align_up(tensor_info_end, general.alignment)`, read every
+tensor at `data_offset + tensor.offset`, and check a known tensor byte/value
+fingerprint. Only then debug downstream RMSNorm, RoPE, Attention, Paged KV,
+or collective numerics.
 """
 
 
@@ -464,9 +600,12 @@ suggestions. You are expected to act on them. The reviewer's notes:
 
 {review_feedback}
 
-Address each suggestion explicitly. If you disagree with one, say why in
-`plan.md` (planner) or your final commit message (implementer / optimizer)
-— do not silently ignore review feedback.
+Address each suggestion explicitly, but do not treat it as an API or model
+contract. Cross-check it against the structured oracle evidence and every
+routed binding contract/reference source before changing code. If they
+conflict, the routed contract/reference wins; record the rejected review
+hypothesis and evidence in `plan.md` (planner) or your final commit message
+(implementer / optimizer). Do not silently ignore review feedback.
 """
 
 
@@ -632,13 +771,65 @@ def _render_req(req: Dict[str, Any]) -> str:
     on-disk path, so its serve.sh always fell back to a mock dir.
     """
     from metainfer.orchestrator.requirements import req_summary_lines
-    lines = req_summary_lines(req)
-    return "\n".join(lines) + render_hardware_profile(req)
+    source_req = dict(req)
+    source_req.pop("resolved_requirements", None)
+    lines = req_summary_lines(source_req)
+    from .capabilities import resolved_from_request
+    resolved = resolved_from_request(req)
+    required = ", ".join(resolved.get("required_capabilities", [])) or "(none)"
+    allowed = ", ".join(resolved.get("allowed_capabilities", [])) or "(none)"
+    disabled = ", ".join(resolved.get("disabled_capabilities", [])) or "(none)"
+    lines.extend([
+        "",
+        "## System-resolved capability contract (AUTHORITATIVE)",
+        f"- required_capabilities: {required}",
+        f"- allowed_capabilities: {allowed}",
+        f"- disabled_capabilities: {disabled}",
+        f"- parameters: {resolved.get('parameters', {})}",
+        f"- capability_parameters: {resolved.get('capability_parameters', {})}",
+        f"- resource_contract: {resolved.get('resource_contract', {})}",
+        f"- active_combination_contracts: {resolved.get('active_combination_contracts', [])}",
+        f"- correctness_suites: {resolved.get('correctness_suites', [])}",
+        f"- performance: {resolved.get('performance', {})}",
+        "Required capabilities are success criteria. Disabled capabilities must not be introduced.",
+    ])
+    return "\n".join(lines) + render_hardware_profile(source_req)
 
 
 # --------------------------------------------------------------------------- #
 # A — Plan
 # --------------------------------------------------------------------------- #
+
+
+def _plan_validation_repair_section(prev_failures: Optional[str]) -> str:
+    if not prev_failures or "A plan validation failed" not in prev_failures:
+        return ""
+    return f"""
+# MACHINE-VALIDATOR REPAIR MODE (HIGHEST PRIORITY)
+
+The existing `plan.md`, `test_spec.md`, and `plan_manifest.json` are already
+present. This retry exists only because their machine validation failed:
+
+{prev_failures}
+
+Before reading source or diagnostics, edit those three planning artifacts to
+repair every semicolon-delimited error above literally. Do not redesign the
+framework, expand the roadmap, or repeat root-cause exploration. Preserve all
+already-valid manifest assignments and return immediately after the manifest
+preflight passes.
+
+When the error names the GGUF recovery contract, both planning prose and the
+test gate must state these semantics explicitly:
+- `data_offset = align_up(tensor_info_end, general.alignment)`;
+- every tensor is read at `data_offset + tensor.offset`;
+- verify a known tensor byte/value before downstream Attention/RoPE work;
+- a finite or non-zero embedding alone does not prove offsets are correct.
+
+When an error names `/v1/models`, add the exact runtime field and its observed
+value/assertion to `plan.md` or `test_spec.md`. When an error names a manifest
+path, change only that JSON field and keep every milestone iteration within
+the frozen task limit.
+"""
 
 
 def plan_prompt(
@@ -652,9 +843,20 @@ def plan_prompt(
     logs_dir: Optional[Path] = None,
 ) -> str:
     prev_snap = logs_dir / PREV_ITER_LOGS_SUBDIR if logs_dir is not None else None
+    from .capabilities import resolved_from_request
+    resolved = resolved_from_request(req)
+    required_capabilities = resolved.get("required_capabilities", [])
+    correctness_suites = resolved.get("correctness_suites", [])
+    first_iteration_suites = resolved.get("first_iteration_suites", [])
+    max_iterations = max(1, req_field_int(req, "max_iterations", 20))
     return f"""You are the **PLANNER** for MetaInfer iteration #{iteration}.
 
-Your job: produce a concrete, file-level work plan for this iteration ONLY.
+{_plan_validation_repair_section(prev_failures)}
+
+Your job: produce the complete framework blueprint and a concrete, file-level
+work plan for this iteration. The blueprint must cover every required
+capability. This iteration must implement every suite activated in the
+machine-readable milestone manifest; prose cannot defer an active suite.
 Subsequent agents in this iteration (implementer) will follow your plan
 exactly, so be specific about file paths, function signatures, and test
 commands.
@@ -667,26 +869,73 @@ commands.
 All code and artifacts you plan for must live INSIDE this directory.
 
 # Knowledge base
-{NOTEBOOKS_HINT}
-Knowledge base path: {notebooks_dir}
+{_knowledge_section(
+    req, notebooks_dir, role="planner",
+    context=_knowledge_context(prev_failures, review_feedback, perf_plan),
+)}
 
 {NO_FRAMEWORK_REFERENCE_RULE}
 
 # Previous iteration failures (if any)
 {prev_failures or "(none — this is the first iteration)"}
 {_prev_logs_section(prev_failures, prev_snap)}
+{'''# Execution-policy failure evidence ordering
+The previous B process completed but was rejected for an execution-policy
+violation. Its code and direct tool-result evidence are newer than any oracle
+report copied forward from an earlier C phase. Separate those timestamps in
+`Failure evidence`: preserve contract-compliant fixes demonstrated by the
+newer build/runtime results, and send them to the authoritative C oracle for
+confirmation. Do not regress a routed binding/reference implementation merely
+to reproduce an older C symptom. Plan a code change only for a defect still
+present in current source or reproduced by the newer B evidence; otherwise
+the required recovery is policy compliance plus full C validation.
+
+Do not use `server*.log` files found in the visible iteration code directory
+as failure evidence. They are ad-hoc smoke captures, are not owned by the
+oracle, and may predate the latest implementation. Authoritative diagnostics
+live only in the task logs directory named above; direct Implementer tool
+results must be ordered by their event timestamps.
+''' if prev_failures and "B execution policy failed" in prev_failures else ''}
 {_perf_plan_section(perf_plan)}
 {_review_feedback_section(review_feedback)}
 
+# Correctness evidence rule
+A milestone assignment is a deadline, not evidence that its suite passed.
+`current_suites` is cumulative: the iteration must preserve and validate all
+previously due suites as well as newly due suites. When the prior iteration
+ended before C or lacks a passing oracle report, treat every due suite as
+unverified. The plan must first recover the observed end-to-end failure and
+establish an incremental test harness; it must not focus only on newly added
+hardening suites while inherited generation still returns fixed, empty,
+mock, input-independent, or non-finite output.
+
+{f'''# Required failure evidence section
+Because a previous phase failed, `plan.md` MUST contain a heading named
+`Failure evidence`. Under it, quote concrete bounded evidence from the
+diagnostic artifacts above and separate observed facts from hypotheses. If B
+ended before C, search the Implementer event stream instead of relying only
+on the retrospective. The first work items must recover the failed base
+loading/forward/generation path before newly due hardening suites. Do not
+assert that a deferred feature caused fixed or non-finite output unless the
+event evidence demonstrates that causal link.
+''' if prev_failures else ''}
+
 # Deliverables
-Write exactly two files inside `{iter_dir}`:
+Write exactly three files inside `{iter_dir}`:
 
 1. `plan.md` — your work plan. Must contain:
+   - **Overall architecture** covering every required capability and their
+     data/control-flow boundaries
+   - **Capability matrix** mapping each required capability to code modules,
+     correctness suites, and a planned implementation iteration
+   - **Iteration roadmap** covering the remaining rounds, not just this turn
    - **Goal of this iteration** (1-2 sentences)
    - **File-by-file work items** (path → what to create/modify, key APIs)
    - **Test plan** (what `test.sh` should check; what "correct" means)
    - **Performance targets** (only if this iteration includes perf work)
    - **Risks** (anything that might block the implementer)
+   - **Knowledge route** listing every required document id you read and any
+     optional document ids you selected. Do not copy document contents.
    - If `review_feedback` was provided above: a **"Review response"** section
      that says how the plan addresses each suggestion.
    - If a perf plan brief was provided above: a **"Perf plan response"**
@@ -698,9 +947,123 @@ Write exactly two files inside `{iter_dir}`:
    test must print to stdout on success:
    `{{"passed": true, "perf": {{"tokens_per_sec": 123.4, ...}}, "notes": "..."}}`
 
-Do NOT write code. Do NOT run tests. Planning only. Be terse — a good
-plan fits in one screen. Do not over-explore the knowledge base; read
-only the 3-4 notebook files most relevant to this iteration's task.
+3. `plan_manifest.json` — strict JSON (no comments) with exactly this shape:
+   ```json
+   {{
+     "schema_version": 1,
+     "iteration": {iteration},
+     "required_capabilities": {json.dumps(required_capabilities)},
+     "current_iteration_capabilities": ["cumulative capabilities due now"],
+     "current_suites": ["cumulative correctness suites due now"],
+     "deferred_suites": ["suites assigned to a later milestone"],
+     "milestones": [
+       {{
+         "iteration": 1,
+         "capabilities": ["capabilities first made executable here"],
+         "suites": ["suites first made gating here"],
+         "deliverables": ["concrete runnable outcome"]
+       }}
+     ]
+   }}
+   ```
+   Before editing this file in iteration 2 or later, read the inherited
+   `plan_manifest.json` already present in the iteration directory. Its
+   milestone deadlines are frozen upper bounds: a capability or suite may be
+   pulled into an earlier milestone, but it MUST NOT be moved to a later one.
+   Preserve assignments that are already due unless the validator explicitly
+   requires an earlier deadline.
+
+   Manifest preflight (perform this after writing the file, before returning):
+   - Every milestone object has exactly the required planning keys
+     `iteration`, `capabilities`, `suites`, and `deliverables`.
+   - Never use legacy aliases such as `id` or `gating_suites`; do not add
+     prose-only milestone fields such as `label` or `description`.
+   - Each required capability appears in the `capabilities` array of exactly
+     one milestone. Later milestones use an empty capability array when no
+     capability is first activated there; they do not repeat active ones.
+   - Each authoritative correctness suite appears in the `suites` array of
+     exactly one milestone. `current_suites` is the ordered cumulative set due
+     through iteration {iteration}; `deferred_suites` is only the remainder.
+   - Every milestone has at least one concrete runnable `deliverables` entry,
+     even when its capability or suite arrays are empty.
+
+   Assign every required capability and every correctness suite exactly once
+   across milestones 1..{max_iterations}. The `current_*` arrays are the
+   cumulative assignments through iteration {iteration}, in the authoritative
+   order below; `deferred_suites` is the remaining suffix/set in that same
+   order. The final iteration cannot defer anything.
+
+# Machine-checked milestone floors
+- authoritative required capabilities: {required_capabilities}
+- authoritative correctness suites: {correctness_suites}
+- iteration-1 mandatory suites: {first_iteration_suites}
+- Iteration 1 MUST assign every required capability to milestone 1. This
+  means executable correctness-first paths, not headers, empty methods,
+  fake metadata, mock output, or future-only roadmap entries.
+- Iteration 1 MUST provide a runnable end-to-end C++ vertical slice: build,
+  real GGUF loading, tokenizer/chat template, real model forward and
+  generation, KV state, and OpenAI HTTP serving. When selected, TP, Paged KV,
+  Continuous Batching, and active combination contracts must also execute
+  their mandatory iteration-1 suites above.
+- When any optional runtime capability is selected, `plan.md` and
+  `test_spec.md` must define the observable `GET /v1/models` evidence. The
+  metadata object includes `capabilities`; TP adds `tp_size`, `world_size`,
+  `rank`, `device_ids`, `weight_sharding`, and `collective_backend`; Paged KV
+  adds `kv_block_size` and `kv_capacity_policy`; Continuous Batching adds
+  `max_concurrency`; either feature adds `max_context_length`. Map each required
+  field to the compiled resource contract and the module that produces the
+  real value. Detailed capacity fields (`max_total_cached_tokens`,
+  `guaranteed_full_context_requests`, `kv_bytes_per_token_per_rank`,
+  `kv_pool_bytes_per_rank`, and `kv_total_blocks`) are recommended diagnostics,
+  not acceptance gates; expose them when the implementation tracks them
+  reliably, but do not fabricate them.
+- Later iterations may harden numeric coverage, edge cases, and performance,
+  but they cannot postpone the first runnable serving path.
+- For a TP task, real-target-model end-to-end and generation validation must
+  run with the frozen `tp_size`. Never plan a full-model TP1/single-device
+  fallback as the correctness path. One-rank tests are allowed only for
+  reduced synthetic operators or rank-local shards whose memory budget is
+  explicitly bounded; they do not replace TP numeric and integration tests.
+- Apply that rule to `tensor_parallel.numeric_parity` too. A full target model
+  with real weights MUST NOT be loaded as TP1/single-device for a reference,
+  debug, baseline, or parity run. Validate TP numerics in two layers:
+  (a) reduced synthetic operators or a reduced synthetic layer may compare
+  TP1 with the frozen TP topology, and (b) real-model loading, forward,
+  generation, Paged KV, and Continuous Batching must run only with the frozen
+  `tp_size`. For the real model, use finite/logit invariants, deterministic
+  reference fixtures, and same-TP execution-mode parity instead of a TP1
+  copy of the complete weights.
+- Do not create a bring-up roadmap that first runs the complete target model
+  as "single-GPU", "single-rank", or "no TP" and adds TP afterward. The
+  real-model `base.real_model_loading`, `base.forward_numerics`,
+  `base.single_sequence_generation`, HTTP, and integration paths also run
+  directly with the frozen `tp_size`. Only explicitly reduced synthetic
+  operator/Layer fixtures may use one device.
+- When recovering a failed GGUF model path, a finite or non-zero embedding is
+  NOT evidence that tensor bytes were loaded correctly; arbitrary header or
+  metadata bytes commonly decode to finite FP16 values. The first recovery
+  work item must audit `src/model_loader.cpp` and verify
+  `data_offset = align_up(tensor_info_end, general.alignment)`, with each
+  `tensor.offset` interpreted relative to that data blob. Add an early byte
+  fingerprint or known-tensor-value check before debugging Attention, RoPE,
+  Paged KV, or Collectives.
+- Do not infer a hipBLAS row-major/column-major bug from API terminology alone.
+  Column-major `C[N,T]` with `ldc=N` has the same contiguous bytes as row-major
+  `[T,N]`. Before planning a dimension swap or transpose, list
+  `transA/transB/M/N/K/lda/ldb/ldc` and cite an observed CPU-reference mismatch.
+
+If "Previous iteration failures" contains `A plan validation failed`, those
+are machine-validator errors for the files in this same directory. Repair
+every listed error before returning. Do not preserve an invalid manifest just
+because its prose roadmap looks reasonable.
+
+Do NOT write code. Do NOT run tests. Planning only. Keep the plan concrete
+and bounded. Read the routed required set, then stay within the
+optional-reading limit instead of exploring the whole knowledge base.
+After writing the three deliverables and performing the manifest preflight,
+return immediately. Do not launch a subagent, background verifier, or any
+other asynchronous task from the Planner turn. The orchestrator performs the
+authoritative validation after the Planner process exits.
 """
 
 
@@ -731,11 +1094,22 @@ def implement_prompt(
 
 # Plan to follow
 Read `{iter_dir}/plan.md` and `{iter_dir}/test_spec.md` (written by the
-planner). Implement exactly what they specify — do not invent new scope.
+planner), plus `{iter_dir}/plan_manifest.json`. Implement exactly what they
+specify — do not invent new scope. Every suite in `current_suites` is a hard
+gate in this iteration. `deferred_suites` are still final requirements, but
+the immutable oracle may report them as expected future failures until their
+milestone becomes active.
+
+For iteration 1, all selected capability paths must be executable together.
+A class declaration, stub return, fake `/v1/models` metadata, TP1 fallback,
+or loader-only binary is not an implementation of the manifest. The server
+must load the real model and complete real HTTP generation end to end.
 
 # Knowledge base
-{NOTEBOOKS_HINT}
-Knowledge base path: {notebooks_dir}
+{_knowledge_section(
+    req, notebooks_dir, role="implementer",
+    context=_knowledge_context(prev_failure, review_feedback, perf_plan),
+)}
 
 {NO_FRAMEWORK_REFERENCE_RULE}
 
@@ -744,6 +1118,14 @@ Knowledge base path: {notebooks_dir}
 # Previous failure (if retrying after a failed test)
 {prev_failure or "(none — fresh implementation)"}
 If a previous failure is shown, your FIRST commit must address it.
+For a failed GGUF path with fixed, garbage, or non-finite output, the first
+diagnostic action and first applicable fix MUST audit `src/model_loader.cpp`:
+compute `data_offset = align_up(tensor_info_end, general.alignment)` and read
+each tensor at `data_offset + tensor.offset`. A finite or non-zero embedding
+does not clear the loader because misread metadata bytes commonly decode to
+finite FP16 values. Verify a known tensor byte/value fingerprint before
+spending time on Attention, RoPE, Paged KV, or Collective debugging.
+{_prior_implementer_evidence_section(logs_dir, iteration) if not prev_failure else ""}
 {_inline_traceback_section(prev_snap)}{_prev_logs_section(prev_failure, prev_snap)}
 {_perf_plan_section(perf_plan)}
 {_review_feedback_section(review_feedback)}
@@ -755,6 +1137,12 @@ If a previous failure is shown, your FIRST commit must address it.
 {PROCESS_SAFETY_MANDATE}
 
 Keep the implementation minimal and correct. No gold-plating.
+
+After the required build and bounded smoke checks finish, return immediately.
+Do not launch an Agent, Task, TaskOutput, Explore, background verifier, or any
+other delegated/asynchronous check. The orchestrator owns independent validation
+in C after this Implementer process exits; delegating post-implementation
+verification is an execution-policy failure even when that verifier passes.
 """
 
 
@@ -803,8 +1191,13 @@ file:line first.
 {PROCESS_SAFETY_MANDATE}
 
 # Knowledge base
-{NOTEBOOKS_HINT}
-Knowledge base path: {notebooks_dir}
+{_knowledge_section(
+    req, notebooks_dir, role="implementer", context=prev_failure,
+)}
+
+After the targeted build and smoke check finish, return immediately. Do not
+launch an Agent, Task, TaskOutput, Explore, background verifier, or any other
+delegated/asynchronous check. The orchestrator owns independent validation.
 """
 
 
@@ -890,10 +1283,57 @@ def _deliverables_for_task(task_type: str, iter_dir: Path, req: Dict[str, Any]) 
      2. waits for `/v1/models` (or a probe to `/v1/chat/completions`),
      3. sends a fixed set of prompts via HTTP,
      4. dispatches a separate judge sub-agent to verdict each response,
-     5. kills the server and writes `oracle-report.json`.
+   5. kills the server and writes `oracle-report.json`.
 
-   You do NOT write the test, prompts, judge, build commands, or profiler
-   commands. Write `serve.sh`, `CMakeLists.txt`, and the C++ framework code.
+   The server MUST include runtime evidence in `GET /v1/models`. Put a
+   `metainfer` or `metadata` object in the first model entry with:
+   `capabilities` (the required capability ids). For TP also expose `tp_size`,
+   `world_size`, `rank`, `device_ids`, `weight_sharding`, and
+   `collective_backend`. For Paged KV expose `kv_block_size`; for Continuous
+   Batching expose `max_concurrency` and a live monotonic
+   `max_observed_batch_size` counter updated from the actual Runner batch, not
+   from HTTP socket count. The immutable oracle re-reads this metadata after
+   concurrent requests and requires an observed Runner batch of at least 2.
+   When either Paged KV or Continuous Batching is selected, expose
+   `max_context_length`; Paged KV also exposes `kv_capacity_policy`. Capacity
+   diagnostics such as `max_total_cached_tokens`,
+   `guaranteed_full_context_requests`, `kv_bytes_per_token_per_rank`,
+   `kv_pool_bytes_per_rank`, and `kv_total_blocks` are optional metadata and do
+   not gate acceptance. Allocate the actual pool according to the compiled
+   resource contract even when those diagnostics are omitted. For
+   `full_context_per_request`, every configured active request must be able to
+   reserve a full context simultaneously. For `shared_token_budget`, advertise
+   the smaller guaranteed full-context concurrency honestly. Reject a single
+   request whose prompt plus maximum output can never fit instead of leaving it
+   queued forever.
+   It cross-checks metadata with behavioral probes; do not advertise a
+   capability that is not actually active.
+
+   Required capabilities are non-negotiable. Never make a failing test pass
+   by silently disabling a selected feature, reducing TP to one rank, moving
+   required weights/LM head to CPU, or returning mock output.
+
+   The default CMake build must also produce `build/qwen3_numeric_tests`.
+   It accepts `--report <path>`, uses real HIP kernels with independent CPU
+   references, and writes `{{"passed": true, "cases": [...]}}` only when
+   every required case passes without skip. Required case ids are:
+   `cast_fp32_to_fp16`, `rms_norm`, `per_head_rms_norm`, `rope_neox`,
+   `kv_write`, `prefill_gqa`, `swiglu`, `greedy`, plus `f16_linear` for F16
+   weights or `dequant_q8_0`, `q8_embedding`, `q8_linear` for Q8_0. Add
+   `paged_attention`, `packed_sequence_isolation`, `tp_collective`, and
+   `tp_sharded_linear` when their corresponding capabilities are selected.
+   Add `kv_capacity_contract` whenever Paged KV or Continuous Batching is
+   selected. That reduced synthetic case must instantiate the frozen context,
+   concurrency, block-size, and capacity policy; verify admission at the
+   promised limit, reject an impossible request without waiting, and recover
+   all KV capacity after release.
+   The immutable C oracle runs this binary before loading the real model;
+   missing, failed, or skipped cases are correctness failures.
+
+   You do NOT write the immutable oracle, its HTTP prompts, judge, system
+   build commands, or profiler commands. You DO write the
+   `qwen3_numeric_tests` target described above, plus `serve.sh`,
+   `CMakeLists.txt`, and the C++ framework code.
 
 {GPU_PREFLIGHT_MANDATE}
 
@@ -940,8 +1380,7 @@ def review_prompt(
     """Prompt for the **post-test reviewer**.
 
     The reviewer runs AFTER C (the test / oracle step), not before it. Its
-    job is no longer to gate the test — the test has already happened.
-    Instead, its job is to:
+    explicit PASS/NEEDS_FIX verdict is a hard phase gate. Its job is to:
 
     1. read the code in the iteration directory,
     2. read the test outcome (`outcome`, `failure`, `perf` below) plus the
@@ -988,10 +1427,11 @@ oracle report, and judge outputs from the test you're reviewing. Open them:
         review_path = iter_dir / "review.md"
     return f"""You are the **REVIEWER** for MetaInfer iteration #{iteration}.
 
-You run AFTER the test step. Your verdict does NOT gate anything — the
-test has already happened and the iteration is already being closed. Your
-job is to produce improvement suggestions that the NEXT iteration will
-inherit through `ctx.review_feedback`.
+You run AFTER the test step. Your verdict is a hard gate for this iteration.
+The next phase is allowed only when the correctness result is passing and you
+write an explicit `Verdict: PASS`. `NEEDS_FIX` or a missing verdict routes the
+implementation back for repair. Suggestions are still carried to the next
+iteration through `ctx.review_feedback`.
 
 # Task requirements (frozen)
 {_render_req(req)}
@@ -1011,15 +1451,25 @@ cases, correctness risks) and on what would speed the next iteration up.
 {iter_dir}
 
 # Plan and spec
-Read `{iter_dir}/plan.md` and `{iter_dir}/test_spec.md` for context.
+Read `{iter_dir}/plan.md`, `{iter_dir}/test_spec.md`, and
+`{iter_dir}/plan_manifest.json` for context.
 
 # Knowledge base
-{NOTEBOOKS_HINT}
-Knowledge base path: {notebooks_dir}
+{_knowledge_section(req, notebooks_dir, role="reviewer", context=failure)}
 
 {NO_FRAMEWORK_REFERENCE_RULE}
 
 # Checks (act on what you observed in the logs + code)
+- Open `oracle-report.json` and inspect `development_gate` first, then
+  `acceptance.suite_results`. Any missing or failed suite named by
+  `development_gate.required_suites` is automatically `NEEDS_FIX`, even when
+  model response cases look plausible. A failure listed only under
+  `development_gate.deferred_suites` is a future milestone and does not by
+  itself block this review; record it as a next-iteration risk. FinalAudit
+  still requires every frozen suite.
+- Cross-check `/v1/models` runtime metadata against required and disabled
+  capabilities. A selected feature running with different parameters, or a
+  disabled feature introduced as a workaround, is `NEEDS_FIX`.
 - Did the code match the plan? Where did it diverge?
 - If C failed: what is the root cause (cite the exact log line or traceback
   frame)? Is it a logic bug, a server-startup bug, a dtype / shape bug, an
@@ -1033,7 +1483,7 @@ Knowledge base path: {notebooks_dir}
 
 # Deliverable
 Write `{review_path}` with:
-- **Verdict**: PASS / NEEDS_FIX  (advisory only — does not gate anything)
+- **Verdict**: PASS / NEEDS_FIX  (the orchestrator parses this as a hard gate)
 - **Root cause** (if C failed): one paragraph citing log lines
 - **Issues**: list, each with file:line and a concrete fix the next
   implementer / optimizer can apply directly
@@ -1070,8 +1520,7 @@ Output contract (MANDATORY — the orchestrator parses this):
 - exit 0 even on failure
 
 # Knowledge base
-{NOTEBOOKS_HINT}
-Knowledge base path: {notebooks_dir}
+{_knowledge_section(req, notebooks_dir, role="test_writer")}
 """
 
 
@@ -1089,6 +1538,7 @@ def c_repair_prompt(
     max_attempts: int,
     failure: Optional[str],
     logs_dir: Optional[Path] = None,
+    failure_route: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Prompt for the **C-step debugger**.
 
@@ -1105,12 +1555,18 @@ def c_repair_prompt(
     * One root cause per attempt. Fix one thing, then stop. The orchestrator
       re-runs the test; if it still fails, the next attempt tackles the next
       cause.
-    * The standard implementer smoke-test mandate still applies — verify the
-      C++ build + server-boot after editing, so the re-run isn't wasted on a
-      compile or link error.
+    * Verify the C++ build plus the failure route's narrow reproduction after
+      editing; a full server boot is required only for runtime/serving routes.
     """
     prev_snap = logs_dir / PREV_ITER_LOGS_SUBDIR if logs_dir is not None else None
     remaining = max(0, max_attempts - attempt)
+    route_context = str((failure_route or {}).get("knowledge_context") or "")
+    knowledge_context = "\n".join(
+        item for item in (failure or "", route_context) if item
+    )
+    playbook_documents = tuple((failure_route or {}).get(
+        "required_documents", []
+    )) + tuple((failure_route or {}).get("reference_templates", []))
     return f"""You are the **C-STEP DEBUGGER** for MetaInfer iteration #{iteration},
 repair attempt {attempt} of {max_attempts} ({remaining} attempt(s) remaining
 after this one before the iteration gives up and routes back to B for a full redo).
@@ -1140,6 +1596,8 @@ working code that just has a bug. Touch only the file(s) the failure reason
 points at. Regenerating unrelated files re-introduces bugs that were
 already fixed and burns your repair budget on noise.
 
+{_failure_route_section(failure_route)}
+
 # Failure-context diagnostic logs
 The full oracle-report.json (or test log) for THIS iteration's failing C
 step lives in:
@@ -1151,8 +1609,13 @@ the detail (exact prompt, response, judge verdict, http status, traceback).
 {_inline_traceback_section(prev_snap)}
 
 # Knowledge base
-{NOTEBOOKS_HINT}
-Knowledge base path: {notebooks_dir}
+{_knowledge_section(
+    req,
+    notebooks_dir,
+    role="debugger",
+    context=knowledge_context,
+    required_document_ids=playbook_documents,
+)}
 
 {NO_FRAMEWORK_REFERENCE_RULE}
 
@@ -1166,17 +1629,24 @@ Knowledge base path: {notebooks_dir}
 3. **Minimal diff.** Use Edit, not Write. Do not rewrite whole functions
    unless the bug is structural. Do not touch files unrelated to the
    failure.
-4. **Verify locally before exiting** (gen-cpp-infer-framework): run
-   `bash build.sh` from the iteration directory first, then run
-   `./build/metainfer_cpp_server --help` or `--version`. If either fails,
-   fix the compile/link/binary-path error before doing anything else -
-   the orchestrator's C re-run will fail instantly and waste this repair
-   attempt. After the build check passes, do a quick local server-boot
-   smoke (start `serve.sh` on a free port, poll `/v1/models`, kill it).
-   See `CPP_BUILD_TEST_MANDATE` / `SMOKE_TEST_MANDATE` principles from
-   the implementer's contract - same rules apply here.
+4. **Run only the targeted verification listed by the deterministic route.**
+   `bash build.sh` is always the first check. Start a local server only when
+   the selected route explicitly calls for a boot or HTTP smoke; numeric,
+   loader, and compile routes must not load the full model unnecessarily.
+   When a server is needed, own its lifecycle in one shell command: capture
+   `$!`, probe it, terminate that PID, and wait for it.
 5. **Do NOT re-run the full oracle / test.sh yourself.** That's the
    orchestrator's job. Stop after the local smoke check passes.
+
+6. **Never regress a required capability.** Do not disable Paged KV,
+   Continuous Batching, or Tensor Parallelism to make one failing probe pass.
+   Do not reduce TP size, move required weights or the LM head to CPU, enable
+   mock mode, or silently fall back to a single rank. If the failure is
+   architectural, record it and let the iteration route back to B.
+7. Read `oracle-report.json::development_gate` and
+   `acceptance.suite_results`. Name the exact failed ACTIVE suite in the
+   repair log. Do not spend a repair attempt on a deferred-only suite, and do
+   not fix an unrelated symptom merely because it is easier to make green.
 
 {PROCESS_SAFETY_MANDATE}
 
@@ -1227,11 +1697,14 @@ End your turn after writing both the code fix and the repair log.
 
 
 def c_repair_followup_prompt(
+    req: Dict[str, Any],
+    notebooks_dir: Path,
     iteration: int,
     attempt: int,
     max_attempts: int,
     new_failure: Optional[str],
     logs_dir: Path,
+    failure_route: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Short follow-up prompt used for C-step repair turns 2..N.
 
@@ -1247,6 +1720,13 @@ def c_repair_followup_prompt(
     (one root cause, minimal diff, smoke test, write the .md)."
     """
     remaining = max(0, max_attempts - attempt)
+    route_context = str((failure_route or {}).get("knowledge_context") or "")
+    knowledge_context = "\n".join(
+        item for item in (new_failure or "", route_context) if item
+    )
+    playbook_documents = tuple((failure_route or {}).get(
+        "required_documents", []
+    )) + tuple((failure_route or {}).get("reference_templates", []))
     return f"""The C-step re-run after your previous fix still FAILED. This is
 repair attempt {attempt} of {max_attempts} ({remaining} remaining after this).
 
@@ -1262,16 +1742,74 @@ re-read files you already read. The diagnostic files for this iteration
 live at `{logs_dir}/` (open them only if the new failure needs detail you
 don't already have).
 
+{_failure_route_section(failure_route)}
+
+# Updated knowledge route
+{_knowledge_section(
+    req,
+    notebooks_dir,
+    role="debugger",
+    context=knowledge_context,
+    required_document_ids=playbook_documents,
+)}
+Do not re-read items already loaded in this resumed session. Read only newly
+required documents introduced by this failure route.
+
 Same discipline as before:
 1. Identify the ONE root cause the new failure points at.
 2. Make a minimal Edit (no rewrites of unrelated code).
-3. Smoke-check: `bash build.sh`, binary help/version, then a quick server-boot probe.
+3. Run the deterministic route's targeted verification. Do not add a full
+   server boot when that route only requires build, loader, or numeric checks.
 4. **MANDATORY**: overwrite `{logs_dir}/c-repair-attempt{attempt}.md`
    with the same 5-section structure as before (Error reason / Root cause
    hypothesis / Fix applied / Verification / Expected next-step outcome).
 
 Be terse. Stop as soon as the smoke check passes and the .md is written.
 """
+
+
+def _failure_route_section(
+    failure_route: Optional[Mapping[str, Any]],
+) -> str:
+    if not failure_route:
+        return "# Deterministic failure route\n- route: `unclassified`"
+    likely_files = tuple(
+        str(item) for item in failure_route.get("likely_files", [])
+    )
+    checks = tuple(
+        str(item) for item in failure_route.get("targeted_checks", [])
+    )
+    root_cause_checks = tuple(
+        str(item) for item in failure_route.get("root_cause_checks", [])
+    )
+    evidence_required = tuple(
+        str(item) for item in failure_route.get("evidence_required", [])
+    )
+    reference_templates = tuple(
+        str(item) for item in failure_route.get("reference_templates", [])
+    )
+    lines = [
+        "# Deterministic failure route (MANDATORY SCOPE)",
+        f"- route: `{failure_route.get('route_id', 'unclassified')}`",
+        f"- category: `{failure_route.get('category', 'unclassified')}`",
+        f"- signature: `{failure_route.get('signature', '')}`",
+        "- likely source scope:",
+    ]
+    lines.extend(f"  - `{item}`" for item in likely_files)
+    lines.append("- failure playbook root-cause checks:")
+    lines.extend(f"  - {item}" for item in root_cause_checks)
+    lines.append("- routed reference templates:")
+    lines.extend(f"  - `{item}`" for item in reference_templates)
+    lines.append("- targeted verification (run these, not the full oracle):")
+    lines.extend(f"  - {item}" for item in checks)
+    lines.append("- evidence required before exit:")
+    lines.extend(f"  - {item}" for item in evidence_required)
+    lines.extend([
+        "Stay inside the likely source scope unless the failure evidence proves",
+        "that another file owns the root cause. If you leave the scope, justify",
+        "the exact file in the repair log before editing it.",
+    ])
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -1311,8 +1849,9 @@ correctness oracle used.
 {iter_dir}
 
 # Knowledge base
-{NOTEBOOKS_HINT}
-Knowledge base path: {notebooks_dir}
+{_knowledge_section(
+    req, notebooks_dir, role="perf_tester", context=review_feedback,
+)}
 
 {NO_FRAMEWORK_REFERENCE_RULE}
 
@@ -1408,8 +1947,10 @@ that the next implementer can act on each item without re-analysis.
 {iter_dir}
 
 # Knowledge base
-{NOTEBOOKS_HINT}
-Knowledge base path: {notebooks_dir}
+{_knowledge_section(
+    req, notebooks_dir, role="perf_planner",
+    context=_knowledge_context(last_perf, review_feedback),
+)}
 Look especially for kernel tuning notes, fused kernels, and memory layout tips
 relevant to the target hardware.
 
@@ -1601,8 +2142,10 @@ Read for context (do NOT dump them in the output, synthesize):
 {review_section}
 
 # Knowledge base (only if you need background on a technique)
-{NOTEBOOKS_HINT}
-Knowledge base path: {notebooks_dir}
+{_knowledge_section(
+    req, notebooks_dir, role="retrospective",
+    context=_knowledge_context(this_perf, review_feedback, e_error),
+)}
 
 {NO_FRAMEWORK_REFERENCE_RULE}
 
@@ -1723,6 +2266,9 @@ You do NOT modify code. You do NOT gate anything. You only WRITE that file.
 # Where to find failure evidence
 Read for context (do NOT dump them in the output, synthesize):
   - `{iter_dir}/plan.md`           — what the planner set out to do
+  - `{iter_dir}/plan_manifest.json`— frozen milestone assignments: required
+                                     capabilities, current suites, and the
+                                     suites that may legitimately be deferred
   - the code under `{iter_dir}/`    — what was actually implemented
   - `{iter_dir}/test.sh`           — the correctness harness (if present)
   - `{logs_dir}/oracle-report.json`— per-case results when oracle path was used
@@ -1731,14 +2277,40 @@ Read for context (do NOT dump them in the output, synthesize):
   - `{logs_dir}/iter{iteration}-c-debugger.attempt*.events.jsonl`
                                     — raw ccb events from each debugger turn
   - `{logs_dir}/server.stderr.log` — server logs (crashes, OOM, import errors)
+  - `{logs_dir}/iter{iteration}-implementer.status.json`
+                                    — B attempt count, timeout, and final status
+  - `{logs_dir}/iter{iteration}-implementer.attempt*.events.jsonl`
+                                    — search the final tool results for concrete
+                                      runtime evidence such as NaN/Inf, fixed
+                                      tokens, HTTP responses, GPU errors, and
+                                      the last successful build or model load
   - any `*.log` / `*.stderr` files under `{logs_dir}/`
 
 Many of these files may not exist (depends on which phase failed and
 whether the repair loop ran). Read what exists; skip what doesn't.
+Implementer event logs can be very large. Search them for the final runtime
+symptoms and read bounded matching sections; do not abandon the evidence
+because a whole-file read exceeds the tool limit.
+
+# Contract-aligned recommendations (MANDATORY)
+
+- Every capability in `required_capabilities` must retain an executable path
+  from iteration 1 onward. Do NOT recommend postponing or dropping a required
+  capability, even when the iteration was over-scoped.
+- You may recommend a smaller correctness-first implementation inside each
+  required capability and may defer only suites listed in
+  `plan_manifest.json::deferred_suites`.
+- Distinguish SubAgentManager attempts from pipeline C repair turns. Do not
+  claim an attempt restarted from scratch, discarded prior source, or used a
+  fresh session unless the status/events provide direct evidence.
+- An HTTP 200 with empty, fixed, mock, non-finite, or input-independent model
+  output is a correctness failure. Preserve that concrete symptom in the
+  next-iteration recommendations.
 
 # Knowledge base (only if you need background on a technique)
-{NOTEBOOKS_HINT}
-Knowledge base path: {notebooks_dir}
+{_knowledge_section(
+    req, notebooks_dir, role="failure_retrospective", context=failure_reason,
+)}
 
 {NO_FRAMEWORK_REFERENCE_RULE}
 

@@ -1,0 +1,9 @@
+{
+  "task_id": "fixture-paged-continuous-q8",
+  "task_type": "gen-cpp-infer-framework",
+  "target_model": "/models/Qwen3-8B-Q8_0.gguf",
+  "target_hardware": "Hygon Z200",
+  "features": ["Paged KV cache", "Continuous batching"],
+  "kv_block_size": 16,
+  "max_concurrency": 4
+}

@@ -104,6 +104,30 @@ __global__ void embedding_lookup_q8_0_kernel(
     out[tid] = __half2float(block->d) * (float) block->qs[offset];
 }
 
+__global__ void embedding_lookup_f16_kernel(
+        float * __restrict__ out,
+        const __half * __restrict__ token_embedding,
+        const int * __restrict__ token_ids,
+        int n_tokens,
+        int vocab_size,
+        int hidden_dim) {
+    const size_t tid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total = (size_t) n_tokens * hidden_dim;
+    if (tid >= total) {
+        return;
+    }
+
+    const int d = (int) (tid % hidden_dim);
+    const int t = (int) (tid / hidden_dim);
+    const int token_id = token_ids[t];
+    if (token_id < 0 || token_id >= vocab_size) {
+        out[tid] = 0.0f;
+        return;
+    }
+    out[tid] = __half2float(
+            token_embedding[(size_t) token_id * hidden_dim + d]);
+}
+
 __device__ float block_reduce_sum(float value, float * smem) {
     const int tid = threadIdx.x;
     smem[tid] = value;
@@ -587,6 +611,115 @@ extern "C" hipError_t qwen3_z200_launch_embedding_lookup_q8_0(
             vocab_size,
             hidden_dim);
     return hipGetLastError();
+}
+
+extern "C" hipError_t qwen3_z200_launch_embedding_lookup_f16(
+        float * out,
+        const __half * token_embedding,
+        const int * token_ids,
+        int n_tokens,
+        int vocab_size,
+        int hidden_dim,
+        hipStream_t stream) {
+    if (out == nullptr || token_embedding == nullptr || token_ids == nullptr
+            || n_tokens <= 0 || vocab_size <= 0 || hidden_dim <= 0) {
+        return hipErrorInvalidValue;
+    }
+
+    const size_t total = (size_t) n_tokens * hidden_dim;
+    hipLaunchKernelGGL(
+            qwen3_z200::embedding_lookup_f16_kernel,
+            dim3((unsigned int) qwen3_z200::div_up_size(
+                    total, qwen3_z200::kBlockSize)),
+            dim3(qwen3_z200::kBlockSize),
+            0,
+            stream,
+            out,
+            token_embedding,
+            token_ids,
+            n_tokens,
+            vocab_size,
+            hidden_dim);
+    return hipGetLastError();
+}
+
+// Compute row-major Y[M, N] = X[M, K] * W_f16[N, K]^T. The caller keeps
+// F16 weights resident and reuses only the activation-cast workspace.
+extern "C" hipblasStatus_t qwen3_z200_f16_linear_fp32(
+        hipblasHandle_t handle,
+        float * out,
+        const float * x,
+        const __half * weight,
+        __half * x_fp16_workspace,
+        size_t x_workspace_elements,
+        int m,
+        int n,
+        int k,
+        hipStream_t stream) {
+    if (handle == nullptr || out == nullptr || x == nullptr || weight == nullptr
+            || x_fp16_workspace == nullptr || m <= 0 || n <= 0 || k <= 0) {
+        return HIPBLAS_STATUS_INVALID_VALUE;
+    }
+
+    const size_t x_elements = (size_t) m * k;
+    if (x_workspace_elements < x_elements) {
+        return HIPBLAS_STATUS_INVALID_VALUE;
+    }
+
+    hipblasStatus_t status = hipblasSetStream(handle, stream);
+    if (status != HIPBLAS_STATUS_SUCCESS) {
+        return status;
+    }
+    const hipError_t hip_status = qwen3_z200_launch_cast_fp32_to_fp16(
+            x_fp16_workspace, x, x_elements, stream);
+    if (hip_status != hipSuccess) {
+        return HIPBLAS_STATUS_EXECUTION_FAILED;
+    }
+
+    hipblasPointerMode_t old_pointer_mode;
+    status = hipblasGetPointerMode(handle, &old_pointer_mode);
+    if (status != HIPBLAS_STATUS_SUCCESS) {
+        return status;
+    }
+    const bool restore_pointer_mode = old_pointer_mode != HIPBLAS_POINTER_MODE_HOST;
+    if (restore_pointer_mode) {
+        status = hipblasSetPointerMode(handle, HIPBLAS_POINTER_MODE_HOST);
+        if (status != HIPBLAS_STATUS_SUCCESS) {
+            return status;
+        }
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    status = hipblasGemmEx(
+            handle,
+            HIPBLAS_OP_T,
+            HIPBLAS_OP_N,
+            n,
+            m,
+            k,
+            &alpha,
+            weight,
+            HIPBLAS_R_16F,
+            k,
+            x_fp16_workspace,
+            HIPBLAS_R_16F,
+            k,
+            &beta,
+            out,
+            HIPBLAS_R_32F,
+            n,
+            HIPBLAS_R_32F,
+            HIPBLAS_GEMM_DEFAULT);
+
+    if (restore_pointer_mode) {
+        const hipblasStatus_t restore_status = hipblasSetPointerMode(
+                handle, old_pointer_mode);
+        if (status == HIPBLAS_STATUS_SUCCESS) {
+            status = restore_status;
+        }
+    }
+    return status;
 }
 
 // Compute row-major Y[M, N] = X[M, K] * W[N, K]^T.
