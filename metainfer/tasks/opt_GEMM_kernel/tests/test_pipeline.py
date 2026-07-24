@@ -78,8 +78,17 @@ def test_one_iteration_promotes_challenger_without_old_task_dependencies(tmp_pat
         (state / "baseline" / "baseline-manifest.json").read_text(encoding="utf-8")
     )
     assert baseline["benchmark"]["evaluation_role"] == "baseline"
-    assert baseline["build_fingerprint"] == "fake-build-v1"
+    assert baseline["implementation"] == "triton"
+    assert baseline["build_fingerprint"] == "triton-jit"
     assert baseline["hardware_profile"]["profile_id"] == "hygon-k100-gfx928"
+    initial_hip = json.loads(
+        (state / "certified" / "initial-hip" / "initial-hip-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert initial_hip["implementation"] == "initial-hip"
+    assert initial_hip["correctness"]["summary"]["expected"] == 2
+    assert initial_hip["hardware_profile"]["profile_id"] == "hygon-k100-gfx928"
     assert record["hardware_profile"]["cases"][0]["vgpr_count"] == 32
     assert feedback["benchmark"]["hardware_profile"]["gpu_arch"] == "gfx928"
     assert "Try a 128x128 tile" in manager.prompts["planner"]

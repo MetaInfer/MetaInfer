@@ -46,11 +46,14 @@ public_contract:
 
 commands:
   correctness:
-    argv: ["{artifact_dir}/metainfer_gemm_harness", correctness]
+    argv: ["python3", "{bundle_dir}/evaluate.py", correctness]
     timeout_s: 7200
   benchmark:
-    argv: ["{artifact_dir}/metainfer_gemm_harness", benchmark]
+    argv: ["python3", "{bundle_dir}/evaluate.py", benchmark]
     timeout_s: 7200
+  profile:
+    argv: ["python3", "{bundle_dir}/evaluate.py"]
+    timeout_s: 1800
 
 cases:
   correctness_include_benchmark: true

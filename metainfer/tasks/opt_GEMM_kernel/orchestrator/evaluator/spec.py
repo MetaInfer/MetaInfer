@@ -19,6 +19,7 @@ class SpecError(ValueError):
 
 
 _PHASES = ("correctness", "benchmark")
+_EXTRA_COMMANDS = ("profile",)
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,14 @@ class KernelTaskSpec:
             if timeout_s < 1 or timeout_s > 86_400:
                 raise SpecError(f"commands.{phase}.timeout_s must be in [1, 86400]")
             commands[phase] = CommandSpec(list(argv), timeout_s)
+        for phase in _EXTRA_COMMANDS:
+            item = commands_raw.get(phase)
+            if isinstance(item, dict):
+                argv = item.get("argv")
+                if isinstance(argv, list) and argv and all(isinstance(v, str) and v for v in argv):
+                    timeout_s = int(item.get("timeout_s", 600))
+                    if 1 <= timeout_s <= 86_400:
+                        commands[phase] = CommandSpec(list(argv), timeout_s)
 
         cases = raw.get("cases") or {}
         if not isinstance(cases, dict):

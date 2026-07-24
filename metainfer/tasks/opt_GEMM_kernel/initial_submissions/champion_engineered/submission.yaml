@@ -1,5 +1,5 @@
 schema_version: 1
 sources:
-  - myGEMM_kernel.hip
+  - gemm_champion_engineered.hip
 include_dirs: []
 requested_build_options: {}

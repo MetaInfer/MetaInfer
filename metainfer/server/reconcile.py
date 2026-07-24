@@ -63,6 +63,43 @@ def _read_pid_file(state_dir: Path) -> Dict[str, Any]:
         return {}
 
 
+def _restore_adopted_task_state(
+    state_dir: Path, task_id: str, pid: int,
+    started_at: Optional[float],
+) -> None:
+    """Clear stale stopped markers after proving an orphan is alive."""
+    pid_path = state_dir / "orchestrator.pid"
+    pid_data = _read_pid_file(state_dir)
+    pid_data.update({
+        "task_id": task_id,
+        "pid": pid,
+        "started_at": started_at,
+    })
+    pid_data.pop("finished_at", None)
+    pid_data.pop("exit_hint", None)
+    tmp = pid_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(pid_data, indent=2), encoding="utf-8")
+    tmp.replace(pid_path)
+
+    run_path = state_dir / "run.json"
+    if not run_path.exists():
+        return
+    try:
+        run_data = json.loads(run_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(run_data, dict):
+        return
+    run_data["finished"] = False
+    run_data["final_status"] = None
+    run_data["last_update"] = time.time()
+    from metainfer.server.filelock import lock_file
+    run_tmp = run_path.with_suffix(".tmp")
+    run_tmp.write_text(json.dumps(run_data, indent=2), encoding="utf-8")
+    with lock_file(run_path):
+        run_tmp.replace(run_path)
+
+
 # NOTE: reconcile used to have its own _write_pid_file_finished that only
 # touched orchestrator.pid. That diverged from launcher._reap_dead_pid_file
 # (which also updates run.json + writes a timeline event) — two reap
@@ -130,6 +167,9 @@ def reconcile(silent: bool = False) -> Dict[str, Any]:
         _runtime.record_task_spawn(
             tid, chosen["pid"], sd, boot_id,
             started_at=chosen.get("started_at"),
+        )
+        _restore_adopted_task_state(
+            sd, tid, chosen["pid"], chosen.get("started_at"),
         )
         adopted.append(tid)
         if not silent:

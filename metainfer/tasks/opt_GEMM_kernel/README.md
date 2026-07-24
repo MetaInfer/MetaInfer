@@ -6,7 +6,7 @@ does not import or modify `opt_kernel`, `gen_cpp_infer_framework`, or
 
 ## Runtime inputs
 
-- `initial_submission`: baseline candidate directory.
+- `initial_submission`: initial HIP challenger and optimization-seed directory.
 - `evaluator_bundle`: task-author-provided harness directory containing
   `task.yaml` and its correctness and benchmark runners. In the UI this is
   called **Harness path**. MetaInfer snapshots it as the system-owned frozen
@@ -25,7 +25,8 @@ fields.
 The initial submission includes a constrained `submission.yaml`; it does not
 own CMake, compiler or profiler commands. The task-local
 `orchestrator/hardware_profiles.yaml` binds the K100 selection to DTK/HIP,
-gfx928, CMake + Ninja, `-O3`, and rocprofv3/rocprof counter groups. MetaInfer
+gfx928, CMake + Ninja, `-O3`, and a preferred `hipprof --pmc` route with
+rocprofv3/rocprof fallbacks. MetaInfer
 resolves the installed executables,
 materializes `system_build/{build_profile.json,CMakeLists.txt,build.sh}`, and
 freezes the device compiler, host C++ compiler, CMake, Ninja/Make generator,
@@ -37,7 +38,12 @@ receives public notebooks and sanitized feedback.
 
 The six iteration phases match the C++/Python framework loop exactly:
 `A_plan -> B_implement -> C_test -> D_review -> E_perf_test -> F_perf_plan`.
-`S_baseline` is a one-time preflight and is not a seventh loop phase. Inside
+`S_baseline` is a one-time preflight and is not a seventh loop phase. It first
+certifies the frozen Triton implementation (correctness, event benchmark, and
+PMC) as the iteration-0 Champion, then independently compiles and certifies the
+Initial HIP submission with its own correctness, benchmark, PMC, and artifact
+directories. Initial HIP replaces Triton only when the existing evaluator and
+noise/critical-regression gates accept it. Inside
 `C_test`, MetaInfer runs its fixed SystemBuilder and then the harness
 correctness command. `E_perf_test` first runs the full frozen event-timed
 benchmark and then profiles only three representative public shapes with the
@@ -51,11 +57,13 @@ See `harness/README.md` for the authoring workspace and runtime protocol.
 ## Loop
 
 ```text
-system baseline certification
+Certified Triton Champion -> Certified Initial HIP challenger
 -> A plan -> B implement -> C test -> D review -> E perf test -> F perf plan
 ```
 
-Each iteration starts from the persisted champion. A candidate must pass every
+Each iteration starts from the persisted HIP Champion source. While Triton is
+still Champion, it starts from the independently certified Initial HIP source
+because Triton has no editable HIP submission tree. A candidate must pass every
 declared correctness and performance case, satisfy the weighted and critical
 shape gates, and beat the champion by more than the noise threshold before it
 is promoted.

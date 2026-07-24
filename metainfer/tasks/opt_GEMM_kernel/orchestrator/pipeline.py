@@ -113,7 +113,18 @@ class Orchestrator:
         try:
             self.store.update_run(current_iteration=0, current_phase="S_baseline")
             self.store.append_timeline("phase_start", {"iteration": 0, "phase": "S_baseline"})
-            self.baseline = self._ensure_baseline()
+            self.baseline = self._ensure_triton_baseline()
+            self.champions.initialize_triton(self.baseline)
+            self.initial_hip = self._ensure_initial_hip()
+            initial_score = dict(self.initial_hip.get("benchmark", {}).get("score") or {})
+            if initial_score.get("passed"):
+                promoted, reason, champion = self.champions.consider(
+                    0, self.cfg.state_dir / "certified" / "initial-hip" / "submission",
+                    initial_score,
+                )
+                self.store.append_timeline("initial_hip_challenged", {
+                    "promoted": promoted, "reason": reason, "champion": champion,
+                })
             self.store.append_timeline(
                 "phase_end", {"iteration": 0, "phase": "S_baseline", "outcome": P.OK}
             )
@@ -126,8 +137,6 @@ class Orchestrator:
             )
             self.manager.shutdown()
             return
-        self.champions.initialize(self.cfg.state_dir / "baseline" / "submission")
-
         start = self.workspace.latest_complete_number() + 1
         any_success = False
         try:
@@ -251,13 +260,17 @@ class Orchestrator:
         return self._finish(rec, "success" if promoted else "not_promoted", outcome, reason if not promoted else None)
 
     def _seed_from_champion(self, iter_dir: Path) -> None:
-        self.champions.load()  # verifies the persisted source tree digest
+        champion = self.champions.load()  # verifies persisted HIP source when present
         submission = iter_dir / "submission"
         if submission.exists():
             shutil.rmtree(submission)
-        champion_submission = self.champions.submission_dir
-        if champion_submission.is_dir():
-            shutil.copytree(champion_submission, submission)
+        seed = (
+            self.champions.submission_dir
+            if champion.get("kind") == "hip" else
+            self.cfg.state_dir / "certified" / "initial-hip" / "submission"
+        )
+        if seed.is_dir():
+            shutil.copytree(seed, submission)
         else:
             submission.mkdir(parents=True)
 
@@ -413,10 +426,11 @@ class Orchestrator:
         self._end_phase(rec, "C_test", outcome, correctness.failure, summary)
         return build_result, compile_result, correctness
 
-    def _ensure_baseline(self) -> Dict[str, Any]:
-        """Compile, validate and measure the original submission before agents run."""
+    def _ensure_triton_baseline(self) -> Dict[str, Any]:
+        """Certify frozen Triton as the initial arena Champion."""
         baseline_dir = self.cfg.state_dir / "baseline"
         submission = baseline_dir / "submission"
+        artifact_dir = baseline_dir / "runtime-artifacts"
         manifest_path = baseline_dir / "baseline-manifest.json"
         if manifest_path.is_file():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -424,8 +438,6 @@ class Orchestrator:
             actual = _canonical_digest(manifest)
             if digest != actual:
                 raise RuntimeError("frozen baseline manifest changed")
-            if manifest.get("build_fingerprint") != self.builder.profile.fingerprint:
-                raise RuntimeError("baseline BuildProfile differs from active BuildProfile")
             if manifest.get("evaluator_digest") != self.cfg.evaluator_bundle.digest:
                 raise RuntimeError("baseline evaluator differs from active evaluator")
             if self.profiler is not None:
@@ -435,55 +447,104 @@ class Orchestrator:
                 ).get("profile_fingerprint")
                 if actual_profile != expected_profile:
                     raise RuntimeError("baseline profiler differs from active hardware profile")
-            if not submission.is_dir() or manifest.get("submission_digest") != _tree_digest(submission):
-                raise RuntimeError("frozen baseline submission changed")
-            self.builder.verify()
+            if manifest.get("implementation") != "triton":
+                raise RuntimeError("baseline is not the certified Triton implementation")
             self.store.append_timeline(
                 "baseline_reused",
-                {"build_fingerprint": self.builder.profile.fingerprint},
+                {"implementation": "triton"},
             )
+            return manifest
+
+        baseline_dir.mkdir(parents=True, exist_ok=True)
+        submission.mkdir(parents=True, exist_ok=True)
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (submission / "IMPLEMENTATION.json").write_text(
+            json.dumps({"kind": "triton", "frozen_evaluator": True}, indent=2),
+            encoding="utf-8",
+        )
+        correctness = self.evaluator.run(
+            "correctness", submission, artifact_dir, baseline_dir,
+            role="baseline", build_fingerprint="triton-jit",
+        )
+        if not correctness.passed:
+            raise RuntimeError(correctness.failure or "Triton baseline failed correctness")
+        benchmark = self.evaluator.run(
+            "benchmark", submission, artifact_dir, baseline_dir,
+            role="baseline", build_fingerprint="triton-jit",
+        )
+        if not benchmark.passed:
+            raise RuntimeError(benchmark.failure or "Triton baseline benchmark failed")
+        hardware_profile: Dict[str, Any] = {}
+        if self.profiler is not None:
+            profiled = self.profiler.run(
+                artifact_dir, baseline_dir, role="baseline"
+            )
+            hardware_profile = profiled.report
+            if not profiled.passed and self.profiler.profile.required:
+                raise RuntimeError(profiled.failure or "Triton hardware profile failed")
+        payload = {
+            "schema_version": 2,
+            "implementation": "triton",
+            "certified_at": time.time(),
+            "build_fingerprint": "triton-jit",
+            "evaluator_digest": self.cfg.evaluator_bundle.digest,
+            "correctness": correctness.report,
+            "benchmark": benchmark.report,
+            "hardware_profile": hardware_profile,
+        }
+        payload["manifest_sha256"] = _canonical_digest(payload)
+        manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.store.append_timeline(
+            "baseline_certified",
+            {
+                "implementation": "triton",
+                "benchmark_cases": len(benchmark.report.get("cases") or []),
+            },
+        )
+        return payload
+
+    def _ensure_initial_hip(self) -> Dict[str, Any]:
+        """Independently certify the user-provided HIP optimization seed."""
+        root = self.cfg.state_dir / "certified" / "initial-hip"
+        submission = root / "submission"
+        manifest_path = root / "initial-hip-manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            digest = manifest.pop("manifest_sha256", None)
+            if digest != _canonical_digest(manifest):
+                raise RuntimeError("frozen Initial HIP manifest changed")
+            if manifest.get("submission_digest") != _tree_digest(submission):
+                raise RuntimeError("frozen Initial HIP submission changed")
             return manifest
 
         initial = self.cfg.initial_submission
         if initial is None or not initial.is_dir():
-            raise RuntimeError("initial_submission is required for baseline certification")
-        baseline_dir.mkdir(parents=True, exist_ok=True)
-        if submission.exists():
-            shutil.rmtree(submission)
+            raise RuntimeError("initial_submission is required")
+        root.mkdir(parents=True, exist_ok=True)
         shutil.copytree(initial, submission)
-        build_result = self.builder.build(submission, baseline_dir / "build")
+        build_result = self.builder.build(submission, root / "build")
         if not build_result.passed:
-            raise RuntimeError(build_result.failure or "baseline did not compile")
+            raise RuntimeError(build_result.failure or "Initial HIP did not compile")
         correctness = self.evaluator.run(
-            "correctness",
-            submission,
-            build_result.artifact_dir,
-            baseline_dir,
-            role="baseline",
-            build_fingerprint=self.builder.profile.fingerprint,
+            "correctness", submission, build_result.artifact_dir, root,
+            role="candidate", build_fingerprint=self.builder.profile.fingerprint,
         )
         if not correctness.passed:
-            raise RuntimeError(correctness.failure or "baseline failed correctness")
+            raise RuntimeError(correctness.failure or "Initial HIP failed correctness")
         benchmark = self.evaluator.run(
-            "benchmark",
-            submission,
-            build_result.artifact_dir,
-            baseline_dir,
-            role="baseline",
-            build_fingerprint=self.builder.profile.fingerprint,
+            "benchmark", submission, build_result.artifact_dir, root,
+            role="candidate", build_fingerprint=self.builder.profile.fingerprint,
+            baseline_report=self.baseline["benchmark"],
         )
-        if not benchmark.passed:
-            raise RuntimeError(benchmark.failure or "baseline benchmark failed")
         hardware_profile: Dict[str, Any] = {}
         if self.profiler is not None:
-            profiled = self.profiler.run(
-                build_result.artifact_dir, baseline_dir, role="baseline"
-            )
+            profiled = self.profiler.run(build_result.artifact_dir, root, role="candidate")
             hardware_profile = profiled.report
             if not profiled.passed and self.profiler.profile.required:
-                raise RuntimeError(profiled.failure or "baseline hardware profile failed")
+                raise RuntimeError(profiled.failure or "Initial HIP hardware profile failed")
         payload = {
             "schema_version": 1,
+            "implementation": "initial-hip",
             "certified_at": time.time(),
             "build_fingerprint": self.builder.profile.fingerprint,
             "evaluator_digest": self.cfg.evaluator_bundle.digest,
@@ -495,13 +556,10 @@ class Orchestrator:
         }
         payload["manifest_sha256"] = _canonical_digest(payload)
         manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        self.store.append_timeline(
-            "baseline_certified",
-            {
-                "build_fingerprint": self.builder.profile.fingerprint,
-                "benchmark_cases": len(benchmark.report.get("cases") or []),
-            },
-        )
+        self.store.append_timeline("initial_hip_certified", {
+            "benchmark_cases": len(benchmark.report.get("cases") or []),
+            "passed_gates": bool((benchmark.report.get("score") or {}).get("passed")),
+        })
         return payload
 
     def _review(
