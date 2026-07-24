@@ -12,7 +12,7 @@ def test_task_owned_harness_starter_has_a_valid_protocol():
     harness = Path(__file__).resolve().parents[1] / "harness" / "user_gemm"
     spec = KernelTaskSpec.load(harness / "task.yaml")
     assert spec.name == "deepseek-w8a8-gemm-tp4-tp8"
-    assert set(spec.commands) == {"correctness", "benchmark"}
+    assert set(spec.commands) == {"correctness", "benchmark", "profile"}
     assert len(spec.benchmark_cases) == 60
     assert len(spec.correctness_case_ids) == 64
     assert len(spec.private_case_ids) == 4

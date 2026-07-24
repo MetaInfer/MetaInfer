@@ -19,8 +19,26 @@ flags and the profile fingerprint are written to the compile report.
 
 E first consumes the Harness GPU-event benchmark for every weighted shape.
 It then invokes the Harness as `profile CASE_ID` for M=1, M=16 and M=4096 of
-the public `wq_b TP=4` workload. On rocprofv3, the system command has this
-fixed shape:
+the public `wq_b TP=4` workload. On the K100 DTK installation, the preferred
+system command is:
+
+```text
+hipprof --pmc --pmc-type 3 -o <SYSTEM_OUTPUT_BASE> \
+  metainfer_gemm_harness profile <CASE_ID>
+```
+
+`--pmc-type 3` produces a CSV table. Per-instance columns such as
+`TCC_HIT[0..31]` and `TCC_MISS[0..31]` are summed by MetaInfer before L2 rates
+are derived. Multiple dispatches (for example split-K plus its reduction) are
+retained in the normalized case report. PMC timings are diagnostic only and do
+not replace the Harness GPU-event benchmark. A PMC CSV is accepted only when
+the same invocation writes a successful `harness-profile.json` whose
+`case_id` exactly matches the requested case. Since the profile entrypoint
+performs all preparation and synchronization before its single candidate
+launch, the captured kernel dispatches belong to that case; a split-K main
+kernel and its reduction are deliberately retained together.
+
+If hipprof is unavailable, rocprofv3 has this fixed shape:
 
 ```text
 rocprofv3 --pmc <FROZEN_GROUP> --output-format csv json \

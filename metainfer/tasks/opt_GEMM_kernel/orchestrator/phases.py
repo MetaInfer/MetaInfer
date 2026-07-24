@@ -37,7 +37,7 @@ class PhaseMeta:
 PHASES: List[PhaseMeta] = [
     PhaseMeta("idle", "idle", "not started"),
     # S is a one-time preflight status, not one of the six iteration phases.
-    PhaseMeta("S_baseline", "Baseline", "one-time system build, correctness, and benchmark certification"),
+    PhaseMeta("S_baseline", "Certification", "certify Triton Champion, then independently certify Initial HIP challenger"),
     PhaseMeta("A_plan", "A: Plan", "agent proposes one measurable GEMM optimization"),
     PhaseMeta("B_implement", "B: Implement", "agent edits submission/ only"),
     PhaseMeta("C_test", "C: Correctness Test", "system build followed by the frozen harness correctness gate"),

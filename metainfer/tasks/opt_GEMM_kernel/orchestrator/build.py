@@ -691,6 +691,17 @@ def _render_build_script(
     root: Path,
     harness_source: Optional[Path] = None,
 ) -> str:
+    # LocalLauncher deliberately gives the orchestrator a friendly argv[0].
+    # CPython can consequently expose an empty sys.executable even though the
+    # real interpreter is available through /proc/self/exe.
+    python_executable = sys.executable
+    if not python_executable:
+        try:
+            python_executable = str(Path("/proc/self/exe").resolve(strict=True))
+        except OSError as exc:
+            raise BuildConfigError("cannot resolve the Python executable") from exc
+    else:
+        python_executable = str(Path(python_executable).resolve())
     harness_arg = (
         f" --harness-source {json.dumps(str(harness_source))}" if harness_source else ""
     )
@@ -698,7 +709,7 @@ def _render_build_script(
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "if [ \"$#\" -ne 2 ]; then echo 'usage: build.sh SUBMISSION_DIR BUILD_DIR' >&2; exit 2; fi\n"
-        f"exec {json.dumps(sys.executable)} -m "
+        f"exec {json.dumps(python_executable)} -m "
         "metainfer.tasks.opt_GEMM_kernel.orchestrator.build "
         f"--profile {json.dumps(str(profile_path))} --system-dir {json.dumps(str(root))} "
         f"--submission \"$1\" --build-dir \"$2\"{harness_arg}\n"

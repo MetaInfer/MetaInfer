@@ -58,13 +58,16 @@ def make_bundle(root: Path, *, speedup: float = 1.25) -> Path:
 phase = os.environ["METAINFER_EVALUATION_PHASE"]
 role = os.environ["METAINFER_EVALUATION_ROLE"]
 path = os.environ["METAINFER_REPORT_PATH"]
+submission = os.environ["METAINFER_SUBMISSION_DIR"]
 if phase == "correctness":
     report = {{"passed": True, "cases": [
         {{"id": "public", "passed": True}},
         {{"id": "heldout", "passed": True}}
     ]}}
 else:
-    latency = 1.0 if role == "baseline" else {candidate_ms}
+    kernel = os.path.join(submission, "kernel.cpp")
+    is_initial = os.path.isfile(kernel) and "baseline" in open(kernel, encoding="utf-8").read()
+    latency = 1.0 if role == "baseline" else (1.0 / 1.05 if is_initial else {candidate_ms})
     report = {{"passed": True, "methodology": {{"warmup": 10, "samples": 100, "timer": "fake"}}, "cases": [
         {{"id": "small", "latency_ms": latency}},
         {{"id": "large", "latency_ms": latency}}

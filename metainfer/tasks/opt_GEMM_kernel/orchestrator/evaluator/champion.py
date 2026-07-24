@@ -26,6 +26,7 @@ class ChampionStore:
         if initial_submission and initial_submission.is_dir():
             shutil.copytree(initial_submission, self.submission_dir, dirs_exist_ok=True)
         self._write({
+            "kind": "hip",
             "iteration": 0,
             "weighted_speedup": 1.0,
             "submission_sha256": _tree_digest(self.submission_dir),
@@ -33,16 +34,32 @@ class ChampionStore:
             "reason": "initial baseline",
         })
 
+    def initialize_triton(self, certified_baseline: Dict[str, Any]) -> None:
+        """Initialize the arena incumbent from the frozen Triton evaluation."""
+        if self.record_path.exists():
+            self.load()
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._write({
+            "kind": "triton",
+            "iteration": 0,
+            "weighted_speedup": 1.0,
+            "baseline_manifest_sha256": certified_baseline.get("manifest_sha256"),
+            "promoted_at": time.time(),
+            "reason": "certified Triton baseline",
+        })
+
     def load(self) -> Dict[str, Any]:
         if not self.record_path.exists():
             return {"iteration": 0, "weighted_speedup": 1.0}
         record = json.loads(self.record_path.read_text(encoding="utf-8"))
-        expected = record.get("submission_sha256")
-        if not expected or not self.submission_dir.is_dir():
-            raise RuntimeError("champion submission or digest is missing")
-        actual = _tree_digest(self.submission_dir)
-        if actual != expected:
-            raise RuntimeError("champion submission changed outside promotion")
+        if record.get("kind", "hip") == "hip":
+            expected = record.get("submission_sha256")
+            if not expected or not self.submission_dir.is_dir():
+                raise RuntimeError("champion submission or digest is missing")
+            actual = _tree_digest(self.submission_dir)
+            if actual != expected:
+                raise RuntimeError("champion submission changed outside promotion")
         return record
 
     def consider(
@@ -71,6 +88,7 @@ class ChampionStore:
             shutil.rmtree(self.submission_dir)
         os.replace(replacement, self.submission_dir)
         record = {
+            "kind": "hip",
             "iteration": iteration,
             "weighted_speedup": candidate_speedup,
             "critical_regression": float(score.get("critical_regression", 0.0)),

@@ -53,42 +53,45 @@ def run_with_requirements(
 
     # Harness is the user-facing name; evaluator_bundle remains the persisted
     # requirements key for compatibility with existing tasks and API clients.
-    bundle_value = req_field(req, "evaluator_bundle")
+    bundle_value = str(req_field(req, "evaluator_bundle") or "").strip()
     if not bundle_value:
         raise SpecError(
             "Harness path (evaluator_bundle) is required for opt_GEMM_kernel"
         )
     bundle = FrozenEvaluatorBundle.materialize(
-        Path(str(bundle_value)), state_dir / "system_evaluator"
+        Path(bundle_value), state_dir / "system_evaluator"
     )
-    weight_value = req_field(req, "weight_bundle")
+    weight_value = str(req_field(req, "weight_bundle") or "").strip()
     if not weight_value:
         raise SpecError("Weight directory (weight_bundle) is required for opt_GEMM_kernel")
     weight_bundle = FrozenWeightBundle.materialize(
-        Path(str(weight_value)), state_dir / "system_weights"
+        Path(weight_value), state_dir / "system_weights"
     )
     _, hardware_profile = require_hardware_profile(req)
     build_profile = BuildProfile.from_requirements(req, hardware_profile)
-    harness_source = bundle.root / "evaluate_native.cpp"
-    if not harness_source.is_file():
-        raise SpecError(f"Harness has no native evaluator source: {harness_source}")
     system_builder = SystemBuilder(
-        build_profile, state_dir / "system_build", harness_source=harness_source
+        build_profile, state_dir / "system_build", harness_source=None
     )
     profiler_profile = FrozenProfilerProfile.resolve(
         req, hardware_profile, state_dir / "system_profiler"
     )
-    if profiler_profile is None:
-        raise SpecError("selected hardware has no matching frozen profiler profile")
-    profiler_runner = ProfilerRunner(
-        profiler_profile,
-        private_env={
-            "METAINFER_WEIGHT_BUNDLE": str(weight_bundle.root.resolve()),
-            "METAINFER_WEIGHT_SHA256": weight_bundle.digest,
-        },
-    )
-    initial_value = req_field(req, "initial_submission")
-    initial_submission = Path(str(initial_value)).expanduser().resolve() if initial_value else None
+    profile_cmd = bundle.spec.commands.get("profile")
+    profiler_runner = None
+    if profiler_profile is not None:
+        harness_argv = None
+        if profile_cmd is not None:
+            values = {"bundle_dir": str(bundle.root.resolve())}
+            harness_argv = [part.format_map(values) for part in profile_cmd.argv]
+        profiler_runner = ProfilerRunner(
+            profiler_profile,
+            private_env={
+                "METAINFER_WEIGHT_BUNDLE": str(weight_bundle.root.resolve()),
+                "METAINFER_WEIGHT_SHA256": weight_bundle.digest,
+            },
+            harness_argv=harness_argv,
+        )
+    initial_value = str(req_field(req, "initial_submission") or "").strip()
+    initial_submission = Path(initial_value).expanduser().resolve() if initial_value else None
     if initial_submission is not None and not initial_submission.is_dir():
         raise FileNotFoundError(f"initial_submission is not a directory: {initial_submission}")
 

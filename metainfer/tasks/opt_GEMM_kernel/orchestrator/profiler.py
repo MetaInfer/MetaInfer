@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import resource
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass
@@ -19,8 +20,17 @@ class ProfilerError(RuntimeError):
     pass
 
 
+def _disable_core_dump() -> None:
+    """Prevent a profiler crash from writing a multi-gigabyte core file."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
 def _version(executable: str) -> str:
-    for option in ("--version", "-v"):
+    # rocprofv3 and newer rocprof releases expose a conventional version
+    # option.  The legacy RPL rocprof shipped by DTK only exposes ``-h``;
+    # its first help line contains a per-invocation timestamp, so remove that
+    # line before using the output as the frozen executable identity.
+    for option in ("--version", "-v", "-h"):
         try:
             proc = subprocess.run(
                 [executable, option], text=True, stdout=subprocess.PIPE,
@@ -28,8 +38,19 @@ def _version(executable: str) -> str:
             )
         except (OSError, subprocess.TimeoutExpired):
             continue
-        if proc.returncode == 0 and (proc.stdout or "").strip():
-            return (proc.stdout or "").strip()[:2000]
+        output = (proc.stdout or "").strip()
+        if option == "-h":
+            output = "\n".join(
+                line for line in output.splitlines()
+                if not line.lstrip().startswith("RPL:")
+            ).strip()
+        legacy_help = (
+            option == "-h"
+            and "ROCm Profiling Library" in output
+            and "Usage:" in output
+        )
+        if output and (proc.returncode == 0 or legacy_help):
+            return output[:2000]
     raise ProfilerError(f"cannot query profiler version: {executable}")
 
 
@@ -47,6 +68,10 @@ def _find_tool(candidates: Iterable[str]) -> Optional[Path]:
 
 
 def _available_counters(executable: Path, kind: str) -> set[str]:
+    if kind == "hipprof":
+        # hipprof owns its full PMC set; unlike rocprof, it does not accept a
+        # caller-provided list of individual counters.
+        return set()
     commands: List[List[str]] = []
     if kind == "rocprofv3":
         companion = executable.with_name("rocprofv3-avail")
@@ -107,16 +132,28 @@ class FrozenProfilerProfile:
 
         executable = _find_tool(raw.get("tool_candidates") or [])
         if executable is None:
-            raise ProfilerError(
-                "Hygon K100/gfx928 requires rocprofv3 or rocprof on the target node"
-            )
-        kind = "rocprofv3" if "rocprofv3" in executable.name else "rocprof"
+            if raw.get("required", True):
+                raise ProfilerError(
+                    "Hygon K100/gfx928 requires hipprof, rocprofv3, or rocprof "
+                    "on the target node"
+                )
+            return None
+        if "hipprof" in executable.name:
+            kind = "hipprof"
+        elif "rocprofv3" in executable.name:
+            kind = "rocprofv3"
+        else:
+            kind = "rocprof"
         available = _available_counters(executable, kind)
         configured = [list(map(str, group)) for group in raw.get("counter_groups") or []]
-        groups = [
-            [counter for counter in group if not available or counter in available]
-            for group in configured
-        ]
+        groups = (
+            [["HIPPROF_PMC_FULL"]]
+            if kind == "hipprof"
+            else [
+                [counter for counter in group if not available or counter in available]
+                for group in configured
+            ]
+        )
         groups = [group for group in groups if group]
         if not groups:
             raise ProfilerError("K100 profiler exposed none of the frozen counter whitelist")
@@ -130,7 +167,9 @@ class FrozenProfilerProfile:
             "tool_kind": kind,
             "representative_cases": list(map(str, raw.get("representative_cases") or [])),
             "counter_groups": groups,
-            "kernel_name_contains": str(raw.get("kernel_name_contains") or "w8a8_scaled_"),
+            # Preserve an explicit empty filter: an empty token means that
+            # _parse_case accepts every kernel row for the representative case.
+            "kernel_name_contains": str(raw.get("kernel_name_contains", "")),
             "required": bool(raw.get("required", True)),
             "fingerprint": "",
             "schema_version": 1,
@@ -158,9 +197,16 @@ class ProfileResult:
 
 
 class ProfilerRunner:
-    def __init__(self, profile: FrozenProfilerProfile, *, private_env: Mapping[str, str]) -> None:
+    def __init__(
+        self,
+        profile: FrozenProfilerProfile,
+        *,
+        private_env: Mapping[str, str],
+        harness_argv: Optional[List[str]] = None,
+    ) -> None:
         self.profile = profile
         self.private_env = dict(private_env)
+        self.harness_argv = harness_argv
 
     def run(
         self,
@@ -173,9 +219,15 @@ class ProfilerRunner:
             self.profile.verify()
         except Exception as exc:  # noqa: BLE001
             return ProfileResult(False, {}, str(exc))
-        harness = artifact_dir / "metainfer_gemm_harness"
-        if not harness.is_file():
-            return ProfileResult(False, {}, f"native harness is missing: {harness}")
+
+        if self.harness_argv is not None:
+            harness_cmd = list(self.harness_argv)
+        else:
+            harness = artifact_dir / "metainfer_gemm_harness"
+            if not harness.is_file():
+                return ProfileResult(False, {}, f"native harness is missing: {harness}")
+            harness_cmd = [str(harness.resolve())]
+
         root = output_dir / f"{role}-hardware-profile"
         root.mkdir(parents=True, exist_ok=True)
         cases: List[Dict[str, Any]] = []
@@ -186,7 +238,7 @@ class ProfilerRunner:
             for group_index, counters in enumerate(self.profile.counter_groups, 1):
                 pass_dir = case_root / f"pass_{group_index}"
                 pass_dir.mkdir(parents=True, exist_ok=True)
-                command = self._command(harness, case_id, counters, pass_dir)
+                command = self._command(harness_cmd, case_id, counters, pass_dir)
                 commands.append(command)
                 env = dict(os.environ)
                 env.update(self.private_env)
@@ -197,11 +249,28 @@ class ProfilerRunner:
                     "METAINFER_REPORT_PATH": str((pass_dir / "harness-profile.json").resolve()),
                     "PYTHONDONTWRITEBYTECODE": "1",
                 })
-                proc = subprocess.run(
-                    command, cwd=str(artifact_dir), env=env, text=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    timeout=1800, check=False,
-                )
+                try:
+                    proc = subprocess.run(
+                        command, cwd=str(artifact_dir), env=env, text=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        timeout=120, check=False, preexec_fn=_disable_core_dump,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    stdout = exc.stdout or ""
+                    stderr = exc.stderr or ""
+                    if isinstance(stdout, bytes):
+                        stdout = stdout.decode(errors="replace")
+                    if isinstance(stderr, bytes):
+                        stderr = stderr.decode(errors="replace")
+                    (pass_dir / "profiler.stdout.log").write_text(stdout, encoding="utf-8")
+                    (pass_dir / "profiler.stderr.log").write_text(stderr, encoding="utf-8")
+                    report = self._report(cases, commands)
+                    _write_json(output_dir / f"{role}-hardware-profile.json", report)
+                    return ProfileResult(
+                        False, report,
+                        f"{self.profile.tool_kind} timed out for {case_id} "
+                        f"pass {group_index} after 120 seconds",
+                    )
                 (pass_dir / "profiler.stdout.log").write_text(proc.stdout or "", encoding="utf-8")
                 (pass_dir / "profiler.stderr.log").write_text(proc.stderr or "", encoding="utf-8")
                 if proc.returncode != 0:
@@ -211,9 +280,19 @@ class ProfilerRunner:
                         False, report,
                         f"{self.profile.tool_kind} failed for {case_id} pass {group_index}",
                     )
+                try:
+                    _validate_harness_profile(pass_dir, case_id)
+                except ProfilerError as exc:
+                    report = self._report(cases, commands)
+                    _write_json(output_dir / f"{role}-hardware-profile.json", report)
+                    return ProfileResult(False, report, str(exc))
             try:
+                kernel_token = (
+                    "matmul_kernel" if role == "baseline"
+                    else self.profile.kernel_name_contains
+                )
                 cases.append(
-                    _parse_case(case_id, case_root, self.profile.kernel_name_contains)
+                    _parse_case(case_id, case_root, kernel_token)
                 )
             except (OSError, ValueError, ProfilerError) as exc:
                 report = self._report(cases, commands)
@@ -224,8 +303,17 @@ class ProfilerRunner:
         return ProfileResult(True, report)
 
     def _command(
-        self, harness: Path, case_id: str, counters: List[str], output: Path,
+        self, harness_cmd: List[str], case_id: str, counters: List[str], output: Path,
     ) -> List[str]:
+        if self.profile.tool_kind == "hipprof":
+            # --pmc-type 3 is the stable CSV table form. hipprof appends the
+            # .csv suffix to this output base.
+            output_base = output / "counter_collection"
+            return [
+                self.profile.executable, "--pmc", "--pmc-type", "3",
+                "-o", str(output_base.resolve()),
+                *harness_cmd, "profile", case_id,
+            ]
         if self.profile.tool_kind == "rocprofv3":
             return [
                 self.profile.executable,
@@ -233,14 +321,14 @@ class ProfilerRunner:
                 "--output-format", "csv", "json",
                 "--output-directory", str(output.resolve()),
                 "--kernel-include-regex", self.profile.kernel_name_contains,
-                "--", str(harness.resolve()), "profile", case_id,
+                "--", *harness_cmd, "profile", case_id,
             ]
         input_path = output / "counters.txt"
         input_path.write_text("pmc: " + " ".join(counters) + "\n", encoding="utf-8")
         return [
             self.profile.executable, "-i", str(input_path.resolve()),
             "-o", str((output / "counter_collection.csv").resolve()), "--timestamp", "on",
-            str(harness.resolve()), "profile", case_id,
+            *harness_cmd, "profile", case_id,
         ]
 
     def _report(self, cases: List[Dict[str, Any]], commands: List[List[str]]) -> Dict[str, Any]:
@@ -271,21 +359,44 @@ def _parse_case(case_id: str, root: Path, kernel_token: str) -> Dict[str, Any]:
     if not selected:
         raise ProfilerError(f"no target-kernel rows found in profiler output for {case_id}")
     counters: Dict[str, float] = {}
+    dispatches: List[Dict[str, Any]] = []
+    seen_dispatches: set[tuple[str, Optional[float], Optional[float]]] = set()
     for row in selected:
         name = _text(row, "Counter_Name", "CounterName")
         value = _number(_text(row, "Counter_Value", "CounterValue"))
         if name and value is not None:
-            counters[_normalize_counter(name)] = value
+            normalized = _normalize_counter(name)
+            counters[normalized] = counters.get(normalized, 0.0) + value
+        row_counters: Dict[str, float] = {}
         for key, raw in row.items():
             normalized = _normalize_counter(key or "")
-            if normalized in _KNOWN_COUNTERS:
+            if _is_counter(normalized):
                 parsed = _number(raw)
                 if parsed is not None:
-                    counters[normalized] = parsed
+                    # hipprof expands per-instance counters as TCC_HIT[0..31].
+                    # Normalize and sum them before combining dispatches.
+                    row_counters[normalized] = row_counters.get(normalized, 0.0) + parsed
+        for normalized, parsed in row_counters.items():
+            counters[normalized] = counters.get(normalized, 0.0) + parsed
+
+        begin = _value(row, "Start_Timestamp", "BeginNs", "Begin_Ns")
+        end = _value(row, "End_Timestamp", "EndNs", "End_Ns")
+        kernel_name = _text(row, "Kernel_Name", "KernelName", "Name")
+        dispatch_key = (kernel_name, begin, end)
+        if dispatch_key not in seen_dispatches:
+            seen_dispatches.add(dispatch_key)
+            dispatches.append({
+                "kernel_name": kernel_name,
+                "duration_ns": (
+                    end - begin
+                    if begin is not None and end is not None and end >= begin else None
+                ),
+                "grid_size": _integer(row, "Grid_Size", "GridSize", "grd"),
+                "workgroup_size": _integer(row, "Workgroup_Size", "WorkgroupSize", "wgr"),
+            })
     last = selected[-1]
-    begin = _value(last, "Start_Timestamp", "BeginNs", "Begin_Ns")
-    end = _value(last, "End_Timestamp", "EndNs", "End_Ns")
-    duration = end - begin if begin is not None and end is not None and end >= begin else None
+    durations = [item["duration_ns"] for item in dispatches if item["duration_ns"] is not None]
+    duration = sum(durations) if durations else None
     tcc_hit, tcc_miss = counters.get("TCC_HIT"), counters.get("TCC_MISS")
     l2_hit = counters.get("L2_CACHE_HIT")
     if l2_hit is None:
@@ -309,6 +420,8 @@ def _parse_case(case_id: str, root: Path, kernel_token: str) -> Dict[str, Any]:
     wave_cycles, waves = counters.get("SQ_WAVE_CYCLES"), counters.get("SQ_WAVES")
     return {
         "id": case_id,
+        "dispatch_count": len(dispatches),
+        "dispatches": dispatches,
         "kernel_name": _text(last, "Kernel_Name", "KernelName", "Name"),
         "duration_ns": duration,
         "grid_size": _integer(last, "Grid_Size", "GridSize", "grd"),
@@ -329,12 +442,51 @@ def _parse_case(case_id: str, root: Path, kernel_token: str) -> Dict[str, Any]:
     }
 
 
+def _validate_harness_profile(pass_dir: Path, case_id: str) -> None:
+    """Tie a profiler CSV to the exact successful harness case invocation."""
+    path = pass_dir / "harness-profile.json"
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProfilerError(
+            f"missing or invalid harness profile report for {case_id}"
+        ) from exc
+    if report.get("passed") is not True or report.get("case_id") != case_id:
+        raise ProfilerError(
+            f"harness profile report does not match requested case {case_id}"
+        )
+
+
 _KNOWN_COUNTERS = {
+    # Compute / instruction counters
     "SQ_WAVES", "SQ_WAVE_CYCLES", "SQ_INSTS_VALU", "SQ_INSTS_SALU",
-    "SQ_INSTS_MFMA", "SQ_INSTS_MMAC", "TCC_HIT", "TCC_MISS",
-    "FETCH_SIZE", "WRITE_SIZE", "GRBM_COUNT", "GRBM_GUI_ACTIVE",
-    "L2_CACHE_HIT", "GPU_BUSY",
+    "SQ_INSTS", "SQ_BUSY_CYCLES", "SQ_CYCLES",
+    "SQ_ACTIVE_INST_VALU", "SQ_INSTS_FLAT_LDS_ONLY", "SQ_INSTS_LDS",
+    "SQ_INSTS_VMEM_RD", "SQ_INSTS_VMEM_WR", "SQ_LDS_BANK_CONFLICT",
+    "SQ_WAIT_INST_LDS",
+    # Legacy matrix counters (not available on gfx928; kept for compatibility)
+    "SQ_INSTS_MFMA", "SQ_INSTS_MMAC",
+    # TCC / cache counters
+    "TCC_HIT", "TCC_MISS", "TCC_READ", "TCC_WRITE", "TCC_REQ",
+    "TCC_BUSY",
+    # ATCL2 (L2) counters (gfx928)
+    "ATCL2_NUMBER_OF_BANK0_HITS", "ATCL2_NUMBER_OF_BANK0_MISSES",
+    "ATCL2_NUMBER_OF_BANK0_REQUESTS",
+    # Legacy L2/bandwidth counters (not available on gfx928; kept for compatibility)
+    "FETCH_SIZE", "WRITE_SIZE", "L2_CACHE_HIT",
+    # GRBM / GPU utilization counters
+    "GRBM_COUNT", "GRBM_GUI_ACTIVE",
+    "GRBM_CPC_BUSY", "GRBM_CPF_BUSY", "GRBM_SPI_BUSY",
+    # Legacy GPU busy counter (not available on gfx928; kept for compatibility)
+    "GPU_BUSY",
 }
+
+
+def _is_counter(normalized: str) -> bool:
+    """Recognize the wide, architecture-specific PMC columns from hipprof."""
+    return normalized in _KNOWN_COUNTERS or normalized.startswith(
+        ("SQ_", "TCC_", "TA_", "TCP_", "GRBM_", "ATCL2_")
+    )
 
 
 def _normalize_counter(value: str) -> str:

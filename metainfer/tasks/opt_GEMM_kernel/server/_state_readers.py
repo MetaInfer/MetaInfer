@@ -40,6 +40,9 @@ def read_champion(state_dir: Path) -> Dict[str, Any]:
 
 def read_baseline(state_dir: Path) -> Dict[str, Any]:
     manifest = _json(state_dir / "baseline" / "baseline-manifest.json", {}) or {}
+    initial_hip = _json(
+        state_dir / "certified" / "initial-hip" / "initial-hip-manifest.json", {}
+    ) or {}
     profile = _json(state_dir / "system_build" / "build_profile.json", {}) or {}
     requirements = _json(state_dir / "requirements.json", {}) or {}
     correctness = manifest.get("correctness") or {}
@@ -53,6 +56,7 @@ def read_baseline(state_dir: Path) -> Dict[str, Any]:
     summary = _aggregate(cases, "baseline_ms")
     return {
         "certified": bool(manifest),
+        "implementation": manifest.get("implementation", "legacy"),
         "certified_at": manifest.get("certified_at"),
         "build_fingerprint": manifest.get("build_fingerprint"),
         "backend": profile.get("backend"),
@@ -73,6 +77,14 @@ def read_baseline(state_dir: Path) -> Dict[str, Any]:
             "passed": hardware_profile.get("passed"),
         },
         "correctness": correctness.get("summary") or {},
+        "initial_hip": {
+            "certified": bool(initial_hip),
+            "certified_at": initial_hip.get("certified_at"),
+            "build_fingerprint": initial_hip.get("build_fingerprint"),
+            "correctness": (initial_hip.get("correctness") or {}).get("summary") or {},
+            "score": (initial_hip.get("benchmark") or {}).get("score") or {},
+            "hardware_profile": initial_hip.get("hardware_profile") or {},
+        },
         "task": {
             "kernel_path": req_field(requirements, "initial_submission"),
             "contract_source": "frozen evaluator" if spec else None,

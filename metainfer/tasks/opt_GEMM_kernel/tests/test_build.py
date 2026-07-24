@@ -13,6 +13,7 @@ from ..orchestrator.build import (
     BuildProfile,
     SubmissionManifest,
     SystemBuilder,
+    _render_build_script,
 )
 
 
@@ -60,6 +61,13 @@ def test_system_builder_owns_profile_and_build_script(tmp_path):
     assert result.passed
     assert result.report["build_fingerprint"] == profile.fingerprint
     assert not (submission / "__pycache__").exists()
+
+
+def test_build_script_resolves_interpreter_when_argv0_is_friendly(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "executable", "")
+    script = _render_build_script(tmp_path / "profile.json", tmp_path)
+    assert 'exec "" -m' not in script
+    assert " -m metainfer.tasks.opt_GEMM_kernel.orchestrator.build " in script
 
 
 def test_manifest_rejects_commands_and_unknown_build_options(tmp_path):
@@ -191,9 +199,14 @@ requested_build_options:
 """,
         encoding="utf-8",
     )
-    harness_source = Path(__file__).resolve().parents[1] / "harness" / "user_gemm" / "evaluate_native.cpp"
+    harness_src = tmp_path / "harness.cu"
+    harness_src.write_text(
+        'extern "C" __global__ void gemm_harness(float* out) { out[0] = 2.0f; }'
+        '\nint main() { return 0; }\n',
+        encoding="utf-8",
+    )
     result = SystemBuilder(
-        profile, tmp_path / "system", harness_source=harness_source
+        profile, tmp_path / "system", harness_source=harness_src
     ).build(
         submission, tmp_path / "build"
     )

@@ -28,6 +28,8 @@ profiles:
     profiling:
       required: true
       tool_candidates:
+        - /opt/dtk/bin/hipprof
+        - /opt/dtk/rocprofiler/bin/rocprof
         - /opt/dtk/bin/rocprofv3
         - /opt/dtk/bin/rocprof
         - /opt/rocm/bin/rocprofv3
@@ -39,7 +41,9 @@ profiles:
         - wq-b-tp4-m16
         - wq-b-tp4-m4096
       counter_groups:
-        - [SQ_WAVES, SQ_WAVE_CYCLES, SQ_INSTS_VALU, SQ_INSTS_SALU, SQ_INSTS_MFMA, SQ_INSTS_MMAC]
-        - [TCC_HIT, TCC_MISS, FETCH_SIZE, WRITE_SIZE, FetchSize, WriteSize, L2CacheHit]
-        - [GRBM_COUNT, GRBM_GUI_ACTIVE, GPUBusy]
-      kernel_name_contains: w8a8_scaled_
+        - [SQ_WAVES, SQ_WAVE_CYCLES, SQ_INSTS_VALU, SQ_INSTS_SALU, SQ_INSTS, SQ_BUSY_CYCLES, SQ_CYCLES]
+        # DTK's legacy RPL rocprof reports "Context Create failed" for
+        # TCC/ATCL2 counters on this K100 stack. SQ is the verified-safe set.
+      # Empty means collect every dispatch in each representative case. This
+      # keeps newly introduced sdot4/split-K/MMAC kernel names visible.
+      kernel_name_contains: ""
