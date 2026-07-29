@@ -1,0 +1,72 @@
+# Form for creating a new knowledge-evolution task in the WebUI.
+# Answers land in requirements.json under the "form" key.
+#
+# Format: flat list of {key, question, header, required, ...}
+# Supported widget types: text, number, textarea, select, multiselect, file
+
+- key: target_model
+  question: "Enter the model weight path (path on your storage, not model name on hugging face):"
+  header: "Target model"
+  required: true
+
+- key: target_hardware
+  question: "Which GPU platform is the primary target?"
+  header: "Hardware"
+  required: true
+  multi: false
+  options:
+    - label: "Hygon K100AI"
+      description: ""
+    - label: "Hygon BW1000"
+      description: ""
+    - label: "Hygon Z100AI"
+      description: ""
+
+- key: features
+  question: "Which features must the framework support?"
+  header: "Features"
+  required: false
+  multi: true
+  options:
+    - label: "Paged KV cache"
+      description: "Block-based KV management"
+    - label: "Continuous batching"
+      description: "In-flight request scheduling"
+    - label: "Tensor parallelism"
+      description: "Multi-GPU TP"
+    - label: "Speculative decoding"
+      description: "Draft + verify"
+
+- key: max_verify_attempts
+  question: "Max in-place retries when D_verify_final fails. The agent sees previous failure reasons, the oracle report, and reviewer analysis before each retry — so it learns from mistakes. After all retries are exhausted, evolution falls back to B_enrich for more open-source learning."
+  header: "Max re-verify"
+  required: false
+  form: number
+  default: 3
+  min: 0
+  step: 1
+
+- key: enable_phase_a
+  question: "Start with Phase A (pure KB attempt)? Phase A tries to generate the framework using only existing notebook knowledge, without open-source code. If disabled, the task starts directly from Phase B (enrich with open-source exploration)."
+  header: "Enable Phase A"
+  required: false
+  type: select
+  default: "Yes"
+  options:
+    - label: "Yes"
+    - label: "No"
+
+- key: max_iterations
+  question: "Maximum number of total evolution iterations across all phases (A/B/C/D). Each iteration is one attempt at a phase — plan, implement, test, and review. When this limit is reached, the evolution stops gracefully."
+  header: "Max rounds"
+  required: false
+  form: number
+  default: 20
+  min: 1
+  step: 1
+
+- key: extra_notes
+  question: "Any extra constraints or notes (free text)?"
+  header: "Notes"
+  required: false
+  form: textarea
