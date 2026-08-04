@@ -1,0 +1,67 @@
+- key: model_path
+  header: Model Path
+  question: "HuggingFace repo id or local path to the model weights."
+  required: true
+  form: text
+
+- key: version
+  header: Version
+  question: "Short tag for this run — used in trace directory naming and result labels."
+  required: true
+  form: text
+
+- key: batch_sizes
+  header: Batch Sizes
+  question: "Comma-separated list of decode batch sizes to profile, e.g. 1,4,8,16."
+  required: true
+  form: text
+
+- key: mapping_batch_size
+  header: Mapping BS
+  question: "Batch size for the mapping run (CUDA Graph disabled). One value is enough — kernel-to-layer mapping is independent of batch size."
+  required: true
+  default: "8"
+  form: number
+
+- key: input_len
+  header: Input Len
+  question: "Synthetic input sequence length."
+  required: true
+  default: "512"
+  form: number
+
+- key: output_len
+  header: Output Len
+  question: "Synthetic output sequence length."
+  required: true
+  default: "2000"
+  form: number
+
+- key: tp_size
+  header: TP Size
+  question: "Tensor-parallelism degree."
+  required: true
+  default: "1"
+  form: number
+
+- key: pp_size
+  header: PP Size
+  question: "Pipeline-parallelism degree."
+  required: true
+  default: "1"
+  form: number
+
+- key: gpu_model
+  header: GPU Model
+  question: "GPU model — used to look up theoretical peak TFLOPS and memory bandwidth."
+  required: true
+  form: select
+  options:
+    - label: "K100"
+      description: "FP32 49TF, TF32 98TF, BF16/FP16 192TF, INT8 392TOPS, BW 700GB/s"
+    - label: "A100_80G"
+      description: "FP32 19.5TF, TF32 156TF, BF16/FP16 312TF, INT8 624TOPS, BW 2039GB/s"
+    - label: "H100"
+      description: "FP32 67TF, TF32 989TF, BF16/FP16 989TF, INT8 1979TOPS, BW 3350GB/s"
+    - label: "B200"
+      description: "FP32 90TF, TF32 2250TF, BF16/FP16 2250TF, INT8 4500TOPS, BW 8000GB/s"
