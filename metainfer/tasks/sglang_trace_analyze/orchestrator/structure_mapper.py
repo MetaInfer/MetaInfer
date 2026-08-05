@@ -53,12 +53,21 @@ def _map_one(
     layer = _infer_layer(call_stack, kernel_name, config, cpu_ops)
     op_type = _infer_op_type(kernel_name, call_stack, cpu_ops)
 
-    confidence = "high"
+    has_cpu_hint = bool(cpu_ops)
+
     if not call_stack:
-        # Without call stacks, we use kernel name + CPU op correlation
-        has_cpu_hint = bool(cpu_ops)
-        if has_cpu_hint and _is_ck_gemm(kernel_name):
-            confidence = "medium"  # CK GEMM is unambiguous even without stack
+        # Confidence tiers without call stack:
+        # high: kernel name unambiguously identifies op type
+        #   (CK GEMM, flash_attn, fused_moe, NCCL, w8a8, cross_device_reduce)
+        # medium: CPU ops provide corroborating hint
+        # low: no useful signal from either source
+        name_clear = _kernel_name_is_clear(kernel_name, op_type)
+        cpu_confirms = _cpu_ops_confirm(kernel_name, cpu_ops, op_type)
+
+        if name_clear:
+            confidence = "high"
+        elif cpu_confirms:
+            confidence = "medium"
         elif has_cpu_hint:
             confidence = "medium"
         else:
@@ -79,6 +88,61 @@ def _map_one(
 def _is_ck_gemm(name: str) -> bool:
     """CK (composable_kernel) GEMM kernels have Cijk_ prefix."""
     return name.lower().startswith("cijk_")
+
+
+def _kernel_name_is_clear(kernel_name: str, op_type: str) -> bool:
+    """Does the kernel name unambiguously identify its op type?"""
+    name_lower = kernel_name.lower()
+    # CK GEMM: name encodes tile dims, very clear
+    if name_lower.startswith("cijk_"):
+        return True
+    # Flash attention / MLA kernels
+    if "flash_fwd" in name_lower or "flash_attn" in name_lower:
+        return True
+    # Fused MoE
+    if "fused_moe" in name_lower:
+        return True
+    # NCCL operations
+    if "nccl" in name_lower:
+        return True
+    # w8a8 GEMM kernels (INT8 quantized)
+    if "w8a8" in name_lower and "scaled_mm" in name_lower:
+        return True
+    # Custom allreduce (cross_device_reduce)
+    if "cross_device_reduce" in name_lower:
+        return True
+    # MHC pre/post kernels
+    if "mhc_pre" in name_lower or "mhc_post" in name_lower:
+        return True
+    # topk kernels
+    if "topk" in name_lower and ("radix" in name_lower or "gather" in name_lower or "find" in name_lower):
+        return True
+    return False
+
+
+def _cpu_ops_confirm(
+    kernel_name: str,
+    cpu_ops: list | None,
+    op_type: str,
+) -> bool:
+    """Do the correlated CPU ops confirm the kernel's op type?"""
+    if not cpu_ops:
+        return False
+    cpu_lower = " ".join(cpu_ops).lower()
+
+    confirmations = {
+        "GEMM": ["aten::linear", "aten::addmm", "aten::matmul", "torch.compile"],
+        "Attention": ["flash_attn", "flash_fwd", "attention"],
+        "MoE": ["fused_moe", "moe", "experts"],
+        "Norm": ["rms_norm", "rmsnorm", "layer_norm", "layernorm"],
+        "NCCL": ["allreduce", "allgather", "all_reduce", "nccl"],
+        "Reduce": ["all_reduce", "reduce", "cross_device"],
+        "ElementWise": ["copy_", "add", "mul", "silu", "gelu", "reshape", "view"],
+    }
+
+    patterns = confirmations.get(op_type, [])
+    return any(p in cpu_lower for p in patterns)
+
 
 
 def _infer_layer(
