@@ -148,7 +148,7 @@ def _infer_op_type(kernel_name: str, call_stack: str, cpu_ops: list | None = Non
         return "MoE"
 
     # ── Kernel name substring heuristics (medium priority) ──
-    if "reduce_kernel" in name_lower:
+    if "reduce_kernel" in name_lower or "cross_device_reduce" in name_lower:
         return "Reduce"
     if "elementwise" in name_lower:
         return "ElementWise"
