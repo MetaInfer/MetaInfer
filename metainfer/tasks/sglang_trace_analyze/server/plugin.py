@@ -24,8 +24,11 @@ plugin = WebPlugin(
         "optimization hints."
     ),
     build_router=build_router,
+    detail_view_module="app/sa-detail",
+    detail_view_export="default",
     frontend_dir=_FRONTEND_DIR,
     importmap_entries=_IMPORTMAP_ENTRIES,
+    extra_stylesheets=["sa.css"],
 )
 
 register(plugin)

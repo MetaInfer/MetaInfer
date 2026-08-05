@@ -15,6 +15,7 @@ import json
 import re
 import subprocess
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -101,6 +102,13 @@ class Pipeline:
         while phase not in ("done", "failed"):
             self.store.update_run(current_phase=phase)
             self.store.append_timeline("phase_enter", {"phase": phase})
+
+            # Skip phases whose outputs already exist (resume / re-run)
+            if self._phase_is_done(phase):
+                print(f"[pipeline] phase {phase} output exists, skipping")
+                self.store.append_timeline("phase_skip", {"phase": phase, "reason": "output exists"})
+                phase = next_phase(phase)
+                continue
 
             method = getattr(self, f"_run_{phase}", None)
             if method is None:
@@ -469,6 +477,33 @@ class Pipeline:
         return True
 
     # ================================================================== #
+    #  Phase skip detection (resume / re-run)
+    # ================================================================== #
+
+    def _phase_is_done(self, phase: str) -> bool:
+        """Return True if the phase's expected outputs already exist."""
+        if phase == "mapping":
+            return (self._analysis_dir / "mapping.json").exists()
+        if phase == "benchmark":
+            # Check that at least one batch_size trace dir exists
+            for bs in self.batch_sizes:
+                trace_dir = self.workspace_dir / "traces" / f"bs_{bs}"
+                if trace_dir.exists():
+                    return True
+            return False
+        if phase == "analyze":
+            for bs in self.batch_sizes:
+                for stage in self.stages:
+                    if not (self._analysis_dir / "batches" / f"bs_{bs}" / stage / "kernel_table.json").exists():
+                        return False
+            return True
+        if phase == "hints":
+            return (self._analysis_dir / "hints.json").exists()
+        if phase == "summarize":
+            return (self._analysis_dir / "summary.json").exists()
+        return False
+
+    # ================================================================== #
     #  Helpers
     # ================================================================== #
 
@@ -517,33 +552,86 @@ class Pipeline:
         bs: int,
         stage: str,
     ) -> Dict[str, Any]:
-        """Analyze a single trace file and return kernel_table, overlap,
-        and fuse results.
+        """Analyze a single trace file — uses trace_parser, structure_mapper,
+        flops_calculator, overlap_detector, fuse_matcher."""
+        from .trace_parser import parse_trace, aggregate_kernels
+        from .structure_mapper import _map_one as map_one
+        from .flops_calculator import calculate_mfu
+        from .overlap_detector import build_overlap_report
+        from .fuse_matcher import build_fuse_report
 
-        Placeholder — real logic in trace_parser / flops_calculator /
-        overlap_detector / fuse_matcher.
-        """
-        # TODO: implement real analysis pipeline
-        return {
-            "kernel_table": {
-                "model": self.model_path,
-                "gpu": self.gpu_spec.label,
-                "batch_size": bs,
-                "stage": stage,
-                "kernels": [],
-            },
-            "overlap": {
-                "batch_size": bs,
-                "stage": stage,
-                "gaps": [],
-                "summary": {"total_gap_us": 0, "total_gap_pct": 0, "cuda_graph_effective": True},
-            },
-            "fuse": {
-                "batch_size": bs,
-                "stage": stage,
-                "matches": [],
-            },
+        print(f"[pipeline]     loading trace: {trace_path}")
+        trace_data = parse_trace(str(trace_path))
+
+        # Aggregate kernels
+        kernels = aggregate_kernels(trace_data)
+        total_dur = sum(k["total_dur_us"] for k in kernels) / 1e6
+
+        # Build CPU op correlation
+        events = trace_data.get("traceEvents", [])
+        cpu_ops_by_corr = defaultdict(lambda: [])
+        kernel_by_corr = defaultdict(lambda: [])
+        for e in events:
+            cat = e.get("cat", "")
+            corr = (e.get("args") or {}).get(
+                "External id" if cat == "cpu_op" else "correlation"
+            )
+            if cat == "cpu_op" and corr:
+                cpu_ops_by_corr[corr].append(e.get("name", ""))
+            elif cat == "kernel" and corr:
+                kernel_by_corr[corr].append(e.get("name", ""))
+
+        # Map each kernel using structure_mapper + cpu_ops
+        result_kernels = []
+        for k in kernels:
+            name = k["kernel_name"]
+            # Collect correlated CPU ops
+            cpu_ops = set()
+            for corr, gpu_names in kernel_by_corr.items():
+                if name in gpu_names:
+                    for cn in cpu_ops_by_corr.get(corr, []):
+                        cpu_ops.add(cn)
+
+            # Use structure_mapper for op_type/category/layer
+            mapped = map_one(name, k.get("call_stack", ""), {}, list(cpu_ops))
+            pct = k["total_dur_us"] / (total_dur * 1e6) * 100
+
+            entry = {
+                "rank": len(result_kernels) + 1,
+                "kernel_name": name,
+                "category": mapped["category"],
+                "op_type": mapped["op_type"],
+                "model_layer": mapped["model_layer"],
+                "confidence": mapped["confidence"],
+                "total_dur_us": k["total_dur_us"],
+                "time_pct": round(pct, 2),
+                "count": k["count"],
+                "avg_dur_us": round(k["total_dur_us"] / k["count"], 2) if k["count"] else 0,
+                "input_dims": k.get("input_dims", []),
+                "tflops_theoretical": self.gpu_spec.bf16_tflops,
+                "bandwidth_theoretical": self.gpu_spec.bandwidth_gb_s,
+            }
+            result_kernels.append(entry)
+
+        # Calculate TFLOPS/MFU/bound using flops_calculator
+        result_kernels = calculate_mfu(
+            result_kernels, self.gpu_spec, batch_size=bs, dtype="bf16"
+        )
+
+        kernel_table = {
+            "model": self.model_path,
+            "gpu": self.gpu_spec.label,
+            "batch_size": bs,
+            "stage": stage,
+            "total_gpu_time_s": round(total_dur, 2),
+            "unique_kernels": len(result_kernels),
+            "kernels": result_kernels,
         }
+
+        overlap = build_overlap_report(trace_data, bs, stage)
+        fuse = build_fuse_report(result_kernels, bs, stage)
+
+        return {"kernel_table": kernel_table, "overlap": overlap, "fuse": fuse}
 
     def _llm_generate_hints(
         self,
@@ -562,3 +650,35 @@ class Pipeline:
             "status": "skipped",
             "reason": "LLM hints not yet wired",
         }
+
+
+# ------------------------------------------------------------------ #
+#  Module-level kernel classifier
+# ------------------------------------------------------------------ #
+
+def _classify_kernel(name: str) -> tuple:
+    """Classify a GPU kernel name into (op_type, category)."""
+    n = name.lower()
+    if n.startswith("cijk_"):
+        return ("GEMM", "CK-GEMM")
+    if "flash_fwd" in n or "flash_attn" in n:
+        return ("Attention", "MLA")
+    if "fused_moe" in n:
+        return ("MoE", "MoE")
+    if "nccl" in n:
+        return ("NCCL", "NCCL-AllGather")
+    if "allreduce" in n:
+        return ("NCCL", "NCCL-AllReduce")
+    if "reduce_kernel" in n:
+        return ("Reduce", "CustomAllReduce")
+    if "rms_norm" in n or "rmsnorm" in n:
+        return ("Norm", "RMSNorm")
+    if "elementwise" in n:
+        return ("ElementWise", "ElementWise")
+    if "gather" in n or "topk" in n:
+        return ("Memory", "Gather")
+    if "copy" in n or "memcpy" in n:
+        return ("Memory", "Copy")
+    if "vectorized" in n:
+        return ("ElementWise", "Vectorized")
+    return ("Other", "Other")

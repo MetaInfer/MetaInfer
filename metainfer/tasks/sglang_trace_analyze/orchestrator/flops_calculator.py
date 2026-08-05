@@ -14,6 +14,18 @@ from typing import Any, Dict, List, Optional
 from .gpu_specs import GpuSpec
 
 
+def extract_ck_tile_dims(kernel_name: str) -> tuple | None:
+    """Extract (M, N, K) tile dimensions from a CK GEMM kernel name.
+
+    Example: ``Cijk_Alik_Bljk_SB_MT64x128x16_...`` → (64, 128, 16)
+    """
+    import re
+    m = re.search(r"MT(\d+)x(\d+)x(\d+)", kernel_name)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return None
+
+
 def calculate_mfu(
     kernels: List[Dict[str, Any]],
     gpu_spec: GpuSpec,
@@ -45,9 +57,18 @@ def calculate_mfu(
         dur_per_invocation_s = dur_s / count if count else dur_s
         dims = k.get("input_dims", [])
         op_type = k.get("op_type", "Other")
+        kernel_name = k.get("kernel_name", "")
 
         flops = _estimate_flops(op_type, dims, batch_size)
         bytes_moved = _estimate_bytes(op_type, dims, batch_size)
+
+        # For CK GEMM kernels without input dims, estimate from tile name
+        if flops == 0 and op_type == "GEMM":
+            tile = extract_ck_tile_dims(kernel_name)
+            if tile:
+                M, N, K_tile = tile
+                flops = 2 * M * N * K_tile * count
+                bytes_moved = (M * K_tile + K_tile * N + M * N) * 2 * count
 
         tflops_actual = (flops / dur_s / 1e12) if dur_s > 0 else 0
         bandwidth_gb_s = (bytes_moved / dur_s / 1e9) if dur_s > 0 else 0
@@ -55,19 +76,18 @@ def calculate_mfu(
 
         # Compute-bound vs memory-bound heuristic
         ops_per_byte = flops / bytes_moved if bytes_moved > 0 else float("inf")
-        # "Roofline" crossover point = peak_flops / peak_bw ops/byte
         if theoretical_bw > 0:
             crossover = theoretical_tflops * 1e12 / (theoretical_bw * 1e9)
         else:
             crossover = float("inf")
         bound = "compute" if ops_per_byte > crossover else "memory"
 
-        k["tflops_actual"] = round(tflops_actual, 3)
+        k["tflops_actual"] = round(tflops_actual, 3) if tflops_actual > 0 else None
         k["tflops_theoretical"] = theoretical_tflops
-        k["bandwidth_gb_s"] = round(bandwidth_gb_s, 1)
+        k["bandwidth_gb_s"] = round(bandwidth_gb_s, 1) if bandwidth_gb_s > 0 else None
         k["bandwidth_theoretical"] = theoretical_bw
-        k["mfu"] = round(mfu, 1)
-        k["bound"] = bound
+        k["mfu"] = round(mfu, 1) if tflops_actual > 0 else None
+        k["bound"] = bound if (tflops_actual and tflops_actual > 0) else "unknown"
         k["flops_per_invocation"] = int(flops)
 
     return kernels
