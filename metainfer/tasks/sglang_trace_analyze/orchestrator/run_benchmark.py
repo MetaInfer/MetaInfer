@@ -9,8 +9,8 @@ Called by the orchestrator pipeline in two modes:
     # Formal runs — one or all batch sizes, CUDA Graph ON
     python run_benchmark.py --config bench_config.json --formal-only [--single-batch N]
 
-The benchmark is a synchronous, blocking call — the caller waits for
-all batch sizes to complete.
+Environment variables required for K100/HIP are set inside this script
+so callers don't need to source them externally.
 """
 
 from __future__ import annotations
@@ -21,7 +21,57 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Any, Dict, List
+
+# ── K100 / HIP environment — must match /workspace/sglang/scripts/run_traces.sh ──
+
+_K100_ENV = {
+    "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD": "0",
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1200",
+    "GLIBC_TUNABLES": "glibc.rtld.optional_static_tls=0x40000",
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "HIP_KERNEL_BATCH_CEILING": "100",
+    "GPU_MAX_HW_QUEUES": "3",
+    # "HIP_GRAPH_ACCUMULATE_DISPATCH": "0",  # torchprof needs this
+    "HIP_H2D_DISABLE_COPY_BUFFER": "0",
+    "HIP_D2H_DISABLE_COPY_BUFFER": "0",
+    "HIP_H2D_DIRECT_COPY_THRESHOLD": "32768",
+    "HIP_H2D_HSAAPI_COPY_THRESHOLD": "32768",
+    "HIP_D2H_DIRECT_COPY_THRESHOLD": "512",
+    "HIP_D2H_HSAAPI_COPY_THRESHOLD": "512",
+    "USE_DCU_CUSTOM_ALLREDUCE": "1",
+    "HIP_KERNEL_EVENT_SYSTENFENCE": "1",
+    "SGLANG_USE_FP8_W8A8_MOE": "0",
+    "SGLANG_USE_LIGHTOP": "0",
+    "SGLANG_ROCM_USE_AITER_MOE": "0",
+    "SGLANG_OPT_USE_FUSED_HASH_TOPK": "false",
+    "SGLANG_OPT_SWIGLU_CLAMP_FUSION": "false",
+    "SGLANG_TOPK_TRANSFORM_512_TORCH": "false",
+    "SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK": "false",
+    "SGLANG_NSA_FUSE_TOPK": "false",
+    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
+    "SGLANG_APPLY_CONFIG_BACKUP": "none",
+    "SGLANG_DSV4_MODE": "2604",
+    "SGLANG_OPT_BF16_FP32_GEMM_ALGO": "torch",
+    "SGLANG_OPT_USE_HIP_PAGED_MQA_LOGITS": "1",
+    "SGLANG_OPT_USE_HIP_MHC_PRE": "1",
+    "SGLANG_OPT_USE_HIP_MHC_POST": "1",
+    "SGLANG_OPT_USE_HIP_INT8_SCALED_MM": "0",
+    "SGLANG_OPT_USE_LMSLIM_INT8_QUANT": "1",
+    "SGLANG_OPT_USE_W8A8_MARLIN_GEMM": "1",
+}
+
+_PYTHONPATH_EXTRA = "/workspace/sglang/sglang-v0.5.15_k100/python"
+
+
+def _setup_env():
+    """Apply K100 env vars and PYTHONPATH once per process."""
+    for k, v in _K100_ENV.items():
+        if k not in os.environ:
+            os.environ[k] = v
+    pp = os.environ.get("PYTHONPATH", "")
+    if _PYTHONPATH_EXTRA not in pp:
+        os.environ["PYTHONPATH"] = f"{_PYTHONPATH_EXTRA}:{pp}" if pp else _PYTHONPATH_EXTRA
 
 
 def build_dir_name(args: Dict[str, Any], disable_cuda_graph: bool = False) -> str:
@@ -95,6 +145,7 @@ def run_benchmark(
 
 
 def main():
+    _setup_env()
     parser = argparse.ArgumentParser(
         description="Run sglang bench_one_batch_server with torch profiler"
     )
