@@ -12,6 +12,7 @@ export default function SADetail({ taskId }) {
   const [summary, setSummary] = useState(null);
   const [hints, setHints] = useState(null);
   const [detail, setDetail] = useState(null);
+  const [mapping, setMapping] = useState(null);
   const [activeTab, setActiveTab] = useState("dashboard");
   const [activeBatch, setActiveBatch] = useState(null);
   const [activeStage, setActiveStage] = useState("decode");
@@ -22,8 +23,9 @@ export default function SADetail({ taskId }) {
     Promise.all([
       fetch(`${API(taskId)}/summary`).then((r) => r.json()),
       fetch(`${API(taskId)}/hints`).then((r) => r.json()),
+      fetch(`${API(taskId)}/mapping`).then((r) => r.json()),
     ])
-      .then(([s, h]) => { setSummary(s); setHints(h); setLoading(false); })
+      .then(([s, h, m]) => { setSummary(s); setHints(h); setMapping(m); setLoading(false); })
       .catch((e) => { setError(e.message); setLoading(false); });
   }, [taskId]);
 
@@ -57,7 +59,7 @@ export default function SADetail({ taskId }) {
         <button class="sa-tab-btn ${activeTab === "hints" ? "active-tab" : ""}" onClick=${() => setActiveTab("hints")}>Hints</button>
       </div>
 
-      ${activeTab === "dashboard" && html`<${Dashboard} summary=${summary} detail=${detail} batchList=${batchList} activeBatch=${activeBatch} setActiveBatch=${setActiveBatch} />`}
+      ${activeTab === "dashboard" && html`<${Dashboard} summary=${summary} detail=${detail} mapping=${mapping} batchList=${batchList} activeBatch=${activeBatch} setActiveBatch=${setActiveBatch} />`}
       ${activeTab === "batch" && html`
         <div class="sa-batch-tabs">
           ${batchList.map((b) => html`
@@ -75,7 +77,7 @@ export default function SADetail({ taskId }) {
    DASHBOARD
    ═══════════════════════════════════════════════════════════════════════ */
 
-function Dashboard({ summary, detail, batchList, activeBatch, setActiveBatch }) {
+function Dashboard({ summary, detail, mapping, batchList, activeBatch, setActiveBatch }) {
   if (!detail) return html`<div class="sa-loading">Loading dashboard…</div>`;
   const kt = detail.kernel_table;
   if (!kt) return null;
@@ -206,7 +208,22 @@ function Dashboard({ summary, detail, batchList, activeBatch, setActiveBatch }) 
         </div>
       </div>
 
-      ${/* Row 3: Top kernels quick preview */""}
+      ${/* Row 3: TFLOPS & Bandwidth + Structure Mapping */""}
+      <div class="sa-grid-2col">
+        <${TflopsPanel} kernels=${kernels} gpu=${summary.gpu || "K100"} />
+        <${StructureMappingPanel} mapping=${mapping} kernels=${kernels} />
+      </div>
+
+      ${/* Row 4: Fuse + Mapping confidence */""}
+      <${FusePanel} detail=${detail} />
+
+      ${/* Row 5: Inefficiency radar + roofline */""}
+      <div class="sa-grid-2col">
+        <${InefficiencyRadar} kernels=${kernels} />
+        <${RooflinePanel} kernels=${kernels} gpu=${summary.gpu || "K100"} />
+      </div>
+
+      ${/* Row 4: Top kernels quick preview */""}
       <div class="sa-panel">
         <h3>Top Kernels</h3>
         <table class="sa-table">
@@ -361,6 +378,211 @@ function BottleneckAnalysis({ kt }) {
         `)}
       </div>
       ${suggestions.map((s) => html`<p class="sa-suggestion">${s}</p>`)}
+    </div>
+  `;
+}
+
+/* ── Inefficiency Radar: high-time, low-MFU kernels ── */
+
+function InefficiencyRadar({ kernels }) {
+  if (!kernels || !kernels.length) return null;
+  // Top kernels by (time_pct * (100 - mfu)) / 100 — high time, low efficiency
+  const inefficiency = kernels
+    .filter((k) => (k.time_pct || 0) > 0.03)
+    .map((k) => ({
+      ...k,
+      waste: ((k.time_pct || 0) * (k.mfu != null ? Math.max(0, 100 - k.mfu) : 100)) / 100,
+    }))
+    .sort((a, b) => b.waste - a.waste);
+
+  return html`
+    <div class="sa-panel">
+      <h3>Inefficiency Radar</h3>
+      <p class="sa-note">Kernels with high GPU time and low MFU — biggest optimization potential.</p>
+      <table class="sa-table">
+        <thead><tr><th>Kernel</th><th>Time%</th><th>MFU</th><th>Waste Score</th><th>Category</th></tr></thead>
+        <tbody>
+          ${inefficiency.slice(0, 8).map((k) => html`
+            <tr key=${k.rank}>
+              <td class="sa-kernel-name" title=${k.kernel_name}>${(k.kernel_name || "").slice(0, 50)}</td>
+              <td class="sa-num">${(k.time_pct || 0).toFixed(1)}%</td>
+              <td class="sa-num">${k.mfu != null ? k.mfu.toFixed(1) + "%" : "—"}</td>
+              <td class="sa-num">${k.waste.toFixed(1).replace(/^-/, "")}</td>
+              <td><span class="sa-cat">${k.category || "?"}</span></td>
+            </tr>
+          `)}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+/* ── Roofline Analysis ── */
+
+function RooflinePanel({ kernels, gpu }) {
+  if (!kernels || !kernels.length) return null;
+
+  // GPU peaks
+  const peaks = { K100: { bf16: 192, bw: 700 }, A100_80G: { bf16: 312, bw: 2039 },
+    H100: { bf16: 989, bw: 3350 }, B200: { bf16: 2250, bw: 8000 } };
+  const pk = peaks[gpu] || peaks.K100;
+  const peakFlops = pk.bf16 * 1e12; // TFLOPS → FLOPS
+  const peakBw = pk.bw * 1e9;       // GB/s → B/s
+  const ridgePoint = peakFlops / peakBw; // ops/byte at the ridge
+
+  // Classify each kernel with valid data
+  const pts = kernels
+    .filter((k) => k.tflops_actual != null && k.tflops_actual > 0 && k.bandwidth_gb_s != null && k.bandwidth_gb_s > 0)
+    .map((k) => ({
+      name: k.kernel_name, category: k.category, time_pct: k.time_pct,
+      flops: k.tflops_actual * 1e12, bw: k.bandwidth_gb_s * 1e9,
+      opsPerByte: (k.tflops_actual * 1e12) / (k.bandwidth_gb_s * 1e9),
+      bound: k.bound, rank: k.rank,
+    }));
+
+  const computeBound = pts.filter((p) => p.bound === "compute").length;
+  const memoryBound = pts.filter((p) => p.bound === "memory").length;
+
+  return html`
+    <div class="sa-panel">
+      <h3>Roofline Analysis</h3>
+      <p class="sa-note">GPU: ${gpu} | Peak BF16: ${pk.bf16} TFLOPS | BW: ${pk.bw} GB/s | Ridge: ${ridgePoint.toFixed(0)} ops/byte</p>
+      <p>
+        <strong>${computeBound}</strong> compute-bound |
+        <strong>${memoryBound}</strong> memory-bound
+        ${pts.length < 5 ? html`<span class="sa-note"> (${kernels.length - pts.length} kernels lack dims for roofline)</span>` : ""}
+      </p>
+      <div class="sa-roofline-bars">
+        ${pts.slice(0, 12).map((p) => {
+          const barW = Math.min(Math.log10(Math.max(p.opsPerByte, 1)) / Math.log10(ridgePoint * 10) * 100, 100);
+          const onRidge = p.opsPerByte > ridgePoint;
+          return html`
+            <div class="sa-rf-row">
+              <span class="sa-rf-name" title=${p.name}>${(p.name || "").slice(0, 40)}</span>
+              <span class="sa-rf-bar-wrap">
+                <div class="sa-rf-bar ${onRidge ? "sa-rf-compute" : "sa-rf-memory"}" style="width:${barW}%"></div>
+              </span>
+              <span class="sa-rf-val">${p.opsPerByte.toFixed(0)} op/B</span>
+              <span class="sa-rf-bound">${onRidge ? "compute" : "memory"}</span>
+            </div>
+          `;
+        })}
+      </div>
+      <p class="sa-note">Ridge point: ${ridgePoint.toFixed(0)} ops/byte. Left of ridge = memory-bound. Right = compute-bound.</p>
+    </div>
+  `;
+}
+
+/* ── TFLOPS & Bandwidth Panel ── */
+
+function TflopsPanel({ kernels, gpu }) {
+  if (!kernels || !kernels.length) return null;
+  const peaks = { K100: { bf16: 192, bw: 700 }, A100_80G: { bf16: 312, bw: 2039 },
+    H100: { bf16: 989, bw: 3350 }, B200: { bf16: 2250, bw: 8000 } };
+  const pk = peaks[gpu] || peaks.K100;
+
+  // Kernels with actual TFLOPS data
+  const withData = kernels.filter((k) => k.tflops_actual != null && k.tflops_actual > 0);
+  const withBw = kernels.filter((k) => k.bandwidth_gb_s != null && k.bandwidth_gb_s > 0);
+
+  return html`
+    <div class="sa-panel">
+      <h3>TFLOPS & Bandwidth</h3>
+      <p class="sa-note">GPU: ${gpu} | Theoretical peak BF16: ${pk.bf16} TFLOPS | BW: ${pk.bw} GB/s</p>
+      <p class="sa-note">${withData.length}/${kernels.length} kernels have TFLOPS data (CK GEMM tile dims extracted from kernel names).</p>
+      <table class="sa-table">
+        <thead><tr><th>Kernel</th><th>TFLOPS</th><th>Peak%</th><th>BW GB/s</th><th>BW%</th><th>Bound</th></tr></thead>
+        <tbody>
+          ${kernels.filter(k => k.tflops_actual != null || k.bandwidth_gb_s != null).slice(0, 10).map((k) => html`
+            <tr key=${k.rank}>
+              <td class="sa-kernel-name" title=${k.kernel_name}>${(k.kernel_name || "").slice(0, 45)}</td>
+              <td class="sa-num">${k.tflops_actual != null ? k.tflops_actual.toFixed(3) : "—"}</td>
+              <td class="sa-num">${k.mfu != null ? k.mfu.toFixed(1) + "%" : "—"}</td>
+              <td class="sa-num">${k.bandwidth_gb_s != null ? k.bandwidth_gb_s.toFixed(1) : "—"}</td>
+              <td class="sa-num">${k.bandwidth_gb_s != null ? (k.bandwidth_gb_s / pk.bw * 100).toFixed(1) + "%" : "—"}</td>
+              <td class="sa-sm">${k.bound || "—"}</td>
+            </tr>
+          `)}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+/* ── Model Structure → Operator Mapping Panel ── */
+
+function StructureMappingPanel({ mapping, kernels }) {
+  if (!mapping || !mapping.entries) return html`<div class="sa-panel"><h3>Model Structure Mapping</h3><p class="sa-note">No mapping data available.</p></div>`;
+
+  const entries = mapping.entries || [];
+  // Group by model_layer
+  const layerGroups = {};
+  for (const e of entries) {
+    const layer = e.model_layer || "unknown";
+    if (!layerGroups[layer]) layerGroups[layer] = { kernels: [], categories: {} };
+    layerGroups[layer].kernels.push(e);
+    layerGroups[layer].categories[e.category] = (layerGroups[layer].categories[e.category] || 0) + 1;
+  }
+
+  const layers = Object.entries(layerGroups).sort((a, b) => b[1].kernels.length - a[1].kernels.length);
+
+  // Confidence stats
+  const confStats = { high: 0, medium: 0, low: 0 };
+  for (const e of entries) { confStats[e.confidence || "low"]++; }
+  const total = entries.length || 1;
+
+  return html`
+    <div class="sa-panel">
+      <h3>Model Structure → Operator Mapping</h3>
+      <p class="sa-note">${entries.length} kernel↔layer mappings |
+        <span class="sa-conf sa-conf-high">high ${confStats.high} (${(confStats.high/total*100).toFixed(0)}%)</span>
+        <span class="sa-conf sa-conf-medium">med ${confStats.medium} (${(confStats.medium/total*100).toFixed(0)}%)</span>
+        <span class="sa-conf sa-conf-low">low ${confStats.low} (${(confStats.low/total*100).toFixed(0)}%)</span>
+      </p>
+      <div class="sa-mapping-grid">
+        ${layers.slice(0, 10).map(([layer, group]) => html`
+          <div class="sa-mapping-row">
+            <span class="sa-mapping-layer">${layer}</span>
+            <span class="sa-mapping-count">${group.kernels.length} kernels</span>
+            <span class="sa-mapping-cats">
+              ${Object.entries(group.categories).slice(0, 4).map(([cat, n]) => html`
+                <span class="sa-cat">${cat}×${n}</span>
+              `)}
+            </span>
+          </div>
+        `)}
+      </div>
+    </div>
+  `;
+}
+
+/* ── Fuse Opportunities Panel ── */
+
+function FusePanel({ detail }) {
+  const fuse = detail ? detail.fuse : null;
+  const matches = fuse ? (fuse.matches || []) : [];
+
+  if (matches.length === 0) return html`
+    <div class="sa-panel">
+      <h3>Fuse Opportunities</h3>
+      <p class="sa-note">No fuse pattern matches found in rule engine. Try enabling LLM hints for AI-generated suggestions.</p>
+    </div>
+  `;
+
+  return html`
+    <div class="sa-panel">
+      <h3>Fuse Opportunities (${matches.length})</h3>
+      ${matches.map((m) => html`
+        <div class="sa-fuse-card">
+          <div class="sa-fuse-header">
+            <strong>${m.pattern}</strong>
+            <span class="sa-conf sa-conf-${m.confidence}">${m.confidence}</span>
+            <span class="sa-note ml8">~${m.estimated_saving_us}μs estimated saving</span>
+          </div>
+          <p class="sa-note">${m.suggestion}</p>
+          <p class="sa-note" style="font-family:monospace;font-size:10px">Kernels: ${(m.kernels || []).join(" → ")}</p>
+        </div>
+      `)}
     </div>
   `;
 }
