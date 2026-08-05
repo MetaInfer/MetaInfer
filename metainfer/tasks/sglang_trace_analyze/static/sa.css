@@ -150,3 +150,11 @@
 .sa-fuse-card { background: #252525; border-left: 3px solid #e67e22; padding: 8px 10px; margin-bottom: 6px; border-radius: 0 4px 4px 0; }
 .sa-fuse-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
 .sa-fuse-header strong { color: #f1c40f; }
+
+/* MFU Histogram */
+.sa-hist { margin-top: 6px; }
+.sa-hist-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.sa-hist-label { font-size: 10px; color: #888; width: 55px; text-align: right; flex-shrink: 0; }
+.sa-hist-bar-bg { flex: 1; background: #2a2a2a; border-radius: 2px; height: 14px; overflow: hidden; }
+.sa-hist-bar { height: 100%; background: #4a90d9; border-radius: 2px; min-width: 2px; }
+.sa-hist-count { font-size: 10px; color: #aaa; width: 30px; text-align: right; font-variant-numeric: tabular-nums; flex-shrink: 0; }
