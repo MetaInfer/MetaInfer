@@ -24,10 +24,10 @@ from pathlib import Path
 from typing import Dict, Any, List
 
 
-def build_dir_name(args: Dict[str, Any]) -> str:
+def build_dir_name(args: Dict[str, Any], disable_cuda_graph: bool = False) -> str:
     """Build sglang-style directory name from config."""
     parts = [args["version"], f"tp{args['tp_size']}", f"pp{args['pp_size']}"]
-    parts.append("graph")
+    parts.append("nograph" if disable_cuda_graph else "graph")
     return "_".join(parts)
 
 
@@ -116,14 +116,14 @@ def main():
     with open(config_path) as f:
         cfg = json.load(f)
 
-    dir_name = build_dir_name(cfg)
-
     if args.mapping_only:
+        dir_name = build_dir_name(cfg, disable_cuda_graph=True)
         bs = cfg.get("mapping_batch_size", 8)
         ok = run_benchmark(cfg, dir_name, bs, disable_cuda_graph=True)
         return 0 if ok else 1
 
     if args.formal_only:
+        dir_name = build_dir_name(cfg, disable_cuda_graph=False)
         batch_sizes: List[int] = cfg.get("batch_sizes", [1])
         if args.single_batch is not None:
             if args.single_batch in batch_sizes:
