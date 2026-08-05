@@ -82,12 +82,12 @@ def calculate_mfu(
             crossover = float("inf")
         bound = "compute" if ops_per_byte > crossover else "memory"
 
-        k["tflops_actual"] = round(tflops_actual, 3) if tflops_actual > 0 else None
+        k["tflops_actual"] = round(tflops_actual, 6) if flops > 0 else None
         k["tflops_theoretical"] = theoretical_tflops
-        k["bandwidth_gb_s"] = round(bandwidth_gb_s, 1) if bandwidth_gb_s > 0 else None
+        k["bandwidth_gb_s"] = round(bandwidth_gb_s, 1) if bytes_moved > 0 else None
         k["bandwidth_theoretical"] = theoretical_bw
-        k["mfu"] = round(mfu, 1) if tflops_actual > 0 else None
-        k["bound"] = bound if (tflops_actual and tflops_actual > 0) else "unknown"
+        k["mfu"] = round(mfu, 3) if flops > 0 else None
+        k["bound"] = bound if (flops > 0 and bytes_moved > 0) else "unknown"
         k["flops_per_invocation"] = int(flops)
 
     return kernels

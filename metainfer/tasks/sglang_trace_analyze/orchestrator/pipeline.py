@@ -592,6 +592,98 @@ class Pipeline:
             "profile_steps": 5,
         }
 
+    def _is_formal_trace(self, trace_path) -> bool:
+        """Return True if this is a formal (CUDA Graph ON) trace."""
+        return "_graph_" in str(trace_path) and "_nograph_" not in str(trace_path)
+
+    def _merge_mapping_tflops(
+        self, result_kernels: list, bs: int, stage: str
+    ) -> None:
+        """Enrich formal trace kernel entries with TFLOPS/MFU/bound from
+        the mapping trace, which has per-kernel Input Dims.
+
+        Matches kernels by name and overwrites tflops_actual, mfu,
+        bound, bandwidth_gb_s, and input_dims from the mapping trace.
+        """
+        mapping_trace_dir = self._find_mapping_trace_dir()
+        if mapping_trace_dir is None:
+            print("[pipeline]   no mapping trace to enrich TFLOPS data")
+            return
+
+        traces = sorted(mapping_trace_dir.glob("*DECODE*.trace.json.gz"))
+        if not traces:
+            return
+
+        from .trace_parser import parse_trace, aggregate_kernels
+        from .flops_calculator import calculate_mfu
+
+        print(f"[pipeline]   enriching TFLOPS from mapping trace")
+        map_data = parse_trace(str(traces[0]))
+        map_kernels = aggregate_kernels(map_data)
+
+        # Build CPU op correlation for mapping trace too
+        events = map_data.get("traceEvents", [])
+        cpu_ops_by_corr = defaultdict(lambda: [])
+        kernel_by_corr = defaultdict(lambda: [])
+        for e in events:
+            cat = e.get("cat", "")
+            corr = (e.get("args") or {}).get("External id" if cat == "cpu_op" else "correlation")
+            if cat == "cpu_op" and corr:
+                cpu_ops_by_corr[corr].append(e.get("name", ""))
+            elif cat == "kernel" and corr:
+                kernel_by_corr[corr].append(e.get("name", ""))
+
+        # Classify + calculate MFU
+        from .structure_mapper import _map_one as map_one
+        map_entries = []
+        for k in map_kernels:
+            name = k["kernel_name"]
+            cpu_ops = set()
+            for corr, gpu_names in kernel_by_corr.items():
+                if name in gpu_names:
+                    for cn in cpu_ops_by_corr.get(corr, []):
+                        cpu_ops.add(cn)
+            mapped = map_one(name, k.get("call_stack", ""), {}, list(cpu_ops))
+            k.update(mapped)
+            map_entries.append(k)
+
+        map_entries = calculate_mfu(map_entries, self.gpu_spec, batch_size=bs, dtype="bf16")
+
+        # Build lookup by kernel name
+        map_lookup = {k["kernel_name"]: k for k in map_entries}
+
+        enriched = 0
+        for k in result_kernels:
+            name = k["kernel_name"]
+            if name in map_lookup:
+                src = map_lookup[name]
+                if src.get("tflops_actual") is not None:
+                    k["tflops_actual"] = src["tflops_actual"]
+                    k["mfu"] = src["mfu"]
+                    k["bound"] = src["bound"]
+                    k["bandwidth_gb_s"] = src["bandwidth_gb_s"]
+                    k["input_dims"] = src.get("input_dims", [])
+                    k["flops_per_invocation"] = src.get("flops_per_invocation", 0)
+                    enriched += 1
+        print(f"[pipeline]   enriched {enriched}/{len(result_kernels)} kernels with TFLOPS from mapping trace")
+
+    def _find_mapping_trace_dir(self) -> Optional[Path]:
+        """Find the mapping trace directory (CUDA Graph OFF)."""
+        map_base = self.workspace_dir / "traces" / "mapping"
+        if not map_base.exists():
+            return None
+        # Check for timestamp subdirs first
+        ts_dirs = sorted([d for d in map_base.iterdir() if d.is_dir()])
+        for ts in ts_dirs:
+            traces = list(ts.glob("*DECODE*.trace.json.gz"))
+            if traces:
+                return ts
+        # Direct
+        traces = list(map_base.glob("*DECODE*.trace.json.gz"))
+        if traces:
+            return map_base
+        return None
+
     def _build_mapping(self, trace_path: Path) -> List[Dict[str, Any]]:
         """Parse a trace file and build kernel→model-structure mapping
         using trace_parser + structure_mapper with CPU op correlation."""
@@ -729,6 +821,10 @@ class Pipeline:
             "unique_kernels": len(result_kernels),
             "kernels": result_kernels,
         }
+
+        # Enrich formal traces with TFLOPS from mapping trace
+        if self._is_formal_trace(trace_path):
+            self._merge_mapping_tflops(result_kernels, bs, stage)
 
         overlap = build_overlap_report(trace_data, bs, stage)
         # Detect CUDA Graph from trace filename: _graph_ = formal, _nograph_ = mapping
