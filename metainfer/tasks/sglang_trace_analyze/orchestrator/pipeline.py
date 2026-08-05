@@ -124,9 +124,14 @@ class Pipeline:
                 return
 
             if not ok:
-                print(f"[pipeline] phase {phase} returned failure, stopping")
-                self.store.update_run(finished=True, final_status="failed")
-                return
+                # MAPPING failure is fatal (no traces to analyze).
+                # BENCHMARK failure is non-fatal: ANALYZE can still use
+                # MAPPING traces (CUDA Graph OFF) with a note.
+                if phase == "mapping":
+                    print(f"[pipeline] phase {phase} returned failure, stopping")
+                    self.store.update_run(finished=True, final_status="failed")
+                    return
+                print(f"[pipeline] phase {phase} returned failure, continuing with available data")
 
             self.store.append_timeline("phase_exit", {"phase": phase})
             phase = next_phase(phase)
@@ -182,19 +187,35 @@ class Pipeline:
             return False
 
         # 3. Parse trace → build mapping table (rule engine)
-        decode_trace_dir = trace_dir / "decode"
+        # sglang puts traces inside a timestamp subdirectory
+        decode_trace_dir = trace_dir
         if not decode_trace_dir.exists():
-            # try: the wrapper may have used --profile-by-stage naming
-            candidates = sorted(trace_dir.glob("*.json.gz"))
-            if not candidates:
-                rec.fail("no trace files found after mapping benchmark")
-                self.store.write_iteration(n, rec.to_dict())
-                return False
-            trace_path = candidates[0]  # best effort
+            # try globbing for timestamp subdirs
+            ts_dirs = sorted(trace_dir.parent.glob(
+                trace_dir.name + "/*" if trace_dir.name else "*/"
+            )) if trace_dir.parent.exists() else []
+            if not ts_dirs:
+                # fall back: find any trace files
+                candidates = list(trace_dir.parent.rglob("*.trace.json.gz")) if trace_dir.parent.exists() else []
+                if not candidates:
+                    rec.fail("no trace files found after mapping benchmark")
+                    self.store.write_iteration(n, rec.to_dict())
+                    return False
+                trace_path = candidates[0]
+            else:
+                decode_trace_dir = ts_dirs[0]
+                traces = sorted(decode_trace_dir.glob("*DECODE*.trace.json.gz"))
+                if not traces:
+                    rec.fail("no decode traces in " + str(decode_trace_dir))
+                    self.store.write_iteration(n, rec.to_dict())
+                    return False
+                trace_path = traces[0]
         else:
-            traces = sorted(decode_trace_dir.glob("*.trace.json.gz"))
+            traces = sorted(decode_trace_dir.glob("*DECODE*.trace.json.gz"))
             if not traces:
-                rec.fail("no trace files in mapping/decode/")
+                traces = sorted(decode_trace_dir.rglob("*DECODE*.trace.json.gz"))
+            if not traces:
+                rec.fail("no decode traces found in " + str(decode_trace_dir))
                 self.store.write_iteration(n, rec.to_dict())
                 return False
             trace_path = traces[0]
@@ -286,11 +307,13 @@ class Pipeline:
             rec.done(trace_dir=str(trace_dir))
             self.store.write_iteration(n, rec.to_dict())
 
-        # We continue even if some batches failed — ANALYZE skips them
-        return all_ok or any(
-            (self.workspace_dir / "traces" / f"bs_{bs}" / "decode").exists()
+        # Continue if any traces exist (mapping or formal)
+        has_formal = any(
+            (self.workspace_dir / "traces" / f"bs_{bs}").exists()
             for bs in self.batch_sizes
         )
+        has_mapping = (self.workspace_dir / "traces" / "mapping").exists()
+        return all_ok or has_formal or has_mapping
 
     # ================================================================== #
     #  Phase: ANALYZE
@@ -308,12 +331,22 @@ class Pipeline:
         any_ok = False
         for bs in self.batch_sizes:
             for stage in self.stages:
+                # Try formal traces first, fall back to mapping traces
                 trace_dir = self.workspace_dir / "traces" / f"bs_{bs}" / stage
                 if not trace_dir.exists():
-                    print(f"[pipeline]   skipping bs_{bs}/{stage} — no trace dir")
-                    continue
+                    # Fallback: look for mapping trace subdir
+                    map_base = self.workspace_dir / "traces" / "mapping"
+                    if map_base.exists():
+                        ts_dirs = sorted(map_base.glob("*/"))  # timestamp subdirs
+                        if ts_dirs:
+                            trace_dir = ts_dirs[0]
+                        else:
+                            trace_dir = map_base
+                    else:
+                        print(f"[pipeline]   skipping bs_{bs}/{stage} — no trace dir")
+                        continue
 
-                traces = sorted(trace_dir.glob("*.trace.json.gz"))
+                traces = sorted(trace_dir.glob("*DECODE*.trace.json.gz"))
                 if not traces:
                     print(f"[pipeline]   skipping bs_{bs}/{stage} — no trace files")
                     continue
@@ -520,18 +553,52 @@ class Pipeline:
             "tp_size": self.tp_size,
             "pp_size": self.pp_size,
             "output_dir": output_dir,
+            "profile_start_step": 5,
+            "profile_steps": 5,
         }
 
     def _build_mapping(self, trace_path: Path) -> List[Dict[str, Any]]:
-        """Parse a torch profiler Chrome trace and extract kernel→layer
-        mappings from call stacks.
+        """Parse a trace file and build kernel→model-structure mapping
+        using trace_parser + structure_mapper with CPU op correlation."""
+        from .trace_parser import parse_trace, aggregate_kernels
+        from .structure_mapper import _map_one as map_one
 
-        Placeholder implementation — real logic will live in
-        ``trace_parser.py`` and ``structure_mapper.py``.
-        """
-        # TODO: implement trace_parser.py
-        print("[pipeline]   _build_mapping: parsing trace (placeholder)")
-        return []
+        print(f"[pipeline]   parsing trace for mapping: {trace_path}")
+        trace_data = parse_trace(str(trace_path))
+
+        kernels = aggregate_kernels(trace_data)
+
+        # Build CPU op correlation
+        events = trace_data.get("traceEvents", [])
+        cpu_ops_by_corr = defaultdict(lambda: [])
+        kernel_by_corr = defaultdict(lambda: [])
+        for e in events:
+            cat = e.get("cat", "")
+            corr = (e.get("args") or {}).get(
+                "External id" if cat == "cpu_op" else "correlation"
+            )
+            if cat == "cpu_op" and corr:
+                cpu_ops_by_corr[corr].append(e.get("name", ""))
+            elif cat == "kernel" and corr:
+                kernel_by_corr[corr].append(e.get("name", ""))
+
+        entries = []
+        seen = set()
+        for k in kernels:
+            name = k["kernel_name"]
+            if name in seen:
+                continue
+            seen.add(name)
+            cpu_ops = set()
+            for corr, gpu_names in kernel_by_corr.items():
+                if name in gpu_names:
+                    for cn in cpu_ops_by_corr.get(corr, []):
+                        cpu_ops.add(cn)
+            entry = map_one(name, k.get("call_stack", ""), {}, list(cpu_ops))
+            entries.append(entry)
+
+        print(f"[pipeline]   mapping built: {len(entries)} unique kernels")
+        return entries
 
     def _llm_mapping_sanity_check(
         self, entries: List[Dict[str, Any]]
