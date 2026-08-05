@@ -223,7 +223,13 @@ function Dashboard({ summary, detail, mapping, batchList, activeBatch, setActive
         <${RooflinePanel} kernels=${kernels} gpu=${summary.gpu || "K100"} />
       </div>
 
-      ${/* Row 4: Top kernels quick preview */""}
+      ${/* Row 4: MFU Distribution + Frequency Analysis */""}
+      <div class="sa-grid-2col">
+        <${MfuDistro} kernels=${kernels} gpu=${summary.gpu || "K100"} />
+        <${FrequencyPanel} kernels=${kernels} />
+      </div>
+
+      ${/* Row 5: Top kernels quick preview */""}
       <div class="sa-panel">
         <h3>Top Kernels</h3>
         <table class="sa-table">
@@ -469,6 +475,83 @@ function RooflinePanel({ kernels, gpu }) {
         })}
       </div>
       <p class="sa-note">Ridge point: ${ridgePoint.toFixed(0)} ops/byte. Left of ridge = memory-bound. Right = compute-bound.</p>
+    </div>
+  `;
+}
+
+/* ── MFU Distribution Histogram ── */
+
+function MfuDistro({ kernels, gpu }) {
+  if (!kernels || !kernels.length) return null;
+  const peaks = { K100: { bf16: 192 }, A100_80G: { bf16: 312 }, H100: { bf16: 989 }, B200: { bf16: 2250 } };
+  const pk = (peaks[gpu] || peaks.K100).bf16;
+
+  // Compute MFU for ALL kernels from tflops_actual / theoretical
+  const mfuVals = kernels.map((k) => {
+    if (k.mfu != null) return k.mfu;
+    if (k.tflops_actual != null && k.tflops_actual > 0) return k.tflops_actual / pk * 100;
+    return null;
+  }).filter((v) => v != null);
+
+  if (mfuVals.length === 0) return html`<div class="sa-panel"><h3>MFU Distribution</h3><p class="sa-note">No MFU data available (no Input Dims in trace).</p></div>`;
+
+  const buckets = [0, 5, 10, 25, 50, 75, 90, 100];
+  const labels = ["0-5%", "5-10%", "10-25%", "25-50%", "50-75%", "75-90%", "90-100%"];
+  const hist = new Array(buckets.length - 1).fill(0);
+  for (const v of mfuVals) {
+    for (let i = buckets.length - 1; i >= 0; i--) {
+      if (v >= buckets[i]) { hist[i]++; break; }
+    }
+  }
+
+  const maxN = Math.max(...hist, 1);
+  const avg = mfuVals.reduce((a, b) => a + b, 0) / mfuVals.length;
+  const median = mfuVals.sort((a, b) => a - b)[Math.floor(mfuVals.length / 2)];
+
+  return html`
+    <div class="sa-panel">
+      <h3>MFU Distribution</h3>
+      <p class="sa-note">${mfuVals.length} kernels with TFLOPS data | avg=${avg.toFixed(1)}% | median=${median.toFixed(1)}%</p>
+      <div class="sa-hist">
+        ${hist.map((n, i) => html`
+          <div class="sa-hist-row">
+            <span class="sa-hist-label">${labels[i]}</span>
+            <div class="sa-hist-bar-bg">
+              <div class="sa-hist-bar" style="width:${(n / maxN * 100).toFixed(0)}%"></div>
+            </div>
+            <span class="sa-hist-count">${n}</span>
+          </div>
+        `)}
+      </div>
+    </div>
+  `;
+}
+
+/* ── Frequency Analysis ── */
+
+function FrequencyPanel({ kernels }) {
+  if (!kernels || !kernels.length) return null;
+  // Top kernels by call count
+  const byCount = [...kernels].sort((a, b) => (b.count || 0) - (a.count || 0));
+
+  return html`
+    <div class="sa-panel">
+      <h3>Top by Invocation Count</h3>
+      <p class="sa-note">High invocation count kernels may indicate repeated small operations that could be batched.</p>
+      <table class="sa-table">
+        <thead><tr><th>Kernel</th><th>Calls</th><th>Time%</th><th>Avg μs</th><th>Category</th></tr></thead>
+        <tbody>
+          ${byCount.slice(0, 10).map((k) => html`
+            <tr key=${k.rank}>
+              <td class="sa-kernel-name" title=${k.kernel_name}>${(k.kernel_name || "").slice(0, 45)}</td>
+              <td class="sa-num">${k.count}</td>
+              <td class="sa-num">${(k.time_pct || 0).toFixed(1)}%</td>
+              <td class="sa-num">${(k.avg_dur_us || 0).toFixed(1)}</td>
+              <td><span class="sa-cat">${k.category || "?"}</span></td>
+            </tr>
+          `)}
+        </tbody>
+      </table>
     </div>
   `;
 }
