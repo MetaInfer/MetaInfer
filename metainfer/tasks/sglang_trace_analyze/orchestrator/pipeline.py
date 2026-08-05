@@ -402,7 +402,7 @@ class Pipeline:
         self.store.write_iteration(n, rec.to_dict())
         self.store.update_run(current_iteration=n)
 
-        # Collect summaries from all analyzed batches
+        # Collect full kernel tables + summaries from all analyzed batches
         kernel_summaries = []
         overlap_summaries = []
         fuse_summaries = []
@@ -414,10 +414,9 @@ class Pipeline:
                 ov = _load_json(out_dir / "overlap.json")
                 fu = _load_json(out_dir / "fuse.json")
                 if kt:
-                    top3 = (kt.get("kernels", []) or [])[:3]
                     kernel_summaries.append({
                         "batch_size": bs, "stage": stage,
-                        "top_kernels": top3,
+                        "all_kernels": kt.get("kernels", []),
                     })
                 if ov:
                     overlap_summaries.append(ov)
@@ -843,16 +842,124 @@ class Pipeline:
         overlap_summaries: list,
         fuse_summaries: list,
     ) -> Dict[str, Any]:
-        """Generate optimization hints via LLM.
+        """Generate optimization hints from analysis data.
 
-        Placeholder — real impl calls SubAgentManager.
+        Uses rule-based analysis of kernel tables, overlap, and fuse results
+        to produce actionable optimization suggestions.
         """
+        suggestions = []
+        surprises = []
+
+        # Collect all kernels across batches/stages
+        all_kernels = []
+        for ks in kernel_summaries:
+            for k in (ks.get("all_kernels") or []):
+                all_kernels.append(k)
+
+        if not all_kernels:
+            return {
+                "bottleneck": {"kernel_or_pattern": "unknown", "reason": "no data", "impact_pct": 0},
+                "suggestions": [], "surprises": [],
+                "status": "generated",
+            }
+
+        top = all_kernels[0] if all_kernels else {}
+        top_name = top.get("kernel_name", "unknown")
+        top_cat = top.get("category", "Other")
+        top_pct = top.get("time_pct", 0)
+
+        # Categorize kernels
+        cats = {}
+        for k in all_kernels:
+            c = k.get("category", "Other")
+            cats[c] = cats.get(c, 0) + (k.get("time_pct", 0) or 0)
+
+        # 1. Dominant kernel analysis
+        if top_pct > 50:
+            suggestions.append({
+                "title": f"Replace or optimize {top_cat} kernel",
+                "what_to_change": f"The \"{top_name[:40]}\" kernel dominates at {top_pct:.0f}% GPU time. Profile with Nsight Compute to identify micro-architectural bottlenecks, or replace with a vendor-optimized implementation.",
+                "why": f"Single kernel consuming >50% of GPU time is the highest-ROI optimization target.",
+                "estimated_saving_pct": round(top_pct * 0.3),
+                "difficulty": "high",
+                "category": "kernel_replace",
+            })
+        elif top_pct > 20:
+            suggestions.append({
+                "title": f"Profile {top_cat} kernel with Nsight",
+                "what_to_change": f"\"{top_name[:40]}\" at {top_pct:.0f}%. Use Nsight Compute to check occupancy, memory coalescing, and register pressure.",
+                "why": "Top kernel is a clear bottleneck. Micro-architectural optimization may yield 10-30% improvement.",
+                "estimated_saving_pct": round(top_pct * 0.2),
+                "difficulty": "medium",
+                "category": "kernel_replace",
+            })
+
+        # 2. Category-specific suggestions
+        reduce_pct = cats.get("Reduce", 0)
+        if reduce_pct > 30:
+            suggestions.append({
+                "title": "Reduce TP allreduce overhead",
+                "what_to_change": "Custom allreduce consumes {:.0f}% GPU time. Try: (1) overlap communication with computation using separate CUDA streams, (2) reduce TP degree if memory permits, or (3) enable CUDA Graph to amortize launch overhead.".format(reduce_pct),
+                "why": "TP communication is the dominant cost. Even 10% reduction saves significant time.",
+                "estimated_saving_pct": round(reduce_pct * 0.25),
+                "difficulty": "medium",
+                "category": "overlap",
+            })
+
+        gemm_pct = cats.get("GEMM", 0)
+        if gemm_pct > 20:
+            suggestions.append({
+                "title": "Quantize GEMMs to FP8 or INT8",
+                "what_to_change": "GEMM kernels consume {:.0f}% GPU time. Explore FP8 (w8a8) quantization for attention projections and FFN layers to double throughput.".format(gemm_pct),
+                "why": "GEMM is compute-heavy and benefits most from reduced precision.",
+                "estimated_saving_pct": round(gemm_pct * 0.4),
+                "difficulty": "medium",
+                "category": "config_tune",
+            })
+
+        element_pct = cats.get("ElementWise", 0)
+        if element_pct > 15:
+            suggestions.append({
+                "title": "Fuse element-wise operations",
+                "what_to_change": f"Element-wise kernels consume {element_pct:.0f}% GPU time. These are memory-bound — fuse consecutive element-wise ops (add, mul, silu, norm) into single kernels to reduce memory traffic.",
+                "why": "Memory-bound element-wise ops benefit most from fusion, eliminating intermediate reads/writes.",
+                "estimated_saving_pct": round(element_pct * 0.4),
+                "difficulty": "low",
+                "category": "fuse",
+            })
+
+        # 3. CUDA Graph check (from overlap data)
+        any_cuda_graph = any(
+            s.get("summary", {}).get("cuda_graph_effective", False)
+            for s in overlap_summaries
+        )
+        if not any_cuda_graph:
+            suggestions.append({
+                "title": "Enable CUDA Graph for decode",
+                "what_to_change": "CUDA Graph is not active. Enable --cuda-graph-bs to capture and replay the decode graph. On K100 with DeepSeek V4, this typically yields 3-5x throughput improvement.",
+                "why": "Decode is launch-bound. CUDA Graph eliminates per-step kernel launch overhead.",
+                "estimated_saving_pct": 70,
+                "difficulty": "low",
+                "category": "config_tune",
+            })
+
+        # 4. Surprises
+        if reduce_pct < 5 and "NCCL" not in cats:
+            surprises.append("TP allreduce overhead is unexpectedly low — verify communication is actually happening (check TP degree).")
+        if gemm_pct > 50:
+            surprises.append("GEMM dominates at >50% — unexpected for a decode workload. Check if attention is correctly fused.")
+
+        bottleneck = {
+            "kernel_or_pattern": top_name[:80] if top_name else "unknown",
+            "reason": f"Largest single consumer of GPU time at {top_pct:.1f}% (category: {top_cat})",
+            "impact_pct": round(top_pct),
+        }
+
         return {
-            "bottleneck": {"kernel_or_pattern": "TBD", "reason": "", "impact_pct": 0},
-            "suggestions": [],
-            "surprises": [],
-            "status": "skipped",
-            "reason": "LLM hints not yet wired",
+            "bottleneck": bottleneck,
+            "suggestions": suggestions[:5],
+            "surprises": surprises,
+            "status": "generated",
         }
 
 
