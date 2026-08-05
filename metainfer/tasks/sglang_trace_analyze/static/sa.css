@@ -1,25 +1,94 @@
+/* sglang_trace_analyze — dashboard + kernel table styles */
 .sa-detail { padding: 12px 16px; color: #e0e0e0; font-family: system-ui, sans-serif; }
-.sa-header { margin-bottom: 12px; }
+.sa-header { margin-bottom: 8px; }
 .sa-header h2 { margin: 0 0 2px; color: #fff; font-size: 18px; }
 .sa-meta { color: #888; font-size: 12px; }
 .sa-loading,.sa-error,.sa-empty { padding: 32px; text-align: center; color: #888; }
 .sa-error { color: #e74c3c; }
 
 /* Tabs */
-.sa-tabs { display: flex; gap: 2px; margin-bottom: 12px; border-bottom: 2px solid #333; }
+.sa-tabs { display: flex; gap: 2px; margin-bottom: 10px; border-bottom: 2px solid #333; }
 .sa-tab-btn { padding: 6px 16px; border: none; border-radius: 4px 4px 0 0;
   background: transparent; color: #999; cursor: pointer; font-size: 13px; }
 .sa-tab-btn.active-tab { background: #2a2a2a; color: #4a90d9; font-weight: 600; }
-.sa-batch-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.sa-batch-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
 .sa-tab { padding: 4px 12px; border: 1px solid #444; border-radius: 4px;
   background: #2a2a2a; color: #ccc; cursor: pointer; font-size: 12px; }
 .sa-tab.active { background: #4a90d9; color: #fff; border-color: #4a90d9; }
 
 /* Panels */
 .sa-panel { background: #1e1e1e; border: 1px solid #333; border-radius: 6px;
-  padding: 14px; margin-bottom: 12px; }
-.sa-panel h3 { margin: 0 0 10px; color: #ddd; font-size: 14px; }
+  padding: 14px; margin-bottom: 10px; }
+.sa-panel h3 { margin: 0 0 8px; color: #ddd; font-size: 13px; }
 .sa-note { color: #888; font-size: 11px; margin: 4px 0; }
+.ml8 { margin-left: 8px; }
+
+/* Stat cards */
+.sa-stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 10px; }
+.sa-stat-card { background: #1e1e1e; border: 1px solid #333; border-radius: 6px;
+  padding: 12px; text-align: center; }
+.sa-stat-value { font-size: 24px; font-weight: 700; color: #fff; line-height: 1.2; }
+.sa-stat-label { font-size: 11px; color: #888; margin-top: 4px; }
+.sa-stat-sub { font-size: 10px; color: #666; margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
+.sa-stat-warn { border-color: #c0392b; }
+.sa-stat-warn .sa-stat-value { color: #e74c3c; }
+.sa-stat-ok { border-color: #27ae60; }
+.sa-stat-ok .sa-stat-value { color: #2ecc71; }
+
+/* Grid */
+.sa-grid-2col { display: grid; grid-template-columns: 380px 1fr; gap: 10px; margin-bottom: 10px; }
+
+/* Donut chart */
+.sa-donut-wrap { display: flex; align-items: center; gap: 16px; }
+.sa-donut { width: 140px; height: 140px; border-radius: 50%; position: relative; flex-shrink: 0; }
+.sa-donut-hole { position: absolute; top: 28px; left: 28px; right: 28px; bottom: 28px;
+  background: #1e1e1e; border-radius: 50%; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; }
+.sa-donut-val { font-size: 22px; font-weight: 700; color: #fff; }
+.sa-donut-lbl { font-size: 10px; color: #888; }
+.sa-donut-legend { flex: 1; min-width: 0; }
+.sa-legend-item { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+.sa-legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.sa-legend-name { font-size: 11px; color: #ccc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sa-legend-pct { font-size: 11px; color: #aaa; margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* Bottleneck */
+.sa-bottleneck { display: flex; gap: 12px; }
+.sa-bn-rank { font-size: 32px; font-weight: 800; color: #c0392b; line-height: 1; flex-shrink: 0; }
+.sa-bn-info { flex: 1; min-width: 0; }
+.sa-bn-name { font-size: 12px; font-family: monospace; color: #e74c3c; margin-bottom: 4px;
+  word-break: break-all; }
+.sa-bn-meta { font-size: 11px; color: #888; margin-bottom: 2px; }
+.sa-bn-meta strong { color: #ccc; }
+.sa-bn-bar-wrap { background: #2a2a2a; border-radius: 3px; height: 20px; overflow: hidden; margin-top: 6px; }
+.sa-bn-bar { height: 100%; background: #c0392b; border-radius: 3px; min-width: 2px; }
+
+/* Bound bars */
+.sa-bound-bars { }
+.sa-bound-row { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+.sa-bound-label { width: 100px; font-size: 11px; color: #ccc; text-align: right; flex-shrink: 0; }
+.sa-bound-bar-bg { flex: 1; background: #2a2a2a; border-radius: 3px; height: 14px; overflow: hidden; }
+.sa-bound-bar { height: 100%; border-radius: 3px; min-width: 2px; }
+.sa-bb-compute { background: #2ecc71; }
+.sa-bb-memory { background: #e67e22; }
+.sa-bb-unknown { background: #555; }
+.sa-bound-pct { width: 45px; font-size: 11px; color: #aaa; font-variant-numeric: tabular-nums; }
+
+/* Bottleneck list (Hints page) */
+.sa-bn-list { margin-bottom: 10px; }
+.sa-bn-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid #2a2a2a; }
+.sa-bn-rank-sm { font-size: 12px; font-weight: 700; color: #888; min-width: 24px; }
+.sa-bn-pct { font-size: 13px; font-weight: 600; color: #e74c3c; min-width: 48px; font-variant-numeric: tabular-nums; }
+.sa-bn-name-sm { font-size: 11px; font-family: monospace; color: #ccc; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Filter bar */
+.sa-filters { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.sa-search { background: #2a2a2a; border: 1px solid #444; border-radius: 4px; padding: 4px 8px;
+  color: #ddd; font-size: 12px; width: 220px; }
+.sa-select { background: #2a2a2a; border: 1px solid #444; border-radius: 4px; padding: 4px 8px;
+  color: #ddd; font-size: 12px; }
+.sa-filter-count { font-size: 11px; color: #888; }
 
 /* Table */
 .sa-table-wrap { overflow-x: auto; }
@@ -29,7 +98,7 @@
 .sa-table td { padding: 3px 6px; border-bottom: 1px solid #2a2a2a; vertical-align: middle; }
 .sa-num { text-align: right; font-variant-numeric: tabular-nums; color: #aaa; }
 .sa-sm { font-size: 10px; color: #888; }
-.sa-kernel-name { max-width: 280px; overflow: hidden; text-overflow: ellipsis;
+.sa-kernel-name { max-width: 300px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; font-family: monospace; font-size: 10px; color: #bbb; }
 .sa-pct { width: 100px; }
 .sa-bar-bg { position: relative; background: #2a2a2a; border-radius: 2px;
@@ -41,25 +110,20 @@
 .sa-cat { display: inline-block; padding: 1px 5px; border-radius: 2px;
   font-size: 10px; background: #333; color: #ccc; }
 
-/* Category chart */
-.sa-cat-chart { display: flex; flex-direction: column; gap: 5px; }
-.sa-cat-row { display: flex; align-items: center; gap: 8px; }
-.sa-cat-label { width: 120px; font-size: 11px; color: #ccc; text-align: right; }
-.sa-cat-bar-bg { flex: 1; background: #2a2a2a; border-radius: 2px; height: 16px; overflow: hidden; }
-.sa-cat-bar { height: 100%; border-radius: 2px; min-width: 2px; }
-.sa-cat-pct { width: 50px; font-size: 11px; color: #aaa; font-variant-numeric: tabular-nums; }
+/* Confidence badges */
+.sa-conf { display: inline-block; padding: 1px 4px; border-radius: 2px; font-size: 10px; }
+.sa-conf-high { background: #27ae60; color: #fff; }
+.sa-conf-medium { background: #e67e22; color: #fff; }
+.sa-conf-low { background: #c0392b; color: #fff; }
 
 /* Hints */
-.sa-hint-section { margin-top: 10px; }
-.sa-hint-section h4 { margin: 0 0 6px; color: #ccc; font-size: 12px; }
 .sa-hint-card { background: #252525; border-left: 3px solid #4a90d9;
   padding: 8px 10px; margin-bottom: 8px; border-radius: 0 4px 4px 0; }
+.sa-hint-card strong { color: #f1c40f; }
 .sa-difficulty { display: inline-block; padding: 1px 6px; border-radius: 3px;
   font-size: 10px; color: #fff; margin-left: 6px; }
 .sa-diff-low { background: #27ae60; }
 .sa-diff-medium { background: #e67e22; }
 .sa-diff-high { background: #c0392b; }
-
-/* Fuse cards */
-.sa-fuse-card { background: #252525; padding: 6px 8px; margin: 6px 0; border-radius: 4px; }
-.sa-fuse-card strong { color: #f1c40f; }
+.sa-suggestion { font-size: 12px; color: #f1c40f; background: #2a2a20;
+  border-left: 3px solid #f1c40f; padding: 6px 10px; margin: 6px 0; border-radius: 0 4px 4px 0; }
