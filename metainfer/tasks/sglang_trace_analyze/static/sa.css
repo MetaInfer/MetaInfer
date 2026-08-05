@@ -127,3 +127,26 @@
 .sa-diff-high { background: #c0392b; }
 .sa-suggestion { font-size: 12px; color: #f1c40f; background: #2a2a20;
   border-left: 3px solid #f1c40f; padding: 6px 10px; margin: 6px 0; border-radius: 0 4px 4px 0; }
+
+/* Roofline */
+.sa-roofline-bars { margin-top: 8px; }
+.sa-rf-row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.sa-rf-name { font-size: 10px; font-family: monospace; color: #bbb; width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+.sa-rf-bar-wrap { flex: 1; background: #2a2a2a; border-radius: 2px; height: 12px; overflow: hidden; }
+.sa-rf-bar { height: 100%; border-radius: 2px; min-width: 2px; }
+.sa-rf-compute { background: #2ecc71; }
+.sa-rf-memory { background: #e67e22; }
+.sa-rf-val { font-size: 10px; color: #888; width: 65px; text-align: right; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.sa-rf-bound { font-size: 10px; color: #666; width: 60px; flex-shrink: 0; }
+
+/* Mapping grid */
+.sa-mapping-grid { margin-top: 8px; }
+.sa-mapping-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; border-bottom: 1px solid #2a2a2a; }
+.sa-mapping-layer { font-size: 11px; color: #ccc; min-width: 140px; font-family: monospace; }
+.sa-mapping-count { font-size: 10px; color: #888; min-width: 60px; }
+.sa-mapping-cats { display: flex; gap: 4px; flex-wrap: wrap; }
+
+/* Fuse cards */
+.sa-fuse-card { background: #252525; border-left: 3px solid #e67e22; padding: 8px 10px; margin-bottom: 6px; border-radius: 0 4px 4px 0; }
+.sa-fuse-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.sa-fuse-header strong { color: #f1c40f; }
