@@ -66,6 +66,8 @@ def run_benchmark(
         "--chunked-prefill-size", "4096",
         "--kv-cache-dtype", "auto",
         "--disable-flashinfer-autotune",
+        "--reasoning-parser", "deepseek-v4",
+        "--tool-call-parser", "deepseekv4",
         "--enable-metrics",
     ]
 
