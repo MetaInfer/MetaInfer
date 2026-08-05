@@ -158,3 +158,10 @@
 .sa-hist-bar-bg { flex: 1; background: #2a2a2a; border-radius: 2px; height: 14px; overflow: hidden; }
 .sa-hist-bar { height: 100%; background: #4a90d9; border-radius: 2px; min-width: 2px; }
 .sa-hist-count { font-size: 10px; color: #aaa; width: 30px; text-align: right; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+
+/* Key Findings */
+.sa-findings { display: flex; flex-wrap: wrap; gap: 8px; }
+.sa-finding-card { display: flex; gap: 8px; background: #252525; border-radius: 4px; padding: 8px 10px; flex: 1; min-width: 280px; max-width: calc(50% - 4px); }
+.sa-finding-icon { font-size: 16px; flex-shrink: 0; line-height: 1.2; }
+.sa-finding-body { min-width: 0; }
+.sa-finding-body strong { font-size: 12px; color: #ddd; }
