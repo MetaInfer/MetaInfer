@@ -223,13 +223,16 @@ function Dashboard({ summary, detail, mapping, batchList, activeBatch, setActive
         <${RooflinePanel} kernels=${kernels} gpu=${summary.gpu || "K100"} />
       </div>
 
-      ${/* Row 4: MFU Distribution + Frequency Analysis */""}
+      ${/* Row 4: Key Findings */""}
+      <${KeyFindings} kernels=${kernels} kt=${kt} cudaGraph=${cudaGraphOk} />
+
+      ${/* Row 5: MFU Distribution + Frequency Analysis */""}
       <div class="sa-grid-2col">
         <${MfuDistro} kernels=${kernels} gpu=${summary.gpu || "K100"} />
         <${FrequencyPanel} kernels=${kernels} />
       </div>
 
-      ${/* Row 5: Top kernels quick preview */""}
+      ${/* Row 6: Top kernels quick preview */""}
       <div class="sa-panel">
         <h3>Top Kernels</h3>
         <table class="sa-table">
@@ -475,6 +478,103 @@ function RooflinePanel({ kernels, gpu }) {
         })}
       </div>
       <p class="sa-note">Ridge point: ${ridgePoint.toFixed(0)} ops/byte. Left of ridge = memory-bound. Right = compute-bound.</p>
+    </div>
+  `;
+}
+
+/* ── Key Findings auto-summary ── */
+
+function KeyFindings({ kernels, kt, cudaGraph }) {
+  if (!kernels || !kernels.length) return null;
+
+  const total = kt.total_gpu_time_s || 0;
+  const top = kernels[0];
+  const top3 = kernels.slice(0, 3);
+
+  // Build findings from data
+  const findings = [];
+
+  // 1. Dominant kernel
+  if ((top.time_pct || 0) > 30) {
+    findings.push({
+      icon: "🔴", title: "Single kernel dominates",
+      text: `"${(top.kernel_name || "").slice(0, 45)}" consumes ${(top.time_pct || 0).toFixed(1)}% of GPU time alone. This is your primary optimization target.`,
+    });
+  } else if ((top.time_pct || 0) > 15) {
+    findings.push({
+      icon: "🟡", title: "Moderate hotspot",
+      text: `Top kernel "${(top.kernel_name || "").slice(0, 45)}" at ${(top.time_pct || 0).toFixed(1)}%. Consider fusion or replacement.`,
+    });
+  } else {
+    findings.push({
+      icon: "🟢", title: "Well-distributed workload",
+      text: "GPU time is spread across many kernels. Focus on fusion and reducing kernel launch overhead.",
+    });
+  }
+
+  // 2. CUDA Graph
+  if (cudaGraph) {
+    findings.push({
+      icon: "🟢", title: "CUDA Graph active",
+      text: `Total GPU time: ${total.toFixed(2)}s with CUDA Graph. Kernel launch overhead is minimized.`,
+    });
+  } else {
+    findings.push({
+      icon: "🔴", title: "CUDA Graph disabled",
+      text: "Enable CUDA Graph to reduce kernel launch overhead and CPU-GPU synchronization. Expected 3-5x speedup on decode.",
+    });
+  }
+
+  // 3. Category concentration
+  const cats = {};
+  for (const k of kernels) cats[k.category] = (cats[k.category] || 0) + (k.time_pct || 0);
+  const topCat = Object.entries(cats).sort((a, b) => b[1] - a[1])[0];
+  if (topCat && topCat[1] > 50) {
+    findings.push({
+      icon: "🔴", title: `Category "${topCat[0]}" dominates at ${topCat[1].toFixed(0)}%`,
+      text: topCat[0] === "Reduce" ? "TP allreduce is the bottleneck. Consider communication-computation overlap or reducing TP degree." :
+           topCat[0] === "GEMM" ? "GEMM is the bottleneck. Explore quantization (FP8/INT8) or faster GEMM backends." :
+           `Focus optimization efforts on ${topCat[0]} operations.`,
+    });
+  }
+
+  // 4. Top 3 summary
+  const top3Summary = top3.map((k, i) =>
+    `#${i + 1} ${(k.category || "?").slice(0, 10)} ${(k.time_pct || 0).toFixed(1)}%`
+  ).join("  |  ");
+  findings.push({
+    icon: "📊", title: "Top 3 kernels",
+    text: top3Summary,
+  });
+
+  // 5. MFU note
+  const withMfu = kernels.filter((k) => k.mfu != null && k.mfu > 0);
+  if (withMfu.length === 0) {
+    findings.push({
+      icon: "💡", title: "No MFU data available",
+      text: "Profiler was run without record_shapes=True. Enable it to get per-kernel TFLOPS and MFU analysis.",
+    });
+  } else if (withMfu.length < 10) {
+    findings.push({
+      icon: "💡", title: `MFU data available for ${withMfu.length} kernels`,
+      text: "Limited TFLOPS data (only CK GEMM tiles). Enable record_shapes=True for full MFU coverage.",
+    });
+  }
+
+  return html`
+    <div class="sa-panel">
+      <h3>Key Findings</h3>
+      <div class="sa-findings">
+        ${findings.map((f) => html`
+          <div class="sa-finding-card">
+            <span class="sa-finding-icon">${f.icon}</span>
+            <div class="sa-finding-body">
+              <strong>${f.title}</strong>
+              <p class="sa-note">${f.text}</p>
+            </div>
+          </div>
+        `)}
+      </div>
     </div>
   `;
 }
