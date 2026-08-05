@@ -1,0 +1,65 @@
+.sa-detail { padding: 12px 16px; color: #e0e0e0; font-family: system-ui, sans-serif; }
+.sa-header { margin-bottom: 12px; }
+.sa-header h2 { margin: 0 0 2px; color: #fff; font-size: 18px; }
+.sa-meta { color: #888; font-size: 12px; }
+.sa-loading,.sa-error,.sa-empty { padding: 32px; text-align: center; color: #888; }
+.sa-error { color: #e74c3c; }
+
+/* Tabs */
+.sa-tabs { display: flex; gap: 2px; margin-bottom: 12px; border-bottom: 2px solid #333; }
+.sa-tab-btn { padding: 6px 16px; border: none; border-radius: 4px 4px 0 0;
+  background: transparent; color: #999; cursor: pointer; font-size: 13px; }
+.sa-tab-btn.active-tab { background: #2a2a2a; color: #4a90d9; font-weight: 600; }
+.sa-batch-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.sa-tab { padding: 4px 12px; border: 1px solid #444; border-radius: 4px;
+  background: #2a2a2a; color: #ccc; cursor: pointer; font-size: 12px; }
+.sa-tab.active { background: #4a90d9; color: #fff; border-color: #4a90d9; }
+
+/* Panels */
+.sa-panel { background: #1e1e1e; border: 1px solid #333; border-radius: 6px;
+  padding: 14px; margin-bottom: 12px; }
+.sa-panel h3 { margin: 0 0 10px; color: #ddd; font-size: 14px; }
+.sa-note { color: #888; font-size: 11px; margin: 4px 0; }
+
+/* Table */
+.sa-table-wrap { overflow-x: auto; }
+.sa-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.sa-table th { text-align: left; padding: 5px 6px; border-bottom: 1px solid #333;
+  color: #999; font-weight: 600; white-space: nowrap; }
+.sa-table td { padding: 3px 6px; border-bottom: 1px solid #2a2a2a; vertical-align: middle; }
+.sa-num { text-align: right; font-variant-numeric: tabular-nums; color: #aaa; }
+.sa-sm { font-size: 10px; color: #888; }
+.sa-kernel-name { max-width: 280px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-family: monospace; font-size: 10px; color: #bbb; }
+.sa-pct { width: 100px; }
+.sa-bar-bg { position: relative; background: #2a2a2a; border-radius: 2px;
+  height: 14px; overflow: hidden; }
+.sa-bar { position: absolute; left: 0; top: 0; height: 100%;
+  background: #4a90d9; border-radius: 2px; opacity: 0.5; }
+.sa-bar-bg span { position: relative; z-index: 1; font-size: 10px;
+  line-height: 14px; padding-left: 3px; color: #ddd; }
+.sa-cat { display: inline-block; padding: 1px 5px; border-radius: 2px;
+  font-size: 10px; background: #333; color: #ccc; }
+
+/* Category chart */
+.sa-cat-chart { display: flex; flex-direction: column; gap: 5px; }
+.sa-cat-row { display: flex; align-items: center; gap: 8px; }
+.sa-cat-label { width: 120px; font-size: 11px; color: #ccc; text-align: right; }
+.sa-cat-bar-bg { flex: 1; background: #2a2a2a; border-radius: 2px; height: 16px; overflow: hidden; }
+.sa-cat-bar { height: 100%; border-radius: 2px; min-width: 2px; }
+.sa-cat-pct { width: 50px; font-size: 11px; color: #aaa; font-variant-numeric: tabular-nums; }
+
+/* Hints */
+.sa-hint-section { margin-top: 10px; }
+.sa-hint-section h4 { margin: 0 0 6px; color: #ccc; font-size: 12px; }
+.sa-hint-card { background: #252525; border-left: 3px solid #4a90d9;
+  padding: 8px 10px; margin-bottom: 8px; border-radius: 0 4px 4px 0; }
+.sa-difficulty { display: inline-block; padding: 1px 6px; border-radius: 3px;
+  font-size: 10px; color: #fff; margin-left: 6px; }
+.sa-diff-low { background: #27ae60; }
+.sa-diff-medium { background: #e67e22; }
+.sa-diff-high { background: #c0392b; }
+
+/* Fuse cards */
+.sa-fuse-card { background: #252525; padding: 6px 8px; margin: 6px 0; border-radius: 4px; }
+.sa-fuse-card strong { color: #f1c40f; }

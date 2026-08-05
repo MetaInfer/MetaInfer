@@ -18,14 +18,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-def _open_trace(trace_path: Path):
+def _open_trace(trace_path):
     """Open a trace file — transparently handles .gz compression."""
-    if trace_path.suffix == ".gz":
-        return gzip.open(trace_path, "rt", encoding="utf-8")
-    return open(trace_path, "r", encoding="utf-8")
+    tp = Path(trace_path)
+    if tp.suffix == ".gz":
+        return gzip.open(tp, "rt", encoding="utf-8")
+    return open(tp, "r", encoding="utf-8")
 
 
-def parse_trace(trace_path: Path) -> Dict[str, Any]:
+def parse_trace(trace_path) -> Dict[str, Any]:
     """Load a Chrome trace JSON and return the top-level document.
 
     Returns:
