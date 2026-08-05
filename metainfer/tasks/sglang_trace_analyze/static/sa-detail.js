@@ -116,8 +116,14 @@ function Dashboard({ summary, detail, mapping, batchList, activeBatch, setActive
     acc += pct;
   }
 
+  const summaryText = buildSummary(kernels, cudaGraphOk, top);
+
   return html`
     <div class="sa-dashboard">
+      <div class="sa-summary-banner">
+        ${summaryText}
+      </div>
+
       ${/* Row 1: Quick stats */""}
       <div class="sa-stats-row">
         <div class="sa-stat-card">
@@ -480,6 +486,44 @@ function RooflinePanel({ kernels, gpu }) {
       <p class="sa-note">Ridge point: ${ridgePoint.toFixed(0)} ops/byte. Left of ridge = memory-bound. Right = compute-bound.</p>
     </div>
   `;
+}
+
+/* ── Executive Summary builder ── */
+
+function buildSummary(kernels, cudaGraph, top) {
+  if (!kernels || !kernels.length) return "No analysis data available.";
+
+  const parts = [];
+  parts.push(cudaGraph ? "CUDA Graph ON" : "CUDA Graph OFF");
+
+  if (top && top.category) {
+    parts.push(`${top.category} is your bottleneck (${(top.time_pct || 0).toFixed(0)}%)`);
+  }
+
+  // Find category insights
+  const cats = {};
+  for (const k of kernels) cats[k.category] = (cats[k.category] || 0) + (k.time_pct || 0);
+
+  const reducePct = cats["Reduce"] || 0;
+  if (reducePct < 10 && reducePct > 0) {
+    parts.push(`TP allreduce well-optimized (${reducePct.toFixed(0)}%)`);
+  }
+
+  const gemmPct = cats["GEMM"] || 0;
+  if (gemmPct > 20) {
+    parts.push(`quantize GEMMs to FP8 for ~${(gemmPct * 0.4).toFixed(0)}% improvement`);
+  }
+
+  const elementPct = cats["ElementWise"] || 0;
+  if (elementPct > 10) {
+    parts.push(`fuse element-wise ops to save ~${(elementPct * 0.3).toFixed(0)}%`);
+  }
+
+  if (!cudaGraph) {
+    parts.push("enable CUDA Graph for 3-5x speedup");
+  }
+
+  return parts.join(". ") + ".";
 }
 
 /* ── Key Findings auto-summary ── */
