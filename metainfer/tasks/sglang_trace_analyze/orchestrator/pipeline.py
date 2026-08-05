@@ -331,20 +331,11 @@ class Pipeline:
         any_ok = False
         for bs in self.batch_sizes:
             for stage in self.stages:
-                # Try formal traces first, fall back to mapping traces
-                trace_dir = self.workspace_dir / "traces" / f"bs_{bs}" / stage
-                if not trace_dir.exists():
-                    # Fallback: look for mapping trace subdir
-                    map_base = self.workspace_dir / "traces" / "mapping"
-                    if map_base.exists():
-                        ts_dirs = sorted(map_base.glob("*/"))  # timestamp subdirs
-                        if ts_dirs:
-                            trace_dir = ts_dirs[0]
-                        else:
-                            trace_dir = map_base
-                    else:
-                        print(f"[pipeline]   skipping bs_{bs}/{stage} — no trace dir")
-                        continue
+                # Priority: formal CUDA Graph ON traces > mapping traces
+                trace_dir = self._find_trace_dir(bs, stage)
+                if trace_dir is None:
+                    print(f"[pipeline]   skipping bs_{bs}/{stage} — no trace dir")
+                    continue
 
                 traces = sorted(trace_dir.glob("*DECODE*.trace.json.gz"))
                 if not traces:
@@ -537,6 +528,50 @@ class Pipeline:
         return False
 
     # ================================================================== #
+    #  Trace discovery
+    # ================================================================== #
+
+    def _find_trace_dir(self, bs: int, stage: str) -> Optional[Path]:
+        """Find the best trace directory for a (batch_size, stage) pair.
+
+        Priority: formal traces (CUDA Graph ON, under ``bs_<N>/``) >
+        mapping traces (CUDA Graph OFF, under ``mapping/``).
+
+        sglang ``--profile-by-stage`` saves traces inside a timestamp
+        subdirectory, so we look there first.
+        """
+        def _find_in(base: Path) -> Optional[Path]:
+            if not base.exists():
+                return None
+            # Direct: bs_8/decode/*.trace.json.gz
+            direct = base / stage
+            if direct.exists():
+                traces = list(direct.glob("*DECODE*.trace.json.gz"))
+                if traces:
+                    return direct
+            # Timestamp subdir: bs_8/<timestamp>/*.trace.json.gz
+            ts_dirs = sorted([d for d in base.iterdir() if d.is_dir()])
+            for ts in ts_dirs:
+                traces = list(ts.glob("*DECODE*.trace.json.gz"))
+                if traces:
+                    return ts
+            return None
+
+        # 1. Formal traces
+        formal_base = self.workspace_dir / "traces" / f"bs_{bs}"
+        found = _find_in(formal_base)
+        if found:
+            return found
+
+        # 2. Mapping traces
+        map_base = self.workspace_dir / "traces" / "mapping"
+        found = _find_in(map_base)
+        if found:
+            return found
+
+        return None
+
+    # ================================================================== #
     #  Helpers
     # ================================================================== #
 
@@ -696,6 +731,12 @@ class Pipeline:
         }
 
         overlap = build_overlap_report(trace_data, bs, stage)
+        # Detect CUDA Graph from trace filename: _graph_ = formal, _nograph_ = mapping
+        trace_name = str(trace_path)
+        if "_nograph_" in trace_name:
+            overlap["summary"]["cuda_graph_effective"] = False
+        elif "_graph_" in trace_name:
+            overlap["summary"]["cuda_graph_effective"] = True
         fuse = build_fuse_report(result_kernels, bs, stage)
 
         return {"kernel_table": kernel_table, "overlap": overlap, "fuse": fuse}
