@@ -18,7 +18,10 @@ class IterationRecord:
     failure_reason: Optional[str] = None
     phases: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     score: Dict[str, Any] = field(default_factory=dict)
-    hardware_profile: Dict[str, Any] = field(default_factory=dict)
+    measurement_report: Dict[str, str] = field(default_factory=dict)
+    profile_report: Dict[str, str] = field(default_factory=dict)
+    incumbent_measurement_report: Dict[str, str] = field(default_factory=dict)
+    incumbent_profile_report: Dict[str, str] = field(default_factory=dict)
     promoted: bool = False
     champion_iteration: int = 0
     artifacts: List[str] = field(default_factory=list)

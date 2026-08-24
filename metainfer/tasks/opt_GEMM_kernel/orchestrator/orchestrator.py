@@ -89,6 +89,7 @@ def run_with_requirements(
                 "METAINFER_WEIGHT_SHA256": weight_bundle.digest,
             },
             harness_argv=harness_argv,
+            benchmark_protocol=bundle.spec.benchmark_protocol,
         )
     initial_value = str(req_field(req, "initial_submission") or "").strip()
     initial_submission = Path(initial_value).expanduser().resolve() if initial_value else None

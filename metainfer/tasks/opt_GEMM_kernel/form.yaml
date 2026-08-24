@@ -38,7 +38,7 @@
   form: select
   options:
     - label: "Hygon K100"
-      description: "DTK/HIP gfx928 with fixed CMake + hipcc and rocprof profiling"
+      description: "DTK/HIP gfx928 with fixed CMake + hipcc and required hipprof trace/PMC profiling"
 
 - key: gpu_arch
   question: "Compiler target owned by the selected Hygon K100 profile."

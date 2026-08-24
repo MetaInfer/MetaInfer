@@ -1,50 +1,58 @@
-from ..orchestrator.evaluator.scoring import compare_measurements, score_benchmark
+from ..orchestrator.evaluator.scoring import (
+    compare_against_champion,
+    compare_measurements,
+)
 from ..orchestrator.evaluator.spec import AcceptanceSpec, BenchmarkCaseSpec
 
 
-def test_trace_weighted_score_and_critical_gate():
-    result = score_benchmark(
-        [
-            {"id": "hot", "baseline_ms": 10, "candidate_ms": 5, "weight": 9, "critical": True},
-            {"id": "cold", "baseline_ms": 10, "candidate_ms": 20, "weight": 1},
-        ],
-        ["hot", "cold"],
-        AcceptanceSpec(min_weighted_speedup=1.2, max_critical_regression=0.03),
+def _spec(case_id: str) -> BenchmarkCaseSpec:
+    return BenchmarkCaseSpec(
+        case_id,
+        shape={"m": 1, "n": 1, "k": 1, "batch": 1},
     )
-    assert result.passed
-    assert result.weighted_speedup == 100 / 65
+
+
+def test_every_shape_must_beat_the_frozen_baseline():
+    result = compare_measurements(
+        [
+            {"id": "hot", "latency_ms": 10.0},
+            {"id": "cold", "latency_ms": 10.0},
+        ],
+        [
+            {"id": "hot", "latency_ms": 5.0},
+            {"id": "cold", "latency_ms": 20.0},
+        ],
+        [_spec("hot"), _spec("cold")],
+        AcceptanceSpec(),
+    )
+    assert not result.passed
+    assert result.failed_case_ids == ["cold"]
+    assert result.worst_case_speedup == 0.5
 
 
 def test_missing_shape_is_a_hard_failure():
-    result = score_benchmark(
-        [{"id": "a", "baseline_ms": 1, "candidate_ms": 0.5}],
-        ["a", "b"],
+    result = compare_measurements(
+        [
+            {"id": "a", "latency_ms": 1.0},
+            {"id": "b", "latency_ms": 1.0},
+        ],
+        [{"id": "a", "latency_ms": 0.5}],
+        [_spec("a"), _spec("b")],
         AcceptanceSpec(),
     )
     assert not result.passed
     assert result.missing_case_ids == ["b"]
 
 
-def test_critical_regression_blocks_good_average():
-    result = score_benchmark(
-        [
-            {"id": "hot", "baseline_ms": 100, "candidate_ms": 50, "weight": 10},
-            {"id": "critical", "baseline_ms": 1, "candidate_ms": 1.1, "weight": 1, "critical": True},
-        ],
-        ["hot", "critical"],
-        AcceptanceSpec(max_critical_regression=0.03),
-    )
-    assert not result.passed
-    assert result.critical_regression > 0.09
-
-
 def test_non_finite_latency_is_rejected():
-    result = score_benchmark(
-        [{"id": "a", "baseline_ms": 1, "candidate_ms": float("nan")}],
-        ["a"],
+    result = compare_measurements(
+        [{"id": "a", "latency_ms": 1.0}],
+        [{"id": "a", "latency_ms": float("nan")}],
+        [_spec("a")],
         AcceptanceSpec(),
     )
     assert not result.passed
+    assert any("positive" in reason for reason in result.reasons)
 
 
 def test_profiler_rates_are_derived_from_frozen_case_spec():
@@ -52,7 +60,7 @@ def test_profiler_rates_are_derived_from_frozen_case_spec():
         [{"id": "gemm", "latency_ms": 2.0}],
         [{"id": "gemm", "latency_ms": 1.0, "flops": 1}],
         [BenchmarkCaseSpec(
-            "gemm", weight=1.0, critical=True,
+            "gemm",
             shape={"m": 1000, "n": 1000, "k": 1000, "batch": 1},
             flops=2_000_000_000.0,
             bytes=1_000_000_000.0,
@@ -62,3 +70,32 @@ def test_profiler_rates_are_derived_from_frozen_case_spec():
     case = result.cases[0]
     assert case["candidate_tflops"] == 2.0
     assert case["candidate_bandwidth_gbps"] == 1000.0
+
+
+def test_champion_noise_gate_requires_every_shape_to_cross_threshold():
+    result = compare_against_champion(
+        [
+            {"id": "a", "latency_ms": 1.0},
+            {"id": "b", "latency_ms": 2.0},
+        ],
+        [
+            {"id": "a", "latency_ms": 0.98},
+            {"id": "b", "latency_ms": 1.99},
+        ],
+        ["a", "b"],
+        0.01,
+    )
+    assert not result.passed
+    assert result.failed_case_ids == ["b"]
+
+
+def test_strict_baseline_gate_rejects_equal_latency():
+    result = compare_against_champion(
+        [{"id": "a", "latency_ms": 1.0}],
+        [{"id": "a", "latency_ms": 1.0}],
+        ["a"],
+        0.0,
+        strict=True,
+    )
+    assert not result.passed
+    assert result.failed_case_ids == ["a"]

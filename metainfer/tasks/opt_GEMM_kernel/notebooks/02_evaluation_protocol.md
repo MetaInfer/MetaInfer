@@ -1,111 +1,150 @@
 # Fixed evaluation protocol
 
-The task snapshots an external evaluator bundle into task state before the
-first agent runs. A SHA-256 manifest is checked before and after every system
-evaluation command. Compilation is not an evaluator command: MetaInfer owns
-the frozen BuildProfile, CMakeLists.txt and build.sh. The evaluator bundle
-contains only correctness and benchmark commands:
+The task snapshots the evaluator and weight bundles before any agent runs. Their
+SHA-256 manifests are verified at system gates. MetaInfer separately owns the
+BuildProfile, generated CMake, compiler, GPU architecture, hipprof command, and
+counter groups.
+
+The evaluator `task.yaml` contains the public contract, correctness command,
+profile entry point, correctness cases, exact benchmark shapes, and frozen
+hipprof protocol. It does not assign performance weights or criticality:
 
 ```yaml
 schema_version: 2
 name: example-gemm
 public_contract:
-  operation: "C = alpha * A @ B + beta * C"
-  dtype: {a: fp16, b: fp16, accumulation: fp32, c: fp16}
-  layout:
-    {a: row_major, b: row_major, c: row_major, trans_a: false, trans_b: false}
+  operation: "Y = scaled_int8_gemm(A, W, A_scale, W_scale)"
+  dtype: {a: int8, b: int8, accumulation: int32, c: bfloat16}
+  layout: {a: row_major, b: row_major, c: row_major}
   abi:
-    entrypoint: launch_gemm
-    signature: "launch_gemm(A, B, C, M, N, K, stream)"
+    entrypoint: launch_w8a8_gemm
+    signature: "launch_w8a8_gemm(A, W, A_scale, W_scale, Y, M, N, K, stream)"
 commands:
   correctness:
     argv: [python3, evaluate.py, correctness]
-    timeout_s: 1200
-  benchmark:
-    argv: [python3, evaluate.py, benchmark]
+    timeout_s: 7200
+  profile:
+    argv: [python3, evaluate.py]
     timeout_s: 1800
 cases:
-  correctness: [public-1, public-2, heldout-1]
+  correctness: [public-1, heldout-1]
   private: [heldout-1]
   benchmark:
     - id: decode-gemm
-      weight: 2000
-      critical: true
-      shape: {m: 1, n: 4096, k: 4096, batch: 1}
-      bytes: 33570816
+      shape: {m: 1, n: 4096, k: 4096}
+      bytes: 16797696
     - id: prefill-gemm
-      weight: 100
-      critical: false
-      shape: {m: 2048, n: 4096, k: 4096, batch: 1}
-      bytes: 67108864
+      shape: {m: 4096, n: 4096, k: 4096}
+      bytes: 50331648
 benchmark_protocol:
   warmup: 10
   samples: 100
-  timer: gpu_event
+  trace_calls: 110
+  timer: hipprof_gpu_kernel_duration_ns
+  statistic: arithmetic_mean
+  operator_aggregation: sum_gpu_kernel_duration_per_call
+  synchronization: hipprof_trace
+  timed_scope: operator_gpu_dispatches_only
+  host_launch_time_included: false
+  pmc_timing_used: false
 acceptance:
-  min_weighted_speedup: 1.01
   noise_threshold: 0.01
-  max_critical_regression: 0.03
-  require_all_cases: true
 ```
 
-Each command writes JSON to `METAINFER_REPORT_PATH`.
+`public_contract` is the only source of truth for dtype, layout, numerics, and
+candidate ABI. Benchmark `shape` is mandatory. Frozen optional `flops` and
+`bytes` metadata is used only to derive diagnostic TFLOPS or modeled bandwidth;
+it does not affect pass/fail.
 
-`public_contract` is mandatory and is the only source of truth for dtype,
-layout and candidate ABI. Benchmark case `shape` is mandatory. The creation UI
-does not ask the task owner to duplicate these fields: after the evaluator is
-frozen, the task detail page renders the extracted contract read-only and the
-orchestrator injects exactly the same contract into planner/implementer
-prompts.
+## Correctness and performance reports
 
-Correctness report:
+The correctness command writes JSON to `METAINFER_REPORT_PATH`:
 
 ```json
 {
   "passed": true,
   "cases": [
-    {"id": "public-1", "passed": true, "max_abs_error": 0.001}
+    {"id": "public-1", "passed": true, "max_abs_error": 0.0}
   ]
 }
 ```
 
-Benchmark report:
+Performance is not supplied by an agent-authored benchmark command. The
+system-owned profiler runs the frozen task-local hipprof suite and constructs a
+canonical benchmark report from trace operator times:
 
 ```json
 {
+  "schema_version": 2,
   "passed": true,
-  "methodology": {"warmup": 10, "samples": 100, "timer": "gpu_event"},
+  "methodology": {
+    "warmup": 10,
+    "samples": 100,
+    "trace_calls": 110,
+    "timer": "hipprof_gpu_kernel_duration_ns",
+    "statistic": "arithmetic_mean",
+    "operator_aggregation": "sum_gpu_kernel_duration_per_call",
+    "synchronization": "hipprof_trace",
+    "timed_scope": "operator_gpu_dispatches_only",
+    "host_launch_time_included": false,
+    "pmc_timing_used": false
+  },
+  "timing_source": "hipprof GPU kernel DurationNs",
+  "timed_scope": "operator_gpu_dispatches_only",
+  "profile_report": {
+    "path": "logs/001/candidate-hardware-profile.json",
+    "sha256": "..."
+  },
   "cases": [
     {
       "id": "decode-gemm",
-      "latency_ms": 0.11
+      "latency_ms": 0.011,
+      "shape": {"m": 1, "n": 4096, "k": 4096},
+      "dispatch_count": 2,
+      "kernel_breakdown_us": {"split": 8.0, "reduce": 3.0}
     }
   ]
 }
 ```
 
-Before any optimizer runs, the system compiles the original submission and
-runs correctness and benchmark with `METAINFER_EVALUATION_ROLE=baseline`.
-That report and its BuildProfile fingerprint are frozen. Candidate runs use
-`role=candidate`; they only report their own latency. Weight and criticality
-come from task.yaml, not from measurement reports.
+The methodology must exactly match the frozen protocol. Expected case IDs must
+have a one-to-one mapping to finite positive latency values; missing, duplicate,
+or unexpected cases fail validation. Each logical call's latency is the sum of
+all related GPU dispatch `DurationNs`. PMC replay duration cannot populate
+`latency_ms`.
 
-For GEMM profiler display, each benchmark case may declare `shape` and
-`bytes`. When `shape` is present, the frozen spec derives FLOPs as
-`2 * M * N * K * batch`; an explicit positive `flops` value overrides that
-derivation for fused or non-standard work. `bytes` is the task author's
-declared total device-memory traffic for the case and should include every
-tensor read/write required by the ABI. Candidate reports never provide these
-values.
+## Every-shape gates
 
-The methodology object must exactly match `benchmark_protocol` for both
-baseline and candidate. The orchestrator computes weighted speedup as:
+For every frozen benchmark case:
 
 ```text
-sum(weight_i * baseline_ms_i) / sum(weight_i * candidate_ms_i)
+candidate_ms < triton_baseline_ms
+candidate_ms < champion_ms * (1 - noise_threshold)
 ```
 
-The UI derives profiler rates from the frozen work metadata and measured
+Champion evaluation uses a strict boundary where required by promotion so an
+equality at the threshold cannot become a hidden improvement. A failure on any
+shape rejects the candidate. `worst_case_speedup` and failed IDs are diagnostics,
+not aggregate substitutes for the gate.
+
+## Performance report as source of truth
+
+Canonical reports are written atomically and referenced by task-state-relative
+path plus SHA-256:
+
+```text
+baseline/baseline-benchmark-report.json
+certified/initial-hip/candidate-benchmark-report.json
+logs/<NNN>/candidate-benchmark-report.json
+```
+
+The Champion v2 record stores its submission digest and measurement-report
+reference, not copied per-shape latency or an aggregate score. Promotion and
+cold restart verify the digest and reload the referenced report. Iteration score,
+timeline, and API summaries are derived historical views and cannot drive a
+future promotion.
+
+The UI derives optional rates only from frozen work metadata and authoritative
 latency:
 
 ```text
@@ -113,5 +152,5 @@ TFLOPS = flops / latency_ms / 1e9
 GB/s   = bytes / latency_ms / 1e6
 ```
 
-If `shape`/`flops` or `bytes` is omitted, latency and speedup remain valid and
-the corresponding TFLOPS or bandwidth tile is shown as unavailable.
+If optional work metadata is absent, latency and the all-shape gate remain valid
+while the corresponding rate is unavailable.

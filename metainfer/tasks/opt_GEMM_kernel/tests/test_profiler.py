@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import subprocess
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 from ..orchestrator.hardware import HardwareProfileError, require_hardware_profile
 from ..orchestrator.profiler import (
     FrozenProfilerProfile, ProfilerError, ProfilerRunner, _parse_case,
-    _validate_harness_profile, _version,
+    _python_executable, _validate_harness_profile, _version,
 )
 
 
@@ -46,6 +47,14 @@ def test_legacy_rocprof_help_is_stable_version_fallback(monkeypatch):
     assert _version("/opt/dtk/rocprofiler/bin/rocprof") == (
         "ROCm Profiling Library (RPL) run script\nUsage: rocprof ..."
     )
+
+
+def test_python_executable_ignores_launcher_argv0(monkeypatch):
+    monkeypatch.setattr(
+        "metainfer.tasks.opt_GEMM_kernel.orchestrator.profiler.sys.executable",
+        "/usr/local/bin/metainfer-orchestrator",
+    )
+    assert Path(_python_executable()).name.startswith("python")
 
 
 def test_rocprof_csv_is_normalized_for_ui_and_f_agent(tmp_path: Path):
@@ -141,3 +150,92 @@ def test_harness_profile_must_match_requested_case(tmp_path: Path):
     _validate_harness_profile(tmp_path, "wq-b-tp4-m16")
     with pytest.raises(ProfilerError, match="does not match"):
         _validate_harness_profile(tmp_path, "wq-b-tp4-m1")
+
+
+def _analyzer_module():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "harness" / "user_gemm" / "analyze_hipprof_suite.py"
+    )
+    spec = importlib.util.spec_from_file_location("gemm_hipprof_analyzer", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_trace_operator_time_sums_all_dispatches_per_final_sample():
+    analyzer = _analyzer_module()
+    case = {
+        "id": "split-k",
+        "host_epoch_begin_ns": 100,
+        "host_epoch_end_ns": 1000,
+    }
+    rows = [
+        {"begin_ns": 50, "duration_ns": 9999, "kernel_name": "prepare"},
+        {"begin_ns": 100, "duration_ns": 900, "kernel_name": "split"},
+        {"begin_ns": 110, "duration_ns": 100, "kernel_name": "split"},
+        {"begin_ns": 120, "duration_ns": 100, "kernel_name": "reduce"},
+        {"begin_ns": 200, "duration_ns": 100, "kernel_name": "split"},
+        {"begin_ns": 210, "duration_ns": 200, "kernel_name": "split"},
+        {"begin_ns": 220, "duration_ns": 50, "kernel_name": "reduce"},
+        {"begin_ns": 300, "duration_ns": 150, "kernel_name": "split"},
+        {"begin_ns": 310, "duration_ns": 250, "kernel_name": "split"},
+        {"begin_ns": 320, "duration_ns": 100, "kernel_name": "reduce"},
+        {"begin_ns": 1100, "duration_ns": 9999, "kernel_name": "post"},
+    ]
+    operator_us, breakdown, dispatches, samples = analyzer._trace_case_times(
+        rows, case, calls=3, samples=2
+    )
+    assert operator_us == pytest.approx(0.425)
+    assert breakdown == pytest.approx({"split": 0.35, "reduce": 0.075})
+    assert dispatches == 3
+    assert samples == pytest.approx([0.35, 0.5])
+
+
+def test_trace_rejects_unstable_final_dispatch_pattern():
+    analyzer = _analyzer_module()
+    case = {
+        "id": "unstable",
+        "host_epoch_begin_ns": 100,
+        "host_epoch_end_ns": 1000,
+    }
+    rows = [
+        {"begin_ns": 100, "duration_ns": 10, "kernel_name": "main"},
+        {"begin_ns": 110, "duration_ns": 10, "kernel_name": "reduce"},
+        {"begin_ns": 200, "duration_ns": 10, "kernel_name": "main"},
+        {"begin_ns": 210, "duration_ns": 10, "kernel_name": "other"},
+    ]
+    with pytest.raises(RuntimeError, match="unstable measured dispatch pattern"):
+        analyzer._trace_case_times(rows, case, calls=2, samples=2)
+
+
+def test_pmc_is_normalized_per_call_and_replay_duration_is_not_latency():
+    analyzer = _analyzer_module()
+    case = {
+        "id": "pmc",
+        "host_monotonic_begin_ns": 100,
+        "host_monotonic_end_ns": 1000,
+    }
+    rows = [
+        {
+            "BeginNs": str(begin),
+            "DurationNs": str(duration),
+            "KernelName": kernel,
+            "TCC_EA_RDREQ[0]": "1",
+            "TCC_EA_RDREQ_32B[0]": "1",
+            "TCC_EA_WRREQ[0]": "1",
+            "TCC_EA_WRREQ_64B[0]": "0",
+        }
+        for begin, duration, kernel in (
+            (100, 1_000_000, "split"),
+            (110, 2_000_000, "reduce"),
+            (200, 3_000_000, "split"),
+            (210, 4_000_000, "reduce"),
+        )
+    ]
+    counters = analyzer._aggregate_counters(rows, case, calls=2)
+    assert counters["dispatch_count"] == 2
+    assert counters["hbm_read_bytes"] == 64
+    assert counters["hbm_write_bytes"] == 64
+    assert "duration" not in counters

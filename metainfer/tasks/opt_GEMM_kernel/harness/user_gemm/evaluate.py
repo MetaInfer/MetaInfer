@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Python evaluator for opt_GEMM_kernel — Triton as reference and baseline.
+"""Frozen correctness harness and hipprof workload driver.
 
-Replaces evaluate_native.cpp.  Uses Triton matmul_int8 as the correctness
-reference AND as the performance baseline, so the MetaInfer optimization
-loop chases Triton-level (MFMA) throughput.
+Triton is the independent correctness reference and the frozen performance
+baseline. Performance measurements are produced only by task-local hipprof
+trace collection around ``profile-batch`` steady-state GPU dispatches.
 
 Phases:
-  correctness  – candidate vs Triton, per-element comparison
-  benchmark    – GPU-event timed measurement (Triton for baseline role,
-                 candidate .so for candidate role)
-  profile      – single candidate launch (wrapped by rocprof)
+  correctness   – candidate vs Triton, per-element comparison
+  profile-batch – all public cases, repeated steady-state calls for hipprof
 """
 
 from __future__ import annotations
@@ -365,158 +363,72 @@ def _run_triton_correctness_case(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# benchmark
+# hipprof workload
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _benchmark_case_triton(
-    weights: WeightStore,
-    case: Case,
-    device: torch.device,
-    warmup: int,
-    samples: int,
-) -> Dict[str, Any]:
-    """Benchmark Triton matmul_int8 with GPU events."""
-    a_bf16, a_int8, a_scale = _generate_activation(case)
-    w_int8_np, w_scale_np = weights.derive(case)
-
-    a_int8_dev = a_int8.to(device)
-    a_scale_dev = a_scale.to(device)
-    w_int8_dev = torch.from_numpy(w_int8_np).to(device)
-    w_scale_dev = torch.from_numpy(w_scale_np).to(device)
-
-    # Warmup
-    for _ in range(warmup):
-        matmul_int8(a_int8_dev, a_scale_dev, w_int8_dev, w_scale_dev, torch.bfloat16, None)
-    torch.cuda.synchronize()
-
-    values = []
-    for _ in range(samples):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        matmul_int8(a_int8_dev, a_scale_dev, w_int8_dev, w_scale_dev, torch.bfloat16, None)
-        end.record()
-        torch.cuda.synchronize()
-        values.append(start.elapsed_time(end))
-
-    values.sort()
-    latency = values[len(values) // 2]
-    flops = 2.0 * case.m * case.n * case.k
-    # rough byte count: A(bf16)+W(int8)+scales+output(bf16)
-    nbytes = (case.m * case.k * 2 + case.k * case.n * 1
-              + case.m * 4 + case.n * 4 + case.m * case.n * 2)
-
-    return {
-        "id": case.id,
-        "latency_ms": latency,
-        "min_ms": values[0],
-        "max_ms": values[-1],
-        "tops": flops / (latency * 1e9),
-        "bandwidth_gbps": nbytes / (latency * 1e6),
-    }
-
-
-def _benchmark_case_candidate(
+def _profile_batch_case_candidate(
     candidate: Candidate,
     weights: WeightStore,
     case: Case,
     device: torch.device,
-    warmup: int,
-    samples: int,
-) -> Dict[str, Any]:
-    """Benchmark candidate .so with GPU events."""
-    a_bf16, a_int8, a_scale = _generate_activation(case)
+    calls: int,
+) -> Tuple[int, int, int, int]:
+    """Prepare once, then enqueue exactly ``calls`` candidate invocations."""
+    _, a_int8, a_scale = _generate_activation(case)
     w_int8_np, w_scale_np = weights.derive(case)
-
-    a_int8_dev = a_int8.to(device)
-    a_scale_dev = a_scale.to(device)
-    w_int8_dev = torch.from_numpy(w_int8_np).to(device)
-    w_scale_dev = torch.from_numpy(w_scale_np).to(device)
+    a_dev = a_int8.to(device)
+    as_dev = a_scale.to(device)
+    w_dev = torch.from_numpy(w_int8_np).to(device)
+    ws_dev = torch.from_numpy(w_scale_np).to(device)
     y = torch.empty((case.m, case.n), dtype=torch.bfloat16, device=device)
-
-    # Warmup
-    for _ in range(warmup):
-        ret = candidate.launch(a_int8_dev, w_int8_dev, a_scale_dev, w_scale_dev, y)
-        if ret != 0:
-            raise RuntimeError(f"candidate returned non-zero for {case.id}")
-    torch.cuda.synchronize()
-
-    values = []
-    for _ in range(samples):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        ret = candidate.launch(a_int8_dev, w_int8_dev, a_scale_dev, w_scale_dev, y)
-        if ret != 0:
-            raise RuntimeError(f"candidate returned non-zero for {case.id}")
-        end.record()
-        torch.cuda.synchronize()
-        values.append(start.elapsed_time(end))
-
-    values.sort()
-    latency = values[len(values) // 2]
-    flops = 2.0 * case.m * case.n * case.k
-    nbytes = (case.m * case.k * 2 + case.k * case.n * 1
-              + case.m * 4 + case.n * 4 + case.m * case.n * 2)
-
-    return {
-        "id": case.id,
-        "latency_ms": latency,
-        "min_ms": values[0],
-        "max_ms": values[-1],
-        "tops": flops / (latency * 1e9),
-        "bandwidth_gbps": nbytes / (latency * 1e6),
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# profile
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _profile_case(
-    candidate: Candidate,
-    weights: WeightStore,
-    case: Case,
-    device: torch.device,
-) -> None:
-    """Single candidate launch for rocprof capture."""
-    a_bf16, a_int8, a_scale = _generate_activation(case)
-    w_int8_np, w_scale_np = weights.derive(case)
-
-    a_int8_dev = a_int8.to(device)
-    a_scale_dev = a_scale.to(device)
-    w_int8_dev = torch.from_numpy(w_int8_np).to(device)
-    w_scale_dev = torch.from_numpy(w_scale_np).to(device)
-    y = torch.empty((case.m, case.n), dtype=torch.bfloat16, device=device)
-
-    torch.cuda.synchronize()
-    ret = candidate.launch(a_int8_dev, w_int8_dev, a_scale_dev, w_scale_dev, y)
+    # Complete one-time weight packing, workspace allocation, and lazy runtime
+    # setup before the profiler's marked steady-state interval.
+    ret = candidate.launch(a_dev, w_dev, as_dev, ws_dev, y)
     if ret != 0:
         raise RuntimeError(f"candidate returned non-zero for {case.id}")
     torch.cuda.synchronize()
+    begin_ns = time.monotonic_ns()
+    begin_epoch_ns = time.time_ns()
+    print(
+        f"PROFILE_GROUP,candidate,{case.id},{case.m},{case.n},{case.k},"
+        f"calls={calls}", flush=True,
+    )
+    for _ in range(calls):
+        ret = candidate.launch(a_dev, w_dev, as_dev, ws_dev, y)
+        if ret != 0:
+            raise RuntimeError(f"candidate returned non-zero for {case.id}")
+    torch.cuda.synchronize()
+    return begin_ns, time.monotonic_ns(), begin_epoch_ns, time.time_ns()
 
 
-def _profile_case_triton(
+def _profile_batch_case_triton(
     weights: WeightStore,
     case: Case,
     device: torch.device,
-) -> None:
-    """Warm up Triton JIT, then launch exactly one profiled invocation."""
+    calls: int,
+) -> Tuple[int, int, int, int]:
+    """JIT before the marked group, then enqueue fixed Triton invocations."""
     _, a_int8, a_scale = _generate_activation(case)
     w_int8_np, w_scale_np = weights.derive(case)
-    a_int8_dev = a_int8.to(device)
-    a_scale_dev = a_scale.to(device)
-    w_int8_dev = torch.from_numpy(w_int8_np).to(device)
-    w_scale_dev = torch.from_numpy(w_scale_np).to(device)
-    # Triton's disk cache is populated by certification benchmark. This is
-    # the single matmul invocation observed by hipprof in this process.
-    matmul_int8(
-        a_int8_dev, a_scale_dev, w_int8_dev, w_scale_dev,
-        torch.bfloat16, None,
-    )
+    a_dev = a_int8.to(device)
+    as_dev = a_scale.to(device)
+    w_dev = torch.from_numpy(w_int8_np).to(device)
+    ws_dev = torch.from_numpy(w_scale_np).to(device)
+    # Force JIT/allocation before the group marker. The analyzer uses the
+    # manifest and final repeated core launches, never this preparation call.
+    matmul_int8(a_dev, as_dev, w_dev, ws_dev, torch.bfloat16, None)
     torch.cuda.synchronize()
+    begin_ns = time.monotonic_ns()
+    begin_epoch_ns = time.time_ns()
+    print(
+        f"PROFILE_GROUP,triton,{case.id},{case.m},{case.n},{case.k},"
+        f"calls={calls}", flush=True,
+    )
+    for _ in range(calls):
+        matmul_int8(a_dev, as_dev, w_dev, ws_dev, torch.bfloat16, None)
+    torch.cuda.synchronize()
+    return begin_ns, time.monotonic_ns(), begin_epoch_ns, time.time_ns()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -526,11 +438,11 @@ def _profile_case_triton(
 
 def main() -> None:
     phase = sys.argv[1]
-    is_profile = phase == "profile"
-    is_eval = phase in ("correctness", "benchmark")
-    if not is_profile and not is_eval:
+    is_profile_batch = phase == "profile-batch"
+    is_correctness = phase == "correctness"
+    if not is_profile_batch and not is_correctness:
         raise RuntimeError(
-            "usage: evaluate.py correctness|benchmark|profile CASE_ID"
+            "usage: evaluate.py correctness|profile-batch candidate|triton CALLS"
         )
 
     report_path = Path(_env("METAINFER_REPORT_PATH"))
@@ -544,24 +456,54 @@ def main() -> None:
     device = torch.device("cuda:0")
 
     weights = WeightStore(weight_root)
-    candidate = None if role == "baseline" else Candidate(artifact_dir)
+    batch_impl = sys.argv[2] if is_profile_batch and len(sys.argv) > 2 else ""
+    needs_candidate = role != "baseline" and (
+        not is_profile_batch or batch_impl == "candidate")
+    candidate = Candidate(artifact_dir) if needs_candidate else None
 
-    if is_profile:
-        case_id = sys.argv[2]
+    if is_profile_batch:
+        if batch_impl not in ("candidate", "triton"):
+            raise RuntimeError("profile-batch implementation must be candidate or triton")
+        calls = int(sys.argv[3]) if len(sys.argv) > 3 else 120
+        if calls <= 0:
+            raise RuntimeError("profile-batch calls must be positive")
+        if batch_impl == "candidate" and candidate is None:
+            raise RuntimeError("candidate profile requested without candidate artifact")
         cases = _public_cases()
-        found = next((c for c in cases if c.id == case_id), None)
-        if found is None:
-            raise RuntimeError(f"unknown public profile case: {case_id}")
-        if role == "baseline":
-            _profile_case_triton(weights, found, device)
-        else:
-            assert candidate is not None
-            _profile_case(candidate, weights, found, device)
+        selected = {
+            token.strip() for token in os.environ.get(
+                "METAINFER_PROFILE_CASE_IDS", ""
+            ).split(",") if token.strip()
+        }
+        if selected:
+            known = {case.id for case in cases}
+            unknown = sorted(selected - known)
+            if unknown:
+                raise RuntimeError(f"unknown profile case ids: {unknown}")
+            cases = [case for case in cases if case.id in selected]
+        profiled_cases = []
+        for found in cases:
+            if batch_impl == "triton":
+                begin_ns, end_ns, begin_epoch_ns, end_epoch_ns = _profile_batch_case_triton(
+                    weights, found, device, calls)
+            else:
+                assert candidate is not None
+                begin_ns, end_ns, begin_epoch_ns, end_epoch_ns = _profile_batch_case_candidate(
+                    candidate, weights, found, device, calls)
+            profiled_cases.append({
+                "id": found.id, "m": found.m, "n": found.n, "k": found.k,
+                "host_monotonic_begin_ns": begin_ns,
+                "host_monotonic_end_ns": end_ns,
+                "host_epoch_begin_ns": begin_epoch_ns,
+                "host_epoch_end_ns": end_epoch_ns,
+            })
         write_json(report_path, {
             "passed": True,
-            "case_id": found.id,
-            "implementation": "triton" if role == "baseline" else "candidate",
-            "timed_scope": "launch_w8a8_gemm_only",
+            "implementation": batch_impl,
+            "calls_per_case": calls,
+            "case_ids": [case.id for case in cases],
+            "cases": profiled_cases,
+            "timed_scope": "core implementation launches only",
         })
         return
 
@@ -591,37 +533,6 @@ def main() -> None:
             report["cases"].append(case_result)
         write_json(report_path, report)
         return
-
-    if phase == "benchmark":
-        protocol = json.loads(_env("METAINFER_BENCHMARK_PROTOCOL"))
-        warmup = int(protocol["warmup"])
-        samples = int(protocol["samples"])
-        all_cases = _public_cases()
-        cases_out = []
-        for c in all_cases:
-            try:
-                if role == "baseline":
-                    item = _benchmark_case_triton(weights, c, device, warmup, samples)
-                else:
-                    assert candidate is not None
-                    item = _benchmark_case_candidate(
-                        candidate, weights, c, device, warmup, samples
-                    )
-            except Exception as exc:
-                write_json(
-                    report_path,
-                    {"passed": False, "reason": str(exc), "cases": []},
-                )
-                sys.exit(2)
-            cases_out.append(item)
-        write_json(report_path, {
-            "passed": True,
-            "methodology": protocol,
-            "timed_scope": "launch_w8a8_gemm_only",
-            "activation_quantization_timed": False,
-            "weight_loading_or_preprocessing_timed": False,
-            "cases": cases_out,
-        })
 
 
 def write_json(path: Path, data: Dict[str, Any]) -> None:

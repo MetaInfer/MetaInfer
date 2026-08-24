@@ -1,10 +1,9 @@
 # K100 / gfx928 fixed profiling route
 
-The WebUI's `Hygon K100` selection resolves one system-owned execution
-profile. Agents do not select tools or construct commands.
+The Web UI's `Hygon K100` selection resolves one system-owned build and profile.
+Agents do not select tools, construct commands, or provide timing results.
 
-The compilation route is equivalent to the C++ framework task's hardware
-binding:
+## Frozen build
 
 ```text
 cmake -S system_build -B ITER_BUILD -G Ninja \
@@ -13,68 +12,89 @@ cmake --build ITER_BUILD --target \
   metainfer_gemm_candidate metainfer_gemm_harness
 ```
 
-The generated CMake freezes the resolved DTK `hipcc`, Release `-O3`, C++/HIP
-17, and `HIP_ARCHITECTURES=gfx928`. Exact resolved paths, versions, commands,
-flags and the profile fingerprint are written to the compile report.
+The generated build freezes the resolved DTK `hipcc`, Release `-O3`, C++/HIP 17,
+and `HIP_ARCHITECTURES=gfx928`. Resolved paths, versions, flags, architecture,
+and the BuildProfile fingerprint are written to the compile report.
 
-E first consumes the Harness GPU-event benchmark for every weighted shape.
-It then invokes the Harness as `profile CASE_ID` for M=1, M=16 and M=4096 of
-the public `wq_b TP=4` workload. On the K100 DTK installation, the preferred
-system command is:
+## Required hipprof suite
 
-```text
-hipprof --pmc --pmc-type 3 -o <SYSTEM_OUTPUT_BASE> \
-  metainfer_gemm_harness profile <CASE_ID>
-```
-
-`--pmc-type 3` produces a CSV table. Per-instance columns such as
-`TCC_HIT[0..31]` and `TCC_MISS[0..31]` are summed by MetaInfer before L2 rates
-are derived. Multiple dispatches (for example split-K plus its reduction) are
-retained in the normalized case report. PMC timings are diagnostic only and do
-not replace the Harness GPU-event benchmark. A PMC CSV is accepted only when
-the same invocation writes a successful `harness-profile.json` whose
-`case_id` exactly matches the requested case. Since the profile entrypoint
-performs all preparation and synchronization before its single candidate
-launch, the captured kernel dispatches belong to that case; a split-K main
-kernel and its reduction are deliberately retained together.
-
-If hipprof is unavailable, rocprofv3 has this fixed shape:
+K100 performance uses only the frozen task-local hipprof suite:
 
 ```text
-rocprofv3 --pmc <FROZEN_GROUP> --output-format csv json \
-  --output-directory <SYSTEM_OUTPUT> \
-  --kernel-include-regex w8a8_scaled_ -- \
-  metainfer_gemm_harness profile <CASE_ID>
+<resolved-python> <FROZEN_HARNESS>/run_hipprof_suite.py \
+  --hipprof /opt/dtk/bin/hipprof --output-dir <SYSTEM_OUTPUT>
+<resolved-python> <FROZEN_HARNESS>/analyze_hipprof_suite.py <SYSTEM_OUTPUT>
 ```
 
-For a DTK installation that provides legacy rocprof, the fixed fallback is:
+The active K100 profile accepts hipprof only. A missing executable, suite,
+analyzer, shape, pass, or matching profiler/protocol fingerprint is an
+infrastructure failure. There is no GPU Event, rocprofv3, legacy rocprof, or
+PMC-duration latency fallback.
+
+For both Triton and candidate, the suite performs one trace collection and
+separate `--pmc`, `--pmc-read`, and `--pmc-write` collections. Tensor generation,
+quantization, weight loading/packing, workspace allocation, candidate setup,
+Triton JIT, and synchronization complete before each marked host interval. Only
+repeated steady-state GEMM calls occur inside the interval.
+
+## Trace operator latency
+
+Every shape has 110 trace calls. The first 10 are warmup and the final 100 are
+measured. hipprof trace rows are selected using the manifest's realtime host
+boundaries. Legacy manifests without realtime boundaries may translate their
+monotonic interval with a boot-stable realtime-minus-monotonic offset; a warmup
+kernel timestamp is not used to infer that offset.
+
+The analyzer verifies:
+
+1. trace, PMC, read, and write manifests contain the same case IDs and M/N/K;
+2. manifest call counts match the frozen collection protocol;
+3. selected dispatch counts divide exactly into logical calls;
+4. final measured calls have a stable kernel dispatch pattern.
+
+For one logical call:
 
 ```text
-rocprof -i <SYSTEM_COUNTER_FILE> -o <SYSTEM_OUTPUT.csv> \
-  --timestamp on metainfer_gemm_harness profile <CASE_ID>
+operator_us = sum(DurationNs of every related GPU dispatch) / 1000
 ```
 
-The available-counter query is performed once when the profile is frozen;
-unsupported names are removed from the whitelist rather than guessed. Tool
-path, version, counter groups and representative shapes are fingerprinted.
-Profiler failure is an E-stage infrastructure failure for this K100 profile.
+The reported latency is the arithmetic mean of the final 100 `operator_us`
+values. Repeated same-name dispatches are first summed within a call, then their
+per-call contributions are averaged for the kernel breakdown. The longest
+kernel name is only a resource-label hint; it never replaces operator latency.
+Host launch API and synchronization time are outside this metric.
 
-The hardware profile is diagnostic evidence for F. Champion promotion remains
-owned by correctness plus the complete weighted multi-shape event benchmark;
-the three profiler cases do not replace or reweight that score.
+## PMC diagnostics
 
-# Interpretation checklist
+DTK hipprof `--pmc-type 3` internally replays hardware counter groups and emits
+merged indexed columns per original dispatch. The analyzer sums indexed values
+such as `TCC_HIT[0..N]` and `TCC_MISS[0..N]`, and aggregates every operator
+dispatch before normalizing by logical call count.
 
-Record the target GPU and exact compiler flags before interpreting profiler
-data. Useful signals include achieved occupancy, waves/SM or waves/CU, register
-and shared-memory pressure, memory transaction efficiency, cache hit rate,
-tensor-core/MFMA utilization, synchronization stalls and launch count.
+Separate read/write passes derive physical HBM request bytes and bandwidth.
+The compact report retains, when actually reported:
 
-Do not optimize a single profiler counter in isolation. A lower occupancy
-kernel may still win through better instruction-level parallelism or data
-reuse. Conversely, a headline speedup smaller than run-to-run noise is not a
-promotion.
+- HBM read/write bytes and read/write/total GB/s;
+- L2 hit percentage;
+- VGPR, AGPR, SGPR, LDS, and scratch for the selected resource-label kernel;
+- grid size, workgroup size, wave size, waves per workgroup, and dispatch count;
+- occupancy or wave-residency only when hipprof exposes a reliable field.
 
-Use public per-shape results to identify the class that changed. Held-out
-results are deliberately summarized so implementation choices generalize
-rather than overfit case IDs.
+Replay `DurationNs` or `DispatchNs` is instrumentation time and is never copied
+into benchmark latency. `occupancy_pct` remains unavailable rather than being
+estimated from incomplete metadata.
+
+## Interpretation checklist
+
+Start from every shape's summed operator latency and dispatch breakdown. Use PMC
+to test a bounded hypothesis, for example excessive physical HBM traffic, weak
+L2 reuse, high register/LDS pressure, partial/reduction overhead, or insufficient
+parallelism. Do not optimize one counter in isolation: lower occupancy can win
+through data reuse or instruction-level parallelism, while higher bandwidth can
+still lose if it increases dispatch or reduction work.
+
+A performance improvement is accepted only if every frozen shape beats Triton
+and every shape crosses the current Champion noise threshold. Representative
+cases may guide diagnosis, but the profiler report and promotion gate retain all
+60 shapes. Notebook timings and older profiler records are historical evidence,
+not current service-level targets.

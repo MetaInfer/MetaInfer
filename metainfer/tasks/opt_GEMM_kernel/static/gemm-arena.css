@@ -23,6 +23,10 @@
 .gemm-contract-grid code, .gemm-contract-grid pre { display: block; margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .gemm-contract-wide { grid-column: 1 / -1; }
 .gemm-kpis { display: grid; grid-template-columns: repeat(5, minmax(130px, 1fr)); gap: .75rem; }
+.gemm-section-heading { align-items: flex-start; display: flex; gap: 1rem; justify-content: space-between; }
+.gemm-section-heading h2, .gemm-section-heading p { margin-top: 0; }
+.gemm-case-picker { display: grid; gap: .3rem; min-width: min(360px, 40vw); }
+.gemm-case-picker span { color: #8b949e; font-size: .75rem; text-transform: uppercase; }
 .gemm-kpi { border: 1px solid var(--border, #30363d); border-radius: .5rem; padding: .75rem; background: rgba(88, 166, 255, .04); }
 .gemm-kpi span { color: var(--muted, #8b949e); display: block; font-size: .75rem; margin-bottom: .35rem; text-transform: uppercase; }
 .gemm-kpi strong { color: #e6edf3; font-size: 1.15rem; }
@@ -42,4 +46,6 @@
   .gemm-kpis, .gemm-profiler-grid, .gemm-contract-grid { grid-template-columns: 1fr; }
   .gemm-contract-wide { grid-column: auto; }
   .gemm-guidance-compose { grid-template-columns: 1fr; }
+  .gemm-section-heading { display: grid; }
+  .gemm-case-picker { min-width: 100%; }
 }

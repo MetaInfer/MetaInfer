@@ -5,16 +5,22 @@ import { Chart, registerables } from "chart.js";
 Chart.register(...registerables);
 
 const DEFINITIONS = [
-  ["latency_ms", "Weighted latency", "ms", "#58a6ff"],
-  ["weighted_speedup", "Speedup vs baseline", "×", "#3fb950"],
+  ["latency_ms", "Case latency", "ms", "#58a6ff"],
+  ["speedup", "Case speedup vs baseline", "×", "#3fb950"],
   ["tflops", "Compute throughput", "TFLOPS", "#d29922"],
   ["bandwidth_gbps", "Modelled bandwidth", "GB/s", "#f778ba"],
-  ["measured_bandwidth_gbps", "Profiler memory bandwidth", "GB/s", "#ff9b71"],
+  ["measured_bandwidth_gbps", "HBM total bandwidth", "GB/s", "#ff9b71"],
+  ["hbm_read_gbps", "HBM read bandwidth", "GB/s", "#fb7185"],
+  ["hbm_write_gbps", "HBM write bandwidth", "GB/s", "#fdba74"],
   ["l2_hit_pct", "L2 hit rate", "%pts", "#2dd4bf"],
-  ["compute_busy_pct", "Compute busy", "%pts", "#f59e0b"],
+  ["occupancy_pct", "Reported occupancy", "%pts", "#f59e0b"],
   ["vgpr_count", "VGPR per work-item", "registers", "#c084fc"],
+  ["agpr_count", "AGPR per work-item", "registers", "#e879f9"],
+  ["sgpr_count", "SGPR per wave", "registers", "#a78bfa"],
   ["lds_bytes", "LDS per workgroup", "bytes", "#22c55e"],
-  ["critical_regression", "Critical regression", "%", "#a371f7"],
+  ["scratch_bytes", "Scratch", "bytes", "#84cc16"],
+  ["dispatch_count", "GPU dispatches per call", "dispatches", "#38bdf8"],
+  ["regression", "Case regression", "%", "#a371f7"],
   ["duration_s", "Iteration duration", "s", "#79c0ff"],
 ];
 

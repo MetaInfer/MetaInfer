@@ -132,6 +132,30 @@ class EvaluatorRunner:
         report["build_fingerprint"] = build_fingerprint
         return self._validate(phase, report, role=role, baseline_report=baseline_report)
 
+    def validate_benchmark_report(
+        self,
+        report: Dict[str, Any],
+        *,
+        role: str,
+        build_fingerprint: str,
+        baseline_report: Optional[Dict[str, Any]] = None,
+    ) -> EvaluationResult:
+        """Validate hipprof measurements without executing a timing command."""
+        if role not in {"baseline", "candidate"}:
+            raise EvaluationError(f"invalid evaluation role: {role}")
+        self.bundle.verify()
+        if self.private_verifier is not None:
+            self.private_verifier()
+        normalized = dict(report)
+        normalized["evaluation_role"] = role
+        normalized["build_fingerprint"] = build_fingerprint
+        return self._validate(
+            "benchmark",
+            normalized,
+            role=role,
+            baseline_report=baseline_report,
+        )
+
     def _validate(
         self,
         phase: str,

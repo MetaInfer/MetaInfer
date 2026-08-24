@@ -1,5 +1,11 @@
 # K100/gfx928 Champion 工程化：DPP、Split-K、MMAC、安全对齐与通用性
 
+> **历史方法说明**：本文保留当时 GPU Event/旧 profiler 的实验数字与推导，便于追踪
+> 技术来源，但这些计时不再是当前任务的 latency 或 promotion 证据。当前协议只使用
+> frozen hipprof trace：每次逻辑调用汇总全部 GPU dispatch `DurationNs`，对最终样本取
+> 算术平均；PMC replay 仅作诊断；每个 frozen shape 都必须独立通过。本文的 dispatch
+> 建议只能作为待复验假设。
+
 ## 1. 文档目的与源码基线
 
 本文记录对以下算子的实际修改、失败尝试、修复、性能证据和工程边界，供后续 planning、implementer 和 reviewer agent 直接参考：

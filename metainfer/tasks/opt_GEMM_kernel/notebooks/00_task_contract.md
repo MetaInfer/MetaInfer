@@ -1,30 +1,35 @@
 # GEMM optimization contract
 
-The candidate implements the GEMM family described in the task requirements:
+The candidate implements the GEMM family defined by the frozen evaluator:
 
 ```text
 C = epilogue(alpha * op(A) @ op(B) + beta * C_or_bias)
 ```
 
-The exact dtype, transpose flags, layouts, strides, batching, alignment,
-epilogue, legal approximation and workspace limits come from the user task and
-the evaluator bundle. `task.yaml::public_contract` is the frozen source of
-truth supplied to agents and shown read-only in the UI. Unspecified behavior
-must not be guessed silently.
+Exact dtype, transpose flags, layouts, strides, batching, alignment, numerics,
+epilogue, legal approximation, and workspace limits come from
+`task.yaml::public_contract`. It is the source of truth supplied to agents and
+shown read-only in the UI. Unspecified behavior must not be guessed silently.
 
 Acceptance requires all of the following:
 
-- the system compiler command succeeds;
-- every declared public and held-out correctness case is returned and passes;
-- every performance case is returned under one fixed timing methodology;
-- trace-weighted speedup clears the configured minimum;
-- no critical shape exceeds its regression limit;
-- the candidate beats the current champion by more than the configured noise
-  threshold.
+- the system-owned build succeeds;
+- every public and held-out correctness case is returned and passes;
+- hipprof returns one finite positive operator latency for every performance
+  shape under the exact frozen methodology;
+- each shape is strictly faster than the frozen Triton baseline;
+- each shape crosses the current Champion by the configured noise threshold.
 
-Before the optimization loop starts, the original submission must compile,
-pass every correctness case, and produce a complete benchmark under the frozen
-BuildProfile. This certified measurement is the only baseline used later.
+Operator latency is the arithmetic mean of the final trace samples after summing
+all GPU dispatch `DurationNs` belonging to each logical GEMM call. Host launch,
+JIT, allocation, copies, preprocessing, and synchronization are outside timing.
+PMC replay supplies diagnostics only and never supplies latency.
 
-Only files under `submission/` are candidate deliverables. Agent-written test
-or benchmark scripts are useful local diagnostics but never become gates.
+There are no performance weights, critical-shape exceptions, or aggregate score
+that can compensate for a losing shape. Before optimization, Triton and Initial
+HIP are independently built, correctness-checked, and profiled under the frozen
+BuildProfile. Their immutable report references are the only performance facts
+used later.
+
+Only files under `submission/` are candidate deliverables. Agent-written tests,
+benchmarks, profiler commands, or pass/fail logic never become system gates.

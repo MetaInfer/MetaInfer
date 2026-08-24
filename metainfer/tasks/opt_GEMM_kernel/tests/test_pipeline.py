@@ -5,10 +5,13 @@ import pytest
 from metainfer.orchestrator.state import StateStore
 
 from ..orchestrator.evaluator.spec import FrozenEvaluatorBundle
-from ..orchestrator.evaluator.champion import ChampionStore
+from ..orchestrator.evaluator.champion import ChampionStore, make_report_reference
 from ..orchestrator.guidance import GuidanceStore
 from ..orchestrator.phases import graph_payload
-from ..orchestrator.pipeline import Orchestrator, OrchestratorConfig
+from ..orchestrator.pipeline import (
+    Orchestrator, OrchestratorConfig, _combine_hipprof_reports,
+    _near_promotion_boundary,
+)
 from ._helpers import FakeBuilder, FakeManager, FakeProfiler, make_bundle
 
 
@@ -77,19 +80,34 @@ def test_one_iteration_promotes_challenger_without_old_task_dependencies(tmp_pat
     baseline = json.loads(
         (state / "baseline" / "baseline-manifest.json").read_text(encoding="utf-8")
     )
-    assert baseline["benchmark"]["evaluation_role"] == "baseline"
+    baseline_report = json.loads(
+        (state / baseline["benchmark_report"]["path"]).read_text(encoding="utf-8")
+    )
+    baseline_profile = json.loads(
+        (state / baseline["profile_report"]["path"]).read_text(encoding="utf-8")
+    )
+    assert baseline_report["evaluation_role"] == "baseline"
     assert baseline["implementation"] == "triton"
     assert baseline["build_fingerprint"] == "triton-jit"
-    assert baseline["hardware_profile"]["profile_id"] == "hygon-k100-gfx928"
+    assert baseline_profile["profile_id"] == "hygon-k100-gfx928"
     initial_hip = json.loads(
         (state / "certified" / "initial-hip" / "initial-hip-manifest.json").read_text(
             encoding="utf-8"
         )
     )
+    initial_profile = json.loads(
+        (state / initial_hip["profile_report"]["path"]).read_text(encoding="utf-8")
+    )
     assert initial_hip["implementation"] == "initial-hip"
     assert initial_hip["correctness"]["summary"]["expected"] == 2
-    assert initial_hip["hardware_profile"]["profile_id"] == "hygon-k100-gfx928"
-    assert record["hardware_profile"]["cases"][0]["vgpr_count"] == 32
+    assert initial_profile["profile_id"] == "hygon-k100-gfx928"
+    record_profile = json.loads(
+        (state / record["profile_report"]["path"]).read_text(encoding="utf-8")
+    )
+    assert record_profile["cases"][0]["vgpr_count"] == 32
+    assert record["measurement_report"]["path"] == (
+        "logs/001/candidate-benchmark-report.json"
+    )
     assert feedback["benchmark"]["hardware_profile"]["gpu_arch"] == "gfx928"
     assert "Try a 128x128 tile" in manager.prompts["planner"]
     assert '"entrypoint": "launch_gemm"' in manager.prompts["planner"]
@@ -99,8 +117,99 @@ def test_one_iteration_promotes_challenger_without_old_task_dependencies(tmp_pat
     assert guidance["items"][0]["applied_role"] == "planner"
     assert any(event["type"] == "human_guidance_applied" for event in timeline)
 
+    reloaded = ChampionStore(
+        state / "champion",
+        noise_threshold=0.01,
+        expected_case_ids=["small", "large"],
+    ).load()
+    assert reloaded["measurement_report"] == champion["measurement_report"]
+    champion_report_path = state / champion["measurement_report"]["path"]
+    original_report = champion_report_path.read_bytes()
+    champion_report_path.write_text('{"passed": true, "cases": []}', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="performance report changed"):
+        ChampionStore(
+            state / "champion",
+            noise_threshold=0.01,
+            expected_case_ids=["small", "large"],
+        ).load()
+    champion_report_path.write_bytes(original_report)
+
     (state / "champion" / "submission" / "kernel.cpp").write_text(
         "// tampered\n", encoding="utf-8"
     )
     with pytest.raises(RuntimeError, match="changed outside promotion"):
-        ChampionStore(state / "champion", noise_threshold=0.01).load()
+        ChampionStore(
+            state / "champion",
+            noise_threshold=0.01,
+            expected_case_ids=["small", "large"],
+        ).load()
+
+
+def test_champion_rejects_candidate_at_exact_noise_boundary(tmp_path):
+    state = tmp_path / "state"
+    baseline_path = state / "baseline" / "baseline-benchmark-report.json"
+    baseline_path.parent.mkdir(parents=True)
+    baseline_path.write_text(
+        json.dumps({"cases": [{"id": "shape", "latency_ms": 1.0}]}),
+        encoding="utf-8",
+    )
+    baseline_ref = make_report_reference(state, baseline_path)
+    store = ChampionStore(
+        state / "champion",
+        noise_threshold=0.01,
+        expected_case_ids=["shape"],
+    )
+    store.initialize_triton(baseline_ref)
+
+    candidate_dir = tmp_path / "candidate"
+    candidate_dir.mkdir()
+    (candidate_dir / "kernel.cpp").write_text("// candidate\n", encoding="utf-8")
+    candidate_path = state / "logs" / "001" / "candidate-benchmark-report.json"
+    candidate_path.parent.mkdir(parents=True)
+    candidate_path.write_text(
+        json.dumps({"cases": [{"id": "shape", "latency_ms": 0.99}]}),
+        encoding="utf-8",
+    )
+    candidate_ref = make_report_reference(state, candidate_path)
+
+    promoted, reason, champion = store.consider(
+        1, candidate_dir, candidate_ref, baseline_ref,
+    )
+
+    assert promoted is False
+    assert "beyond noise threshold" in reason
+    assert champion["kind"] == "triton"
+    assert not store.submission_dir.exists()
+
+
+def test_boundary_retest_combines_raw_hipprof_samples_without_shape_weighting():
+    methodology = {"timer": "hipprof_gpu_kernel_duration_ns"}
+    first = {
+        "methodology": methodology,
+        "cases": [{
+            "id": "shape", "latency_ms": 1.0,
+            "operator_samples_ms": [0.9, 1.1],
+        }],
+    }
+    second = {
+        "methodology": methodology,
+        "cases": [{
+            "id": "shape", "latency_ms": 0.9,
+            "operator_samples_ms": [0.8, 1.0],
+        }],
+    }
+    combined = _combine_hipprof_reports(first, second)
+    case = combined["cases"][0]
+    assert case["latency_ms"] == pytest.approx(0.95)
+    assert case["sample_count"] == 4
+    assert case["measurement_batches"] == 2
+
+
+def test_one_percent_boundary_triggers_retest():
+    incumbent = {"cases": [{"id": "shape", "latency_ms": 1.0}]}
+    assert _near_promotion_boundary(
+        incumbent, {"cases": [{"id": "shape", "latency_ms": 0.99}]}, 0.01
+    )
+    assert not _near_promotion_boundary(
+        incumbent, {"cases": [{"id": "shape", "latency_ms": 0.8}]}, 0.01
+    )

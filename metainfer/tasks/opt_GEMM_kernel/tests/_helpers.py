@@ -26,31 +26,37 @@ def make_bundle(root: Path, *, speedup: float = 1.25) -> Path:
         },
         "commands": {
             phase: {"argv": [sys.executable, "evaluate.py"], "timeout_s": 30}
-            for phase in ("correctness", "benchmark")
+            for phase in ("correctness", "profile")
         },
         "cases": {
             "correctness": ["public", "heldout"],
             "private": ["heldout"],
             "benchmark": [
                 {
-                    "id": "small", "weight": 3, "critical": True,
+                    "id": "small",
                     "shape": {"m": 2, "n": 3, "k": 4, "batch": 1},
                     "bytes": 100,
                 },
                 {
-                    "id": "large", "weight": 1, "critical": False,
+                    "id": "large",
                     "shape": {"m": 4, "n": 4, "k": 4, "batch": 2},
                     "bytes": 200,
                 },
             ],
         },
-        "benchmark_protocol": {"warmup": 10, "samples": 100, "timer": "fake"},
-        "acceptance": {
-            "min_weighted_speedup": 1.01,
-            "noise_threshold": 0.01,
-            "max_critical_regression": 0.03,
-            "require_all_cases": True,
+        "benchmark_protocol": {
+            "warmup": 10,
+            "samples": 100,
+            "trace_calls": 110,
+            "timer": "hipprof_gpu_kernel_duration_ns",
+            "statistic": "arithmetic_mean",
+            "operator_aggregation": "sum_gpu_kernel_duration_per_call",
+            "synchronization": "hipprof_trace",
+            "timed_scope": "operator_gpu_dispatches_only",
+            "host_launch_time_included": False,
+            "pmc_timing_used": False,
         },
+        "acceptance": {"noise_threshold": 0.01},
     }
     (root / "task.yaml").write_text(yaml.safe_dump(spec), encoding="utf-8")
     candidate_ms = 1.0 / speedup
@@ -142,23 +148,41 @@ class FakeProfiler:
             fingerprint="fake-profiler-v1", required=True,
         )
 
-    def run(self, artifact_dir, output_dir, *, role):
+    def run(
+        self, artifact_dir, output_dir, *, role, collection_mode="trace",
+        case_ids=None, run_label=None, implementation=None,
+    ):
         from ..orchestrator.profiler import ProfileResult
+        latency = (
+            1.0 if role == "baseline" else
+            (0.95 if "initial-hip" in str(output_dir) else 0.8)
+        )
         report = {
             "passed": True,
             "profile_id": "hygon-k100-gfx928",
             "gpu_arch": "gfx928",
-            "tool": "rocprofv3",
+            "tool": "hipprof",
             "profile_fingerprint": self.profile.fingerprint,
             "counter_groups": [["SQ_WAVES"]],
-            "cases": [{
-                "id": "small", "vgpr_count": 32, "lds_bytes": 4096,
-                "l2_hit_pct": 88.0, "compute_busy_pct": 75.0,
-                "measured_bandwidth_gbps": 640.0,
-            }],
+            "cases": [
+                {
+                    "id": case_id, "vgpr_count": 32, "lds_bytes": 4096,
+                    "l2_hit_pct": 88.0, "compute_busy_pct": None,
+                    "measured_bandwidth_gbps": 640.0,
+                }
+                for case_id in ("small", "large")
+            ],
+            "collection_mode": collection_mode,
+            "timing_cases": [
+                {"id": "small", "latency_ms": latency, "kernel_name": "gemm"},
+                {"id": "large", "latency_ms": latency, "kernel_name": "gemm"},
+            ] if not case_ids else [
+                {"id": case_id, "latency_ms": latency, "kernel_name": "gemm"}
+                for case_id in case_ids
+            ],
         }
         output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / f"{role}-hardware-profile.json").write_text(
+        (output_dir / f"{run_label or role}-hardware-profile.json").write_text(
             json.dumps(report), encoding="utf-8"
         )
         return ProfileResult(True, report)

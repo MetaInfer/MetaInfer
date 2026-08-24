@@ -1,5 +1,11 @@
 # K100/gfx928 W8A8 GEMM：MMAC CTA Swizzle、Fused Split-K 与 BM=1 特化
 
+> **历史方法说明**：本文保留当时 GPU Event/rocprof 的实验数字与推导，便于追踪技术
+> 来源，但这些计时不再是当前任务的 latency 或 promotion 证据。当前协议只使用 frozen
+> hipprof trace：每次逻辑调用汇总全部 GPU dispatch `DurationNs`，对最终样本取算术
+> 平均；PMC replay 仅作诊断；每个 frozen shape 都必须独立通过。本文的 dispatch 建议
+> 只能作为待复验假设。
+
 ## 1. 文档范围与证据基线
 
 本文记录在 K500SM_AI / gfx928 / Wave64 上实测过的三项改动：
