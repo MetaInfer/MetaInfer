@@ -29,13 +29,7 @@ profiles:
       required: true
       tool_candidates:
         - /opt/dtk/bin/hipprof
-        - /opt/dtk/rocprofiler/bin/rocprof
-        - /opt/dtk/bin/rocprofv3
-        - /opt/dtk/bin/rocprof
-        - /opt/rocm/bin/rocprofv3
-        - /opt/rocm/bin/rocprof
-        - rocprofv3
-        - rocprof
+        - hipprof
       representative_cases:
         - wq-b-tp4-m1
         - wq-b-tp4-m16

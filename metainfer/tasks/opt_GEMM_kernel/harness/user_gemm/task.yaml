@@ -48,9 +48,6 @@ commands:
   correctness:
     argv: ["python3", "{bundle_dir}/evaluate.py", correctness]
     timeout_s: 7200
-  benchmark:
-    argv: ["python3", "{bundle_dir}/evaluate.py", benchmark]
-    timeout_s: 7200
   profile:
     argv: ["python3", "{bundle_dir}/evaluate.py"]
     timeout_s: 1800
@@ -70,12 +67,6 @@ cases:
   benchmark:
     matrix:
       m_values: [1, 2, 4, 8, 16, 4096]
-      large_m: 4096
-      small_m_total_weight: 0.5
-      large_m_weight: 0.5
-      # Every requested M is protected from >3% regression. This prevents a
-      # large-M win from hiding a decode regression (or vice versa).
-      critical_m: [1, 2, 4, 8, 16, 4096]
       workloads:
         - {id: wqkv-a-tp4, op: wqkv_a, tp: 4, k: 4096, n: 1536}
         - {id: wq-b-tp4, op: wq_b, tp: 4, k: 1024, n: 8192}
@@ -91,13 +82,18 @@ cases:
 benchmark_protocol:
   warmup: 10
   samples: 100
-  timer: gpu_event
-  statistic: median
-  synchronization: event_per_sample
-  timed_scope: launch_w8a8_gemm_only
+  trace_calls: 110
+  timer: hipprof_gpu_kernel_duration_ns
+  statistic: arithmetic_mean
+  operator_aggregation: sum_gpu_kernel_duration_per_call
+  synchronization: hipprof_trace
+  timed_scope: operator_gpu_dispatches_only
+  host_launch_time_included: false
+  pmc_timing_used: false
+  raw_samples_retained: true
+  dispersion_reported: [median, stddev, cv, min, max]
+  comparison: same_round_champion
+  boundary_retest: equal_sample_second_trace_for_both_sides
 
 acceptance:
-  min_weighted_speedup: 1.01
   noise_threshold: 0.01
-  max_critical_regression: 0.03
-  require_all_cases: true

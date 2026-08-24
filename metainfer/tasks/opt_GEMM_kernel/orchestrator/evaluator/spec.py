@@ -18,8 +18,16 @@ class SpecError(ValueError):
     pass
 
 
-_PHASES = ("correctness", "benchmark")
-_EXTRA_COMMANDS = ("profile",)
+_REQUIRED_COMMANDS = ("correctness", "profile")
+_REQUIRED_BENCHMARK_METHOD = {
+    "timer": "hipprof_gpu_kernel_duration_ns",
+    "statistic": "arithmetic_mean",
+    "operator_aggregation": "sum_gpu_kernel_duration_per_call",
+    "synchronization": "hipprof_trace",
+    "timed_scope": "operator_gpu_dispatches_only",
+    "host_launch_time_included": False,
+    "pmc_timing_used": False,
+}
 
 
 @dataclass(frozen=True)
@@ -30,17 +38,12 @@ class CommandSpec:
 
 @dataclass(frozen=True)
 class AcceptanceSpec:
-    min_weighted_speedup: float = 1.0
     noise_threshold: float = 0.01
-    max_critical_regression: float = 0.03
-    require_all_cases: bool = True
 
 
 @dataclass(frozen=True)
 class BenchmarkCaseSpec:
     id: str
-    weight: float = 1.0
-    critical: bool = False
     shape: Optional[Dict[str, int]] = None
     flops: Optional[float] = None
     bytes: Optional[float] = None
@@ -78,7 +81,7 @@ class KernelTaskSpec:
         if not isinstance(commands_raw, dict):
             raise SpecError("task.yaml requires commands mapping")
         commands: Dict[str, CommandSpec] = {}
-        for phase in _PHASES:
+        for phase in _REQUIRED_COMMANDS:
             item = commands_raw.get(phase)
             if not isinstance(item, dict):
                 raise SpecError(f"commands.{phase} must be a mapping")
@@ -89,14 +92,6 @@ class KernelTaskSpec:
             if timeout_s < 1 or timeout_s > 86_400:
                 raise SpecError(f"commands.{phase}.timeout_s must be in [1, 86400]")
             commands[phase] = CommandSpec(list(argv), timeout_s)
-        for phase in _EXTRA_COMMANDS:
-            item = commands_raw.get(phase)
-            if isinstance(item, dict):
-                argv = item.get("argv")
-                if isinstance(argv, list) and argv and all(isinstance(v, str) and v for v in argv):
-                    timeout_s = int(item.get("timeout_s", 600))
-                    if 1 <= timeout_s <= 86_400:
-                        commands[phase] = CommandSpec(list(argv), timeout_s)
 
         cases = raw.get("cases") or {}
         if not isinstance(cases, dict):
@@ -118,12 +113,32 @@ class KernelTaskSpec:
         try:
             warmup = int(protocol["warmup"])
             samples = int(protocol["samples"])
+            trace_calls = int(protocol["trace_calls"])
             timer = str(protocol["timer"]).strip()
         except (KeyError, TypeError, ValueError) as exc:
-            raise SpecError("benchmark_protocol requires warmup, samples, and timer") from exc
-        if warmup < 1 or samples < 3 or not timer:
-            raise SpecError("benchmark protocol requires warmup>=1, samples>=3, and timer")
-        protocol = {**protocol, "warmup": warmup, "samples": samples, "timer": timer}
+            raise SpecError(
+                "benchmark_protocol requires warmup, samples, trace_calls, and timer"
+            ) from exc
+        if warmup < 0 or samples < 3 or trace_calls != warmup + samples or not timer:
+            raise SpecError(
+                "benchmark protocol requires samples>=3 and trace_calls=warmup+samples"
+            )
+        for key, expected_value in _REQUIRED_BENCHMARK_METHOD.items():
+            actual_value = protocol.get(key)
+            if actual_value != expected_value or (
+                isinstance(expected_value, bool)
+                and type(actual_value) is not bool
+            ):
+                raise SpecError(
+                    f"benchmark_protocol.{key} must be {expected_value!r}"
+                )
+        protocol = {
+            **protocol,
+            "warmup": warmup,
+            "samples": samples,
+            "trace_calls": trace_calls,
+            "timer": timer,
+        }
         private = _unique_ids(cases.get("private", []), "cases.private", allow_empty=True)
         unknown_private = sorted(set(private) - set(correctness))
         if unknown_private:
@@ -133,17 +148,10 @@ class KernelTaskSpec:
         if not isinstance(acc_raw, dict):
             raise SpecError("acceptance must be a mapping")
         acceptance = AcceptanceSpec(
-            min_weighted_speedup=float(acc_raw.get("min_weighted_speedup", 1.0)),
             noise_threshold=float(acc_raw.get("noise_threshold", 0.01)),
-            max_critical_regression=float(acc_raw.get("max_critical_regression", 0.03)),
-            require_all_cases=bool(acc_raw.get("require_all_cases", True)),
         )
-        if not math.isfinite(acceptance.min_weighted_speedup) or acceptance.min_weighted_speedup <= 0:
-            raise SpecError("min_weighted_speedup must be positive")
         if not math.isfinite(acceptance.noise_threshold) or not 0 <= acceptance.noise_threshold < 1:
             raise SpecError("noise_threshold must be in [0, 1)")
-        if not math.isfinite(acceptance.max_critical_regression) or not 0 <= acceptance.max_critical_regression < 1:
-            raise SpecError("max_critical_regression must be in [0, 1)")
         return cls(
             name=name,
             public_contract=public_contract,
@@ -167,8 +175,6 @@ class KernelTaskSpec:
             {
                 "id": case.id,
                 "shape": case.shape,
-                "weight": case.weight,
-                "critical": case.critical,
             }
             for case in self.benchmark_cases
             if case.id not in private
@@ -220,12 +226,8 @@ def _benchmark_cases(value: Any) -> List[BenchmarkCaseSpec]:
             case = BenchmarkCaseSpec(item)
         elif isinstance(item, dict):
             case_id = str(item.get("id") or "").strip()
-            try:
-                weight = float(item.get("weight", 1.0))
-            except (TypeError, ValueError) as exc:
-                raise SpecError(f"benchmark case {case_id!r} has invalid weight") from exc
-            if not case_id or not math.isfinite(weight) or weight <= 0:
-                raise SpecError("benchmark case id and positive weight are required")
+            if not case_id:
+                raise SpecError("benchmark case id is required")
             shape = _benchmark_shape(item, case_id)
             if shape is None:
                 raise SpecError(
@@ -235,17 +237,15 @@ def _benchmark_cases(value: Any) -> List[BenchmarkCaseSpec]:
             transferred = _optional_positive_number(
                 item.get("bytes"), f"benchmark case {case_id!r} bytes"
             )
-            if flops is None and shape is not None:
+            if flops is None:
                 flops = float(
                     2 * shape["m"] * shape["n"] * shape["k"] * shape["batch"]
                 )
             case = BenchmarkCaseSpec(
-                case_id,
-                weight,
-                bool(item.get("critical", False)),
-                shape,
-                flops,
-                transferred,
+                id=case_id,
+                shape=shape,
+                flops=flops,
+                bytes=transferred,
             )
         else:
             raise SpecError("benchmark cases must be strings or mappings")
@@ -266,21 +266,10 @@ def _benchmark_matrix(value: Dict[str, Any]) -> List[BenchmarkCaseSpec]:
         raise SpecError("cases.benchmark mapping requires matrix")
     try:
         m_values = [int(item) for item in matrix["m_values"]]
-        large_m = int(matrix.get("large_m", 4096))
-        small_total = float(matrix.get("small_m_total_weight", 0.5))
-        large_weight = float(matrix.get("large_m_weight", 0.5))
     except (KeyError, TypeError, ValueError) as exc:
-        raise SpecError("benchmark matrix has invalid M values or weights") from exc
+        raise SpecError("benchmark matrix has invalid M values") from exc
     if not m_values or len(set(m_values)) != len(m_values) or any(m <= 0 for m in m_values):
         raise SpecError("benchmark matrix m_values must be unique positive integers")
-    small_values = [m for m in m_values if m != large_m]
-    if large_m not in m_values or not small_values:
-        raise SpecError("benchmark matrix must contain large_m and at least one small M")
-    if not math.isfinite(small_total) or small_total <= 0:
-        raise SpecError("benchmark matrix small_m_total_weight must be positive")
-    if not math.isfinite(large_weight) or large_weight <= 0:
-        raise SpecError("benchmark matrix large_m_weight must be positive")
-    critical_m = {int(item) for item in matrix.get("critical_m", [1, large_m])}
     workloads = matrix.get("workloads")
     if not isinstance(workloads, list) or not workloads:
         raise SpecError("benchmark matrix workloads must be a non-empty list")
@@ -294,22 +283,16 @@ def _benchmark_matrix(value: Dict[str, Any]) -> List[BenchmarkCaseSpec]:
             n = int(workload["n"])
             k = int(workload["k"])
             batch = int(workload.get("batch", 1))
-            workload_weight = float(workload.get("weight", 1.0))
         except (KeyError, TypeError, ValueError) as exc:
             raise SpecError(f"benchmark matrix workload {workload_id!r} is invalid") from exc
-        if not workload_id or min(n, k, batch) <= 0 or workload_weight <= 0:
+        if not workload_id or min(n, k, batch) <= 0:
             raise SpecError(f"benchmark matrix workload {workload_id!r} is invalid")
         for m in m_values:
             shape = {"m": m, "n": n, "k": k, "batch": batch}
-            weight = workload_weight * (
-                large_weight if m == large_m else small_total / len(small_values)
-            )
             transferred = float(batch * (m * k + k * n + 4 * m + 4 * n + 2 * m * n))
             cases.append(
                 BenchmarkCaseSpec(
                     id=f"{workload_id}-m{m}",
-                    weight=weight,
-                    critical=m in critical_m,
                     shape=shape,
                     flops=float(2 * m * n * k * batch),
                     bytes=transferred,

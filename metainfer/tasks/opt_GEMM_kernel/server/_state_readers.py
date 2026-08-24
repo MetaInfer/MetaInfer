@@ -1,15 +1,21 @@
-"""Read the task-owned iteration, score and champion schemas."""
+"""Read task-owned reports and derive public per-shape views."""
 
 from __future__ import annotations
 
-import json
 import copy
+import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ..orchestrator import phases
-from ..orchestrator.evaluator.spec import BenchmarkCaseSpec, KernelTaskSpec, SpecError
 from metainfer.orchestrator.requirements import req_field
+
+from ..orchestrator import phases
+from ..orchestrator.evaluator.champion import (
+    champion_report_reference,
+    load_report_reference,
+)
+from ..orchestrator.evaluator.spec import BenchmarkCaseSpec, KernelTaskSpec, SpecError
 
 
 def _json(path: Path, default: Any) -> Any:
@@ -21,21 +27,44 @@ def _json(path: Path, default: Any) -> Any:
 
 def read_iterations(state_dir: Path) -> List[Dict[str, Any]]:
     spec = _task_spec(state_dir)
+    baseline = _baseline_report(state_dir)
     records = [
         value
         for path in sorted((state_dir / "iterations").glob("*.json"))
         if isinstance((value := _json(path, None)), dict)
     ] if (state_dir / "iterations").is_dir() else []
-    return [_public_record(record, spec) for record in records]
+    return [
+        _public_record(state_dir, record, spec, baseline)
+        for record in records
+    ]
 
 
 def read_iteration(state_dir: Path, n: int) -> Optional[Dict[str, Any]]:
     value = _json(state_dir / "iterations" / f"{n:03d}.json", None)
-    return _public_record(value, _task_spec(state_dir)) if isinstance(value, dict) else None
+    if not isinstance(value, dict):
+        return None
+    return _public_record(state_dir, value, _task_spec(state_dir), _baseline_report(state_dir))
 
 
 def read_champion(state_dir: Path) -> Dict[str, Any]:
-    return _json(state_dir / "champion" / "champion.json", {}) or {}
+    record = _json(state_dir / "champion" / "champion.json", {}) or {}
+    if not isinstance(record, dict) or not record:
+        return {}
+    reference = champion_report_reference(state_dir, record)
+    benchmark = load_report_reference(state_dir, reference)
+    promotion_incumbent_ref = record.get("promotion_incumbent_report")
+    promotion_incumbent = (
+        load_report_reference(state_dir, promotion_incumbent_ref)
+        if isinstance(promotion_incumbent_ref, dict) else {}
+    )
+    profile = _champion_profile(state_dir, record)
+    return {
+        **record,
+        "measurement_report": reference,
+        "benchmark": benchmark,
+        "promotion_incumbent": promotion_incumbent,
+        "profile": profile,
+    }
 
 
 def read_baseline(state_dir: Path) -> Dict[str, Any]:
@@ -43,30 +72,45 @@ def read_baseline(state_dir: Path) -> Dict[str, Any]:
     initial_hip = _json(
         state_dir / "certified" / "initial-hip" / "initial-hip-manifest.json", {}
     ) or {}
-    profile = _json(state_dir / "system_build" / "build_profile.json", {}) or {}
+    build_profile = _json(state_dir / "system_build" / "build_profile.json", {}) or {}
     requirements = _json(state_dir / "requirements.json", {}) or {}
-    correctness = manifest.get("correctness") or {}
-    benchmark = manifest.get("benchmark") or {}
-    hardware_profile = manifest.get("hardware_profile") or {}
     frozen_profiler = _json(
         state_dir / "system_profiler" / "profiler_profile.json", {}
     ) or {}
+    benchmark = _baseline_report(state_dir)
+    hardware_profile = _manifest_report(
+        state_dir,
+        manifest,
+        "profile_report",
+        state_dir / "baseline" / "baseline-hardware-profile.json",
+    )
+    initial_benchmark = _manifest_report(
+        state_dir,
+        initial_hip,
+        "benchmark_report",
+        state_dir / "certified" / "initial-hip" / "candidate-benchmark-report.json",
+    )
+    initial_profile = _manifest_report(
+        state_dir,
+        initial_hip,
+        "profile_report",
+        state_dir / "certified" / "initial-hip" / "candidate-hardware-profile.json",
+    )
     spec = _task_spec(state_dir)
     cases = _baseline_cases(benchmark, spec)
-    summary = _aggregate(cases, "baseline_ms")
     return {
         "certified": bool(manifest),
         "implementation": manifest.get("implementation", "legacy"),
         "certified_at": manifest.get("certified_at"),
         "build_fingerprint": manifest.get("build_fingerprint"),
-        "backend": profile.get("backend"),
-        "kernel_language": profile.get("kernel_language"),
-        "target_hardware": profile.get("target_hardware"),
-        "gpu_arch": profile.get("gpu_arch"),
-        "detected_hardware": profile.get("detected_hardware"),
-        "compiler": profile.get("compiler"),
-        "compiler_version": profile.get("compiler_version"),
-        "cmake_version": profile.get("cmake_version"),
+        "backend": build_profile.get("backend"),
+        "kernel_language": build_profile.get("kernel_language"),
+        "target_hardware": build_profile.get("target_hardware"),
+        "gpu_arch": build_profile.get("gpu_arch"),
+        "detected_hardware": build_profile.get("detected_hardware"),
+        "compiler": build_profile.get("compiler"),
+        "compiler_version": build_profile.get("compiler_version"),
+        "cmake_version": build_profile.get("cmake_version"),
         "profiler": {
             "profile_id": frozen_profiler.get("id"),
             "tool": frozen_profiler.get("tool_kind"),
@@ -76,14 +120,16 @@ def read_baseline(state_dir: Path) -> Dict[str, Any]:
             "counter_groups": frozen_profiler.get("counter_groups") or [],
             "passed": hardware_profile.get("passed"),
         },
-        "correctness": correctness.get("summary") or {},
+        "correctness": (manifest.get("correctness") or {}).get("summary") or {},
         "initial_hip": {
             "certified": bool(initial_hip),
             "certified_at": initial_hip.get("certified_at"),
             "build_fingerprint": initial_hip.get("build_fingerprint"),
             "correctness": (initial_hip.get("correctness") or {}).get("summary") or {},
-            "score": (initial_hip.get("benchmark") or {}).get("score") or {},
-            "hardware_profile": initial_hip.get("hardware_profile") or {},
+            "score": initial_benchmark.get("score") or {},
+            "profile": initial_profile,
+            "benchmark_report": initial_hip.get("benchmark_report") or {},
+            "profile_report": initial_hip.get("profile_report") or {},
         },
         "task": {
             "kernel_path": req_field(requirements, "initial_submission"),
@@ -93,111 +139,70 @@ def read_baseline(state_dir: Path) -> Dict[str, Any]:
         },
         "benchmark": {
             "methodology": benchmark.get("methodology") or {},
-            "case_count": len(benchmark.get("cases") or []),
-            "summary": summary,
+            "case_count": len(cases),
+            "summary": _measurement_summary(cases),
             "cases": cases,
+            "report": manifest.get("benchmark_report") or {},
         },
     }
 
 
 def read_charts(state_dir: Path) -> Dict[str, Any]:
-    records = read_iterations(state_dir)
-    manifest = _json(state_dir / "baseline" / "baseline-manifest.json", {}) or {}
     spec = _task_spec(state_dir)
-    baseline_cases = _baseline_cases(manifest.get("benchmark") or {}, spec)
-    baseline_hardware = manifest.get("hardware_profile") or {}
-    baseline_summary = _aggregate(baseline_cases, "baseline_ms")
+    baseline_report = _baseline_report(state_dir)
+    baseline_manifest = _json(
+        state_dir / "baseline" / "baseline-manifest.json", {}
+    ) or {}
+    baseline_profile = _manifest_report(
+        state_dir,
+        baseline_manifest,
+        "profile_report",
+        state_dir / "baseline" / "baseline-hardware-profile.json",
+    )
+    baseline_cases = _baseline_cases(baseline_report, spec)
+    records = read_iterations(state_dir)
     champion = read_champion(state_dir)
-
-    series: Dict[str, List[Dict[str, Any]]] = {
-        "latency_ms": [],
-        "weighted_speedup": [],
-        "tflops": [],
-        "bandwidth_gbps": [],
-        "critical_regression": [],
-        "duration_s": [],
-        "measured_bandwidth_gbps": [],
-        "l2_hit_pct": [],
-        "compute_busy_pct": [],
-        "vgpr_count": [],
-        "lds_bytes": [],
-    }
-    if baseline_cases:
-        _append_point(series["latency_ms"], 0, baseline_summary.get("latency_ms"), True)
-        _append_point(series["weighted_speedup"], 0, 1.0, True)
-        _append_point(series["tflops"], 0, baseline_summary.get("tflops"), True)
-        _append_point(
-            series["bandwidth_gbps"], 0, baseline_summary.get("bandwidth_gbps"), True
-        )
-        _append_point(series["critical_regression"], 0, 0.0, True)
-        _append_hardware_points(series, 0, baseline_hardware, True)
-
-    candidate_cases_by_iteration: Dict[int, List[Dict[str, Any]]] = {}
+    champion_cases = _comparison_cases(
+        champion.get("promotion_incumbent") or baseline_report,
+        champion.get("benchmark") or baseline_report,
+        spec,
+    )
+    champion_profile = champion.get("profile") or baseline_profile
+    profile_cases = _merge_hardware_cases(champion_cases, champion_profile)
+    case_series = _case_series(
+        baseline_cases,
+        baseline_profile,
+        records,
+        spec,
+    )
+    duration_series: List[Dict[str, Any]] = []
     for record in records:
-        iteration = int(record.get("iteration") or 0)
-        score = record.get("score") or {}
-        hardware = record.get("hardware_profile") or {}
-        cases = _score_cases(score.get("cases") or [], spec)
-        if cases:
-            candidate_cases_by_iteration[iteration] = cases
-            summary = _aggregate(cases, "candidate_ms")
-            _append_point(
-                series["latency_ms"], iteration, summary.get("latency_ms"),
-                bool(record.get("promoted")),
-            )
-            _append_point(
-                series["tflops"], iteration, summary.get("tflops"),
-                bool(record.get("promoted")),
-            )
-            _append_point(
-                series["bandwidth_gbps"], iteration, summary.get("bandwidth_gbps"),
-                bool(record.get("promoted")),
-            )
-        _append_hardware_points(
-            series, iteration, hardware, bool(record.get("promoted"))
-        )
         _append_point(
-            series["weighted_speedup"], iteration, score.get("weighted_speedup"),
+            duration_series,
+            int(record.get("iteration") or 0),
+            record.get("duration_s"),
             bool(record.get("promoted")),
         )
-        _append_point(
-            series["critical_regression"], iteration,
-            score.get("critical_regression"), bool(record.get("promoted")),
-        )
-        _append_point(
-            series["duration_s"], iteration, record.get("duration_s"),
-            bool(record.get("promoted")),
-        )
-
-    champion_iteration = int(champion.get("iteration") or 0)
-    champion_cases = candidate_cases_by_iteration.get(champion_iteration, baseline_cases)
-    champion_record = next(
-        (record for record in records if int(record.get("iteration") or 0) == champion_iteration),
-        None,
-    )
-    champion_hardware = (
-        (champion_record or {}).get("hardware_profile") or baseline_hardware
-    )
-    champion_summary = (
-        _aggregate(champion_cases, "candidate_ms")
-        if champion_iteration in candidate_cases_by_iteration
-        else baseline_summary
-    )
-    champion_summary = {
-        **champion_summary,
-        **_hardware_summary(champion_hardware),
-        "weighted_speedup": float(champion.get("weighted_speedup", 1.0) or 1.0),
-        "iteration": champion_iteration,
-    }
     return {
-        "series": series,
-        "baseline_summary": baseline_summary,
-        "champion_summary": champion_summary,
-        "profile_cases": _merge_hardware_cases(champion_cases, champion_hardware),
-        # Compatibility for early clients of this task-local endpoint.
-        "weighted_speedup": series["weighted_speedup"],
-        "critical_regression": series["critical_regression"],
-        "durations": series["duration_s"],
+        "series": {"duration_s": duration_series},
+        "case_ids": list(case_series),
+        "case_series": case_series,
+        "baseline_summary": _measurement_summary(baseline_cases),
+        "champion_summary": {
+            **_gate_summary(champion_cases),
+            "worst_case_speedup": min(
+                (
+                    float(case["speedup"])
+                    for case in champion_cases
+                    if case.get("speedup") is not None
+                ),
+                default=None,
+            ),
+            "iteration": int(champion.get("iteration") or 0),
+            "kind": champion.get("kind", "triton"),
+            "reason": champion.get("reason"),
+        },
+        "profile_cases": profile_cases,
     }
 
 
@@ -240,16 +245,98 @@ def _task_spec(state_dir: Path) -> Optional[KernelTaskSpec]:
         return None
 
 
-def _public_record(record: Dict[str, Any], spec: Optional[KernelTaskSpec]) -> Dict[str, Any]:
+def _manifest_report(
+    state_dir: Path,
+    manifest: Dict[str, Any],
+    key: str,
+    legacy_path: Path,
+) -> Dict[str, Any]:
+    reference = manifest.get(key)
+    if isinstance(reference, dict):
+        return load_report_reference(state_dir, reference)
+    legacy_key = "benchmark" if key == "benchmark_report" else "hardware_profile"
+    embedded = manifest.get(legacy_key)
+    if isinstance(embedded, dict) and embedded:
+        return embedded
+    value = _json(legacy_path, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _baseline_report(state_dir: Path) -> Dict[str, Any]:
+    manifest = _json(state_dir / "baseline" / "baseline-manifest.json", {}) or {}
+    return _manifest_report(
+        state_dir,
+        manifest,
+        "benchmark_report",
+        state_dir / "baseline" / "baseline-benchmark-report.json",
+    )
+
+
+def _champion_profile(state_dir: Path, champion: Dict[str, Any]) -> Dict[str, Any]:
+    kind = str(champion.get("kind") or "hip")
+    iteration = int(champion.get("iteration") or 0)
+    if kind == "triton":
+        manifest = _json(state_dir / "baseline" / "baseline-manifest.json", {}) or {}
+        return _manifest_report(
+            state_dir,
+            manifest,
+            "profile_report",
+            state_dir / "baseline" / "baseline-hardware-profile.json",
+        )
+    if iteration == 0:
+        manifest = _json(
+            state_dir / "certified" / "initial-hip" / "initial-hip-manifest.json", {}
+        ) or {}
+        return _manifest_report(
+            state_dir,
+            manifest,
+            "profile_report",
+            state_dir / "certified" / "initial-hip" / "candidate-hardware-profile.json",
+        )
+    record = _json(state_dir / "iterations" / f"{iteration:03d}.json", {}) or {}
+    reference = record.get("profile_report")
+    if isinstance(reference, dict):
+        return load_report_reference(state_dir, reference)
+    return _json(
+        state_dir / "logs" / f"{iteration:03d}" / "candidate-hardware-profile.json",
+        {},
+    ) or {}
+
+
+def _public_record(
+    state_dir: Path,
+    record: Dict[str, Any],
+    spec: Optional[KernelTaskSpec],
+    baseline_report: Dict[str, Any],
+) -> Dict[str, Any]:
     result = copy.deepcopy(record)
+    measurement_ref = result.get("measurement_report")
+    if isinstance(measurement_ref, dict):
+        benchmark = load_report_reference(state_dir, measurement_ref)
+        result["benchmark"] = benchmark
+        result["score"] = benchmark.get("score") or {}
+    else:
+        benchmark = {"score": result.get("score") or {}}
+    profile_ref = result.get("profile_report")
+    if isinstance(profile_ref, dict):
+        result["profile"] = load_report_reference(state_dir, profile_ref)
+    elif isinstance(result.get("hardware_profile"), dict):
+        result["profile"] = result.get("hardware_profile")
     score = result.get("score")
-    if not isinstance(score, dict):
-        return result
-    score["cases"] = _score_cases(score.get("cases") or [], spec)
-    private = _private_ids(spec)
-    score["reasons"] = [
-        _redact(str(reason), private) for reason in score.get("reasons") or []
-    ]
+    if isinstance(score, dict):
+        if not score.get("cases") and benchmark.get("cases"):
+            score["cases"] = _comparison_cases(
+                baseline_report,
+                benchmark,
+                spec,
+            )
+        else:
+            score["cases"] = _score_cases(score.get("cases") or [], spec)
+        private = _private_ids(spec)
+        score["reasons"] = [
+            _redact(str(reason), private) for reason in score.get("reasons") or []
+        ]
+    result.pop("hardware_profile", None)
     return result
 
 
@@ -273,12 +360,50 @@ def _baseline_cases(
         case_id = str(raw.get("id") or "")
         if not case_id or case_id in private:
             continue
-        item = specs.get(case_id)
         try:
             latency = float(raw["latency_ms"])
         except (KeyError, TypeError, ValueError):
             continue
-        cases.append(_profile_case(item, case_id, latency, latency))
+        cases.append(_profile_case(specs.get(case_id), case_id, latency, latency))
+    return cases
+
+
+def _comparison_cases(
+    baseline_report: Dict[str, Any],
+    candidate_report: Dict[str, Any],
+    spec: Optional[KernelTaskSpec],
+) -> List[Dict[str, Any]]:
+    baseline = {
+        str(case.get("id")): case
+        for case in baseline_report.get("cases") or []
+        if isinstance(case, dict) and case.get("id")
+    }
+    candidate = {
+        str(case.get("id")): case
+        for case in candidate_report.get("cases") or []
+        if isinstance(case, dict) and case.get("id")
+    }
+    specs = _case_specs(spec)
+    private = _private_ids(spec)
+    cases: List[Dict[str, Any]] = []
+    expected = [case.id for case in spec.benchmark_cases] if spec else list(baseline)
+    for case_id in expected:
+        if case_id in private or case_id not in baseline or case_id not in candidate:
+            continue
+        try:
+            baseline_ms = float(baseline[case_id]["latency_ms"])
+            candidate_ms = float(candidate[case_id]["latency_ms"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        shown = _profile_case(specs.get(case_id), case_id, baseline_ms, candidate_ms)
+        for key in (
+            "latency_mean_ms", "latency_median_ms", "latency_stddev_ms",
+            "latency_cv", "latency_min_ms", "latency_max_ms",
+            "measurement_batches", "sample_count",
+        ):
+            if key in candidate[case_id]:
+                shown[key] = candidate[case_id][key]
+        cases.append(shown)
     return cases
 
 
@@ -299,23 +424,23 @@ def _score_cases(
             candidate_ms = float(raw["candidate_ms"])
         except (KeyError, TypeError, ValueError):
             continue
-        cases.append(_profile_case(specs.get(case_id), case_id, baseline_ms, candidate_ms))
+        cases.append(_profile_case(
+            specs.get(case_id), case_id, baseline_ms, candidate_ms
+        ))
     return cases
 
 
 def _profile_case(
-    spec: Optional[BenchmarkCaseSpec], case_id: str,
-    baseline_ms: float, candidate_ms: float,
+    spec: Optional[BenchmarkCaseSpec],
+    case_id: str,
+    baseline_ms: float,
+    candidate_ms: float,
 ) -> Dict[str, Any]:
-    weight = float(spec.weight) if spec else 1.0
-    critical = bool(spec.critical) if spec else False
     flops = spec.flops if spec else None
     transferred = spec.bytes if spec else None
     return {
         "id": case_id,
         "shape": spec.shape if spec else None,
-        "weight": weight,
-        "critical": critical,
         "flops": flops,
         "bytes": transferred,
         "baseline_ms": baseline_ms,
@@ -329,35 +454,37 @@ def _profile_case(
     }
 
 
-def _aggregate(cases: List[Dict[str, Any]], latency_key: str) -> Dict[str, Any]:
-    valid = [case for case in cases if float(case.get(latency_key) or 0) > 0]
-    if not valid:
-        return {"latency_ms": None, "tflops": None, "bandwidth_gbps": None}
-    total_weight = sum(float(case.get("weight") or 1.0) for case in valid)
-    weighted_ms = sum(
-        float(case.get("weight") or 1.0) * float(case[latency_key]) for case in valid
-    )
-    flop_cases = [case for case in valid if case.get("flops") is not None]
-    byte_cases = [case for case in valid if case.get("bytes") is not None]
+def _measurement_summary(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+    invalid = []
+    for case in cases:
+        try:
+            latency_ms = float(case.get("baseline_ms"))
+        except (TypeError, ValueError):
+            latency_ms = math.nan
+        if not math.isfinite(latency_ms) or latency_ms <= 0:
+            invalid.append(str(case.get("id")))
     return {
-        "latency_ms": weighted_ms / total_weight,
-        "tflops": _aggregate_rate(flop_cases, latency_key, "flops", 1e9),
-        "bandwidth_gbps": _aggregate_rate(byte_cases, latency_key, "bytes", 1e6),
+        "case_count": len(cases),
+        "all_shapes_measured": bool(cases) and not invalid,
+        "invalid_case_ids": invalid,
     }
 
 
-def _aggregate_rate(
-    cases: List[Dict[str, Any]], latency_key: str, work_key: str, scale: float,
-) -> Optional[float]:
-    if not cases:
-        return None
-    work = sum(
-        float(case.get("weight") or 1.0) * float(case[work_key]) for case in cases
-    )
-    elapsed = sum(
-        float(case.get("weight") or 1.0) * float(case[latency_key]) for case in cases
-    )
-    return work / elapsed / scale if elapsed > 0 else None
+def _gate_summary(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "case_count": len(cases),
+        "all_shapes_passed": bool(cases) and all(
+            float(case.get("candidate_ms") or 0)
+            < float(case.get("baseline_ms") or 0)
+            for case in cases
+        ),
+        "failed_case_ids": [
+            str(case.get("id"))
+            for case in cases
+            if float(case.get("candidate_ms") or 0)
+            >= float(case.get("baseline_ms") or 0)
+        ],
+    }
 
 
 def _rate(work: Optional[float], latency_ms: float, scale: float) -> Optional[float]:
@@ -377,33 +504,97 @@ def _append_point(
 
 
 _HARDWARE_METRICS = (
-    "measured_bandwidth_gbps", "l2_hit_pct", "compute_busy_pct",
-    "vgpr_count", "lds_bytes",
+    "measured_bandwidth_gbps",
+    "hbm_read_gbps",
+    "hbm_write_gbps",
+    "hbm_read_bytes",
+    "hbm_write_bytes",
+    "l2_hit_pct",
+    "occupancy_pct",
+    "vgpr_count",
+    "agpr_count",
+    "sgpr_count",
+    "lds_bytes",
+    "scratch_bytes",
+    "dispatch_count",
 )
 
 
-def _hardware_summary(report: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    cases = [case for case in report.get("cases") or [] if isinstance(case, dict)]
-    result: Dict[str, Optional[float]] = {}
-    for metric in _HARDWARE_METRICS:
-        values: List[float] = []
+def _case_series(
+    baseline_cases: List[Dict[str, Any]],
+    baseline_profile: Dict[str, Any],
+    records: List[Dict[str, Any]],
+    spec: Optional[KernelTaskSpec],
+) -> Dict[str, Dict[str, Any]]:
+    baseline_profiled = {
+        str(case.get("id")): case
+        for case in _merge_hardware_cases(baseline_cases, baseline_profile)
+    }
+    result: Dict[str, Dict[str, Any]] = {}
+    for case in baseline_cases:
+        case_id = str(case.get("id") or "")
+        if not case_id:
+            continue
+        series = _empty_case_series()
+        shown = baseline_profiled.get(case_id, case)
+        _append_case_points(series, 0, shown, True, True)
+        result[case_id] = {"case": shown, "series": series}
+
+    for record in records:
+        iteration = int(record.get("iteration") or 0)
+        promoted = bool(record.get("promoted"))
+        cases = _merge_hardware_cases(
+            _score_cases((record.get("score") or {}).get("cases") or [], spec),
+            record.get("profile") or {},
+        )
         for case in cases:
-            try:
-                value = float(case[metric])
-            except (KeyError, TypeError, ValueError):
+            case_id = str(case.get("id") or "")
+            if not case_id or case_id not in result:
                 continue
-            values.append(value)
-        result[metric] = sum(values) / len(values) if values else None
+            _append_case_points(
+                result[case_id]["series"], iteration, case, promoted, False
+            )
+            _append_point(
+                result[case_id]["series"]["duration_s"],
+                iteration,
+                record.get("duration_s"),
+                promoted,
+            )
     return result
 
 
-def _append_hardware_points(
-    series: Dict[str, List[Dict[str, Any]]], iteration: int,
-    report: Dict[str, Any], promoted: bool,
+def _empty_case_series() -> Dict[str, List[Dict[str, Any]]]:
+    return {
+        "latency_ms": [],
+        "speedup": [],
+        "tflops": [],
+        "bandwidth_gbps": [],
+        "regression": [],
+        "duration_s": [],
+        **{metric: [] for metric in _HARDWARE_METRICS},
+    }
+
+
+def _append_case_points(
+    series: Dict[str, List[Dict[str, Any]]],
+    iteration: int,
+    case: Dict[str, Any],
+    promoted: bool,
+    baseline: bool,
 ) -> None:
-    summary = _hardware_summary(report)
+    prefix = "baseline" if baseline else "candidate"
+    _append_point(series["latency_ms"], iteration, case.get(f"{prefix}_ms"), promoted)
+    _append_point(series["speedup"], iteration, 1.0 if baseline else case.get("speedup"), promoted)
+    _append_point(series["regression"], iteration, 0.0 if baseline else case.get("regression"), promoted)
+    _append_point(series["tflops"], iteration, case.get(f"{prefix}_tflops"), promoted)
+    _append_point(
+        series["bandwidth_gbps"],
+        iteration,
+        case.get(f"{prefix}_bandwidth_gbps"),
+        promoted,
+    )
     for metric in _HARDWARE_METRICS:
-        _append_point(series[metric], iteration, summary.get(metric), promoted)
+        _append_point(series[metric], iteration, case.get(metric), promoted)
 
 
 def _merge_hardware_cases(

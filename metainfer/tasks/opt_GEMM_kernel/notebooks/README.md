@@ -32,7 +32,30 @@ remaining multi-stream workspace limitations, read
 `11_champion_engineering_DPP_alignment_generality.md`.
 
 For the measured follow-up work on large-M MMAC L2-aware CTA swizzling,
-last-arriving-CTA fused split-K, the exact `M=1,N=8192,K=1024` BM=1
+last-arriving-CTA fused Split-K, the exact `M=1,N=8192,K=1024` BM=1
 specialization, physical-versus-logical bandwidth interpretation, and the
 shape guards and concurrency cautions required to use those techniques, read
 `12_MMAC_CTA_swizzle_fused_splitK_BM1.md`.
+
+For workspace ownership and fused Split-K concurrency history, read
+`13_stream_splitK workload_opt.md`. Its per-stream workspace design was not
+fully compiled or stress-tested on K100 and is not the final caller-owned
+workspace ABI, so use it as a correctness-risk record rather than a dispatch
+prescription.
+
+For the final `/home/FF/workspace/003` packed W8A8 MMAC implementation and its
+shape-specific bandwidth/compute techniques, read `14_bandwith_opt.md`. It
+distinguishes production dispatches from experiments and records the evidence
+source for each technique.
+
+## How agents must use this knowledge base
+
+These notes are historical evidence, constraints, and candidate hypotheses.
+They are intentionally not exhaustive and never override the current
+`submission/`, frozen shape contract, or fresh hipprof evidence. Before choosing
+an optimization, inspect the current source and join each target shape with its
+summed GPU operator time, dispatch breakdown, HBM/L2 metrics, and available
+resource data. Derive a bounded, measurable, reversible hypothesis independently;
+new ideas outside these notebooks are expected when the evidence supports them.
+Absolute microsecond values in a notebook are machine/run-specific observations,
+not portable performance requirements.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import shutil
+import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +24,12 @@ from .evaluator import (
     FrozenEvaluatorBundle,
     FrozenWeightBundle,
 )
+from .evaluator.champion import (
+    ReportReference,
+    load_report_reference,
+    make_report_reference,
+    write_json_atomic,
+)
 from .guidance import GuidanceStore
 from .iteration_record import IterationRecord
 from .plugin import PLUGIN
@@ -31,6 +38,7 @@ from .prompts import (
     implement_prompt,
     perf_plan_prompt,
     plan_prompt,
+    repair_prompt,
     review_prompt,
     with_human_guidance,
 )
@@ -91,6 +99,7 @@ class Orchestrator:
         self.champions = ChampionStore(
             cfg.state_dir / "champion",
             cfg.evaluator_bundle.spec.acceptance.noise_threshold,
+            cfg.evaluator_bundle.spec.benchmark_case_ids,
         )
 
     def run(self) -> None:
@@ -114,13 +123,15 @@ class Orchestrator:
             self.store.update_run(current_iteration=0, current_phase="S_baseline")
             self.store.append_timeline("phase_start", {"iteration": 0, "phase": "S_baseline"})
             self.baseline = self._ensure_triton_baseline()
-            self.champions.initialize_triton(self.baseline)
+            self.champions.initialize_triton(self.baseline["benchmark_report"])
             self.initial_hip = self._ensure_initial_hip()
-            initial_score = dict(self.initial_hip.get("benchmark", {}).get("score") or {})
+            initial_score = dict(self.initial_hip["benchmark"].get("score") or {})
             if initial_score.get("passed"):
                 promoted, reason, champion = self.champions.consider(
-                    0, self.cfg.state_dir / "certified" / "initial-hip" / "submission",
-                    initial_score,
+                    0,
+                    self.cfg.state_dir / "certified" / "initial-hip" / "submission",
+                    self.initial_hip["benchmark_report"],
+                    self.baseline["benchmark_report"],
                 )
                 self.store.append_timeline("initial_hip_challenged", {
                     "promoted": promoted, "reason": reason, "champion": champion,
@@ -216,6 +227,27 @@ class Orchestrator:
             ),
         )
 
+        if not (
+            compile_result.passed and correctness is not None and correctness.passed
+        ):
+            ok, repair_failure = self._agent_phase(
+                rec, "B_implement", role="repair", workdir=submission_dir,
+                prompt=repair_prompt(self.agent_req, submission_dir, n, test_feedback),
+            )
+            if ok:
+                build_result, compile_result, correctness = self._test_phase(
+                    rec, submission_dir, logs_dir
+                )
+                test_feedback = self._write_feedback(
+                    logs_dir, compile_result=compile_result,
+                    correctness_result=correctness,
+                )
+                rec.phases["C_test"]["repair_attempted"] = True
+                self._write(rec)
+            else:
+                rec.phases.setdefault("C_test", {})["repair_failure"] = repair_failure
+                self._write(rec)
+
         if not compile_result.passed:
             return self._finish_failed(
                 rec,
@@ -230,17 +262,63 @@ class Orchestrator:
             )
 
         benchmark = self._evaluation_phase(
-            rec, "E_perf_test", "benchmark", submission_dir,
+            rec, "E_perf_test", submission_dir,
             build_result.artifact_dir, logs_dir,
         )
         score = dict(benchmark.report.get("score") or {})
         rec.score = score
-        rec.hardware_profile = dict(benchmark.report.get("hardware_profile") or {})
+        if benchmark.infra_failure:
+            perf_feedback = self._write_feedback(
+                logs_dir, compile_result=compile_result,
+                correctness_result=correctness, benchmark_result=benchmark,
+            )
+            del perf_feedback
+            return self._finish_failed(
+                rec, P.INFRA_FAIL,
+                benchmark.failure or "benchmark infrastructure failure",
+            )
+
+        diagnostic_ids = [] if benchmark.passed else list(
+            score.get("failed_case_ids") or []
+        )
+
+        if self.profiler is not None and (benchmark.passed or diagnostic_ids):
+            diagnostic = self.profiler.run(
+                build_result.artifact_dir, logs_dir, role="candidate",
+                collection_mode="full",
+                case_ids=None if benchmark.passed else diagnostic_ids,
+                run_label="candidate-diagnostic",
+                implementation="candidate",
+            )
+            if diagnostic.passed:
+                diagnostic_path = logs_dir / "candidate-diagnostic-hardware-profile.json"
+                rec.profile_report = make_report_reference(
+                    self.cfg.state_dir, diagnostic_path
+                )
+                benchmark.report["_profile_report"] = diagnostic.report
+            elif benchmark.passed:
+                benchmark.infra_failure = True
+                benchmark.passed = False
+                benchmark.failure = (
+                    diagnostic.failure or "promotable candidate full PMC archive failed"
+                )
+                self._write_feedback(
+                    logs_dir, compile_result=compile_result,
+                    correctness_result=correctness, benchmark_result=benchmark,
+                )
+                return self._finish_failed(
+                    rec, P.INFRA_FAIL, benchmark.failure
+                )
         promoted = False
         reason = benchmark.failure or "benchmark failed"
         champion = self.champions.load()
         if benchmark.passed:
-            promoted, reason, champion = self.champions.consider(n, submission_dir, score)
+            promoted, reason, champion = self.champions.consider(
+                n,
+                submission_dir,
+                rec.measurement_report,
+                rec.incumbent_measurement_report,
+            )
         rec.promoted = promoted
         rec.champion_iteration = int(champion.get("iteration", 0))
         self._write(rec)
@@ -254,8 +332,6 @@ class Orchestrator:
         )
         self._perf_plan(rec, iter_dir, perf_feedback, promotion)
 
-        if benchmark.infra_failure:
-            return self._finish_failed(rec, P.INFRA_FAIL, benchmark.failure or "benchmark infrastructure failure")
         outcome = P.OK if promoted else P.PERF_REGRESSION
         return self._finish(rec, "success" if promoted else "not_promoted", outcome, reason if not promoted else None)
 
@@ -329,59 +405,230 @@ class Orchestrator:
         self,
         rec: IterationRecord,
         phase: P.Phase,
-        evaluator_phase: str,
         submission_dir: Path,
         artifact_dir: Path,
         logs_dir: Path,
     ) -> EvaluationResult:
         self._start_phase(rec, phase)
         try:
-            result = self.evaluator.run(
-                evaluator_phase,
-                submission_dir,
-                artifact_dir,
-                logs_dir,
-                role="candidate",
-                build_fingerprint=self.builder.profile.fingerprint,
-                baseline_report=(
-                    self.baseline.get("benchmark") if evaluator_phase == "benchmark" else None
-                ),
-            )
-            if (
-                evaluator_phase == "benchmark" and result.passed
-                and self.profiler is not None
-            ):
-                profile_result = self.profiler.run(
-                    artifact_dir, logs_dir, role="candidate"
+            incumbent = self.champions.load()
+            if incumbent.get("kind") == "hip":
+                incumbent_build = self.builder.build(
+                    self.champions.submission_dir, logs_dir / "incumbent-build"
                 )
-                result.report["hardware_profile"] = profile_result.report
-                if not profile_result.passed and self.profiler.profile.required:
-                    result = EvaluationResult(
-                        evaluator_phase, False, result.report,
-                        profile_result.failure or "required hardware profile failed", True,
+                if not incumbent_build.passed:
+                    raise RuntimeError(
+                        incumbent_build.failure or "current Champion did not rebuild"
                     )
+                incumbent_artifact = incumbent_build.artifact_dir
+                incumbent_impl = "candidate"
+                incumbent_fingerprint = self.builder.profile.fingerprint
+            else:
+                incumbent_artifact = self.cfg.state_dir / "baseline" / "runtime-artifacts"
+                incumbent_impl = "triton"
+                incumbent_fingerprint = "triton-jit"
+            incumbent_result, incumbent_ref, incumbent_profile_ref, _ = self._profile_benchmark(
+                incumbent_artifact, logs_dir, role="baseline",
+                build_fingerprint=incumbent_fingerprint,
+                report_label="incumbent", collection_mode="trace",
+                implementation=incumbent_impl,
+            )
+            if not incumbent_result.passed or incumbent_ref is None:
+                raise RuntimeError(
+                    incumbent_result.failure or "same-round Champion trace failed"
+                )
+            rec.incumbent_measurement_report = incumbent_ref
+            if incumbent_profile_ref:
+                rec.incumbent_profile_report = incumbent_profile_ref
+            result, measurement_ref, profile_ref, profile_report = (
+                self._profile_benchmark(
+                    artifact_dir,
+                    logs_dir,
+                    role="candidate",
+                    build_fingerprint=self.builder.profile.fingerprint,
+                    baseline_report=incumbent_result.report,
+                    collection_mode="trace",
+                )
+            )
+            if result.passed and _near_promotion_boundary(
+                incumbent_result.report, result.report,
+                self.cfg.evaluator_bundle.spec.acceptance.noise_threshold,
+            ):
+                incumbent_retry, _, _, _ = self._profile_benchmark(
+                    incumbent_artifact, logs_dir, role="baseline",
+                    build_fingerprint=incumbent_fingerprint,
+                    report_label="incumbent-retest", collection_mode="trace",
+                    implementation=incumbent_impl,
+                )
+                candidate_retry, _, _, _ = self._profile_benchmark(
+                    artifact_dir, logs_dir, role="candidate",
+                    build_fingerprint=self.builder.profile.fingerprint,
+                    baseline_report=incumbent_retry.report,
+                    report_label="candidate-retest", collection_mode="trace",
+                )
+                if not incumbent_retry.passed or candidate_retry.infra_failure:
+                    raise RuntimeError("boundary retest hipprof trace failed")
+                incumbent_combined = _combine_hipprof_reports(
+                    incumbent_result.report, incumbent_retry.report
+                )
+                candidate_combined = _combine_hipprof_reports(
+                    result.report, candidate_retry.report
+                )
+                incumbent_path = logs_dir / "incumbent-combined-benchmark-report.json"
+                candidate_path = logs_dir / "candidate-combined-benchmark-report.json"
+                write_json_atomic(incumbent_path, incumbent_combined)
+                incumbent_ref = make_report_reference(self.cfg.state_dir, incumbent_path)
+                rec.incumbent_measurement_report = incumbent_ref
+                result = self.evaluator.validate_benchmark_report(
+                    candidate_combined, role="candidate",
+                    build_fingerprint=self.builder.profile.fingerprint,
+                    baseline_report=incumbent_combined,
+                )
+                result.report["boundary_retested"] = True
+                write_json_atomic(candidate_path, result.report)
+                measurement_ref = make_report_reference(self.cfg.state_dir, candidate_path)
+            if measurement_ref:
+                rec.measurement_report = measurement_ref
+            if profile_ref:
+                rec.profile_report = profile_ref
+            if profile_report:
+                result.report["_profile_report"] = profile_report
         except Exception as exc:  # noqa: BLE001
             result = EvaluationResult(
-                evaluator_phase, False, {}, f"evaluator crashed: {exc!r}", True
+                "benchmark", False, {}, f"hipprof evaluation crashed: {exc!r}", True
             )
         outcome = P.OK if result.passed else (
-            P.INFRA_FAIL if result.infra_failure else (
-                P.PERF_REGRESSION if evaluator_phase == "benchmark" else P.LOGIC_FAIL
-            )
+            P.INFRA_FAIL if result.infra_failure else P.PERF_REGRESSION
         )
         summary: Dict[str, Any] = {
-            "report": str(logs_dir / f"candidate-{evaluator_phase}-report.json"),
+            "report": str(logs_dir / "candidate-benchmark-report.json"),
             "build_fingerprint": self.builder.profile.fingerprint,
+            "score": result.report.get("score"),
+            "measurement_report": dict(rec.measurement_report),
+            "profile_report": dict(rec.profile_report),
+            "incumbent_measurement_report": dict(rec.incumbent_measurement_report),
         }
-        if evaluator_phase == "benchmark":
-            summary["score"] = result.report.get("score")
-            summary["hardware_profile"] = str(
-                logs_dir / "candidate-hardware-profile.json"
-            )
-        if evaluator_phase == "correctness":
-            summary["summary"] = result.report.get("summary")
         self._end_phase(rec, phase, outcome, result.failure, summary)
         return result
+
+    def _profile_benchmark(
+        self,
+        artifact_dir: Path,
+        report_dir: Path,
+        *,
+        role: str,
+        build_fingerprint: str,
+        baseline_report: Optional[Dict[str, Any]] = None,
+        report_label: Optional[str] = None,
+        collection_mode: str = "trace",
+        implementation: Optional[str] = None,
+    ) -> tuple[
+        EvaluationResult,
+        Optional[ReportReference],
+        Optional[ReportReference],
+        Dict[str, Any],
+    ]:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        label = report_label or role
+        benchmark_path = report_dir / f"{label}-benchmark-report.json"
+        if self.profiler is None:
+            result = EvaluationResult(
+                "benchmark", False, {}, "required hipprof profiler is unavailable", True
+            )
+            return result, None, None, {}
+
+        profiled = self.profiler.run(
+            artifact_dir, report_dir, role=role,
+            collection_mode=collection_mode, run_label=label,
+            implementation=implementation,
+        )
+
+        profile_report = dict(profiled.report)
+        profile_path = report_dir / f"{label}-hardware-profile.json"
+        try:
+            profile_ref = make_report_reference(self.cfg.state_dir, profile_path)
+        except RuntimeError as exc:
+            result = EvaluationResult(
+                "benchmark", False, {}, f"hipprof report is unavailable: {exc}", True
+            )
+            return result, None, None, profile_report
+
+        report: Dict[str, Any] = {
+            "schema_version": 2,
+            "passed": bool(profiled.passed),
+            "methodology": dict(self.cfg.evaluator_bundle.spec.benchmark_protocol),
+            "timing_source": "hipprof GPU kernel DurationNs",
+            "timed_scope": "operator_gpu_dispatches_only",
+            "profile_report": dict(profile_ref),
+            "cases": [],
+        }
+        if not profiled.passed:
+            write_json_atomic(benchmark_path, report)
+            measurement_ref = make_report_reference(self.cfg.state_dir, benchmark_path)
+            result = EvaluationResult(
+                "benchmark",
+                False,
+                report,
+                profiled.failure or "required hipprof profile failed",
+                True,
+            )
+            return result, measurement_ref, profile_ref, profile_report
+
+        specs = {
+            spec.id: spec for spec in self.cfg.evaluator_bundle.spec.benchmark_cases
+        }
+        timing_cases = profile_report.get("timing_cases") or []
+        ids = [
+            str(case.get("id") or "")
+            for case in timing_cases
+            if isinstance(case, dict)
+        ]
+        duplicates = sorted({case_id for case_id in ids if ids.count(case_id) > 1})
+        expected = self.cfg.evaluator_bundle.spec.benchmark_case_ids
+        missing = sorted(set(expected) - set(ids))
+        unexpected = sorted(set(ids) - set(expected))
+        invalid = len(ids) != len(timing_cases) or "" in ids
+        if missing or unexpected or duplicates or invalid:
+            report["passed"] = False
+            report["profile_case_errors"] = {
+                "missing": missing,
+                "unexpected": unexpected,
+                "duplicate": duplicates,
+                "invalid": invalid,
+            }
+            write_json_atomic(benchmark_path, report)
+            measurement_ref = make_report_reference(self.cfg.state_dir, benchmark_path)
+            failure = (
+                "hipprof timing cases are incomplete: "
+                f"missing={missing}, unexpected={unexpected}, "
+                f"duplicate={duplicates}, invalid={invalid}"
+            )
+            result = EvaluationResult("benchmark", False, report, failure, True)
+            return result, measurement_ref, profile_ref, profile_report
+
+        cases: List[Dict[str, Any]] = []
+        for raw in timing_cases:
+            case_id = str(raw["id"])
+            spec = specs[case_id]
+            case = dict(raw)
+            case["timing_source"] = "hipprof GPU kernel DurationNs"
+            if spec.shape is not None:
+                case["shape"] = dict(spec.shape)
+            if spec.flops is not None:
+                case["flops"] = spec.flops
+            if spec.bytes is not None:
+                case["bytes"] = spec.bytes
+            cases.append(case)
+        report["cases"] = cases
+        result = self.evaluator.validate_benchmark_report(
+            report,
+            role=role,
+            build_fingerprint=build_fingerprint,
+            baseline_report=baseline_report,
+        )
+        write_json_atomic(benchmark_path, result.report)
+        measurement_ref = make_report_reference(self.cfg.state_dir, benchmark_path)
+        return result, measurement_ref, profile_ref, profile_report
 
     def _test_phase(
         self, rec: IterationRecord, submission_dir: Path, logs_dir: Path,
@@ -433,27 +680,56 @@ class Orchestrator:
         artifact_dir = baseline_dir / "runtime-artifacts"
         manifest_path = baseline_dir / "baseline-manifest.json"
         if manifest_path.is_file():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            digest = manifest.pop("manifest_sha256", None)
-            actual = _canonical_digest(manifest)
-            if digest != actual:
+            stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+            digest = stored.get("manifest_sha256")
+            manifest = {
+                key: value for key, value in stored.items()
+                if key != "manifest_sha256"
+            }
+            if digest != _canonical_digest(manifest):
                 raise RuntimeError("frozen baseline manifest changed")
             if manifest.get("evaluator_digest") != self.cfg.evaluator_bundle.digest:
                 raise RuntimeError("baseline evaluator differs from active evaluator")
-            if self.profiler is not None:
-                expected_profile = self.profiler.profile.fingerprint
-                actual_profile = (
-                    manifest.get("hardware_profile") or {}
-                ).get("profile_fingerprint")
-                if actual_profile != expected_profile:
-                    raise RuntimeError("baseline profiler differs from active hardware profile")
             if manifest.get("implementation") != "triton":
                 raise RuntimeError("baseline is not the certified Triton implementation")
-            self.store.append_timeline(
-                "baseline_reused",
-                {"implementation": "triton"},
+            benchmark_ref = manifest.get("benchmark_report")
+            profile_ref = manifest.get("profile_report")
+            if not isinstance(benchmark_ref, dict):
+                benchmark_ref = make_report_reference(
+                    self.cfg.state_dir,
+                    baseline_dir / "baseline-benchmark-report.json",
+                )
+            if not isinstance(profile_ref, dict):
+                profile_ref = make_report_reference(
+                    self.cfg.state_dir,
+                    baseline_dir / "baseline-hardware-profile.json",
+                )
+            benchmark = load_report_reference(self.cfg.state_dir, benchmark_ref)
+            profile = load_report_reference(self.cfg.state_dir, profile_ref)
+            validated = self.evaluator.validate_benchmark_report(
+                benchmark,
+                role="baseline",
+                build_fingerprint="triton-jit",
             )
-            return manifest
+            if not validated.passed:
+                raise RuntimeError(validated.failure or "frozen Triton benchmark is invalid")
+            if self.profiler is None:
+                raise RuntimeError("required hipprof profiler is unavailable")
+            if profile.get("profile_fingerprint") != self.profiler.profile.fingerprint:
+                raise RuntimeError(
+                    "baseline profiler differs from active hardware profile"
+                )
+            self.store.append_timeline(
+                "baseline_reused", {"implementation": "triton"}
+            )
+            return {
+                **manifest,
+                "manifest_sha256": digest,
+                "benchmark_report": dict(benchmark_ref),
+                "profile_report": dict(profile_ref),
+                "benchmark": validated.report,
+                "hardware_profile": profile,
+            }
 
         baseline_dir.mkdir(parents=True, exist_ok=True)
         submission.mkdir(parents=True, exist_ok=True)
@@ -468,40 +744,42 @@ class Orchestrator:
         )
         if not correctness.passed:
             raise RuntimeError(correctness.failure or "Triton baseline failed correctness")
-        benchmark = self.evaluator.run(
-            "benchmark", submission, artifact_dir, baseline_dir,
-            role="baseline", build_fingerprint="triton-jit",
+        benchmark, benchmark_ref, profile_ref, profile = self._profile_benchmark(
+            artifact_dir,
+            baseline_dir,
+            role="baseline",
+            build_fingerprint="triton-jit",
+            collection_mode="full",
         )
-        if not benchmark.passed:
-            raise RuntimeError(benchmark.failure or "Triton baseline benchmark failed")
-        hardware_profile: Dict[str, Any] = {}
-        if self.profiler is not None:
-            profiled = self.profiler.run(
-                artifact_dir, baseline_dir, role="baseline"
+        if not benchmark.passed or benchmark_ref is None or profile_ref is None:
+            raise RuntimeError(
+                benchmark.failure or "Triton baseline hipprof benchmark failed"
             )
-            hardware_profile = profiled.report
-            if not profiled.passed and self.profiler.profile.required:
-                raise RuntimeError(profiled.failure or "Triton hardware profile failed")
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "implementation": "triton",
             "certified_at": time.time(),
             "build_fingerprint": "triton-jit",
             "evaluator_digest": self.cfg.evaluator_bundle.digest,
             "correctness": correctness.report,
-            "benchmark": benchmark.report,
-            "hardware_profile": hardware_profile,
+            "benchmark_report": dict(benchmark_ref),
+            "profile_report": dict(profile_ref),
         }
         payload["manifest_sha256"] = _canonical_digest(payload)
-        manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_json_atomic(manifest_path, payload)
         self.store.append_timeline(
             "baseline_certified",
             {
                 "implementation": "triton",
                 "benchmark_cases": len(benchmark.report.get("cases") or []),
+                "measurement_report": benchmark_ref,
             },
         )
-        return payload
+        return {
+            **payload,
+            "benchmark": benchmark.report,
+            "hardware_profile": profile,
+        }
 
     def _ensure_initial_hip(self) -> Dict[str, Any]:
         """Independently certify the user-provided HIP optimization seed."""
@@ -509,13 +787,54 @@ class Orchestrator:
         submission = root / "submission"
         manifest_path = root / "initial-hip-manifest.json"
         if manifest_path.is_file():
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            digest = manifest.pop("manifest_sha256", None)
+            stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+            digest = stored.get("manifest_sha256")
+            manifest = {
+                key: value for key, value in stored.items()
+                if key != "manifest_sha256"
+            }
             if digest != _canonical_digest(manifest):
                 raise RuntimeError("frozen Initial HIP manifest changed")
             if manifest.get("submission_digest") != _tree_digest(submission):
                 raise RuntimeError("frozen Initial HIP submission changed")
-            return manifest
+            if manifest.get("evaluator_digest") != self.cfg.evaluator_bundle.digest:
+                raise RuntimeError("Initial HIP evaluator differs from active evaluator")
+            benchmark_ref = manifest.get("benchmark_report")
+            profile_ref = manifest.get("profile_report")
+            if not isinstance(benchmark_ref, dict):
+                benchmark_ref = make_report_reference(
+                    self.cfg.state_dir,
+                    root / "candidate-benchmark-report.json",
+                )
+            if not isinstance(profile_ref, dict):
+                profile_ref = make_report_reference(
+                    self.cfg.state_dir,
+                    root / "candidate-hardware-profile.json",
+                )
+            benchmark = load_report_reference(self.cfg.state_dir, benchmark_ref)
+            profile = load_report_reference(self.cfg.state_dir, profile_ref)
+            validated = self.evaluator.validate_benchmark_report(
+                benchmark,
+                role="candidate",
+                build_fingerprint=self.builder.profile.fingerprint,
+                baseline_report=self.baseline["benchmark"],
+            )
+            if validated.infra_failure:
+                raise RuntimeError(validated.failure or "Initial HIP benchmark is invalid")
+            if self.profiler is None:
+                raise RuntimeError("required hipprof profiler is unavailable")
+            if profile.get("profile_fingerprint") != self.profiler.profile.fingerprint:
+                raise RuntimeError(
+                    "Initial HIP profiler differs from active hardware profile"
+                )
+            return {
+                **manifest,
+                "manifest_sha256": digest,
+                "benchmark_report": dict(benchmark_ref),
+                "profile_report": dict(profile_ref),
+                "benchmark": validated.report,
+                "hardware_profile": profile,
+            }
 
         initial = self.cfg.initial_submission
         if initial is None or not initial.is_dir():
@@ -531,19 +850,20 @@ class Orchestrator:
         )
         if not correctness.passed:
             raise RuntimeError(correctness.failure or "Initial HIP failed correctness")
-        benchmark = self.evaluator.run(
-            "benchmark", submission, build_result.artifact_dir, root,
-            role="candidate", build_fingerprint=self.builder.profile.fingerprint,
+        benchmark, benchmark_ref, profile_ref, profile = self._profile_benchmark(
+            build_result.artifact_dir,
+            root,
+            role="candidate",
+            build_fingerprint=self.builder.profile.fingerprint,
             baseline_report=self.baseline["benchmark"],
+            collection_mode="full",
         )
-        hardware_profile: Dict[str, Any] = {}
-        if self.profiler is not None:
-            profiled = self.profiler.run(build_result.artifact_dir, root, role="candidate")
-            hardware_profile = profiled.report
-            if not profiled.passed and self.profiler.profile.required:
-                raise RuntimeError(profiled.failure or "Initial HIP hardware profile failed")
+        if benchmark.infra_failure or benchmark_ref is None or profile_ref is None:
+            raise RuntimeError(
+                benchmark.failure or "Initial HIP hipprof benchmark failed"
+            )
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "implementation": "initial-hip",
             "certified_at": time.time(),
             "build_fingerprint": self.builder.profile.fingerprint,
@@ -551,16 +871,21 @@ class Orchestrator:
             "submission_digest": _tree_digest(submission),
             "compile": build_result.report,
             "correctness": correctness.report,
-            "benchmark": benchmark.report,
-            "hardware_profile": hardware_profile,
+            "benchmark_report": dict(benchmark_ref),
+            "profile_report": dict(profile_ref),
         }
         payload["manifest_sha256"] = _canonical_digest(payload)
-        manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_json_atomic(manifest_path, payload)
         self.store.append_timeline("initial_hip_certified", {
             "benchmark_cases": len(benchmark.report.get("cases") or []),
             "passed_gates": bool((benchmark.report.get("score") or {}).get("passed")),
+            "measurement_report": benchmark_ref,
         })
-        return payload
+        return {
+            **payload,
+            "benchmark": benchmark.report,
+            "hardware_profile": profile,
+        }
 
     def _review(
         self,
@@ -681,7 +1006,7 @@ class Orchestrator:
                 "score": score,
                 "methodology": benchmark_result.report.get("methodology") or {},
                 "hardware_profile": _agent_profile_feedback(
-                    benchmark_result.report.get("hardware_profile") or {}
+                    benchmark_result.report.get("_profile_report") or {}
                 ),
             }
         if promotion:
@@ -778,7 +1103,11 @@ def _agent_profile_feedback(report: Dict[str, Any]) -> Dict[str, Any]:
         "gpu_arch": report.get("gpu_arch"),
         "tool": report.get("tool"),
         "counter_groups": report.get("counter_groups") or [],
-        "cases": report.get("cases") or [],
+        "cases": [
+            {key: value for key, value in case.items()
+             if key != "operator_samples_us"}
+            for case in report.get("cases") or [] if isinstance(case, dict)
+        ],
     }
 
 
@@ -788,6 +1117,70 @@ def _canonical_digest(data: Dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _near_promotion_boundary(
+    incumbent: Dict[str, Any], candidate: Dict[str, Any], threshold: float,
+) -> bool:
+    incumbent_by_id = {
+        str(case.get("id")): case for case in incumbent.get("cases") or []
+        if isinstance(case, dict) and case.get("id")
+    }
+    for case in candidate.get("cases") or []:
+        case_id = str(case.get("id") or "")
+        if case_id not in incumbent_by_id:
+            continue
+        old = float(incumbent_by_id[case_id]["latency_ms"])
+        new = float(case["latency_ms"])
+        improvement = 1.0 - new / old
+        if abs(improvement - threshold) <= threshold:
+            return True
+    return False
+
+
+def _combine_hipprof_reports(
+    first: Dict[str, Any], second: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Combine equal-sized hipprof batches without shape weighting."""
+    other = {
+        str(case.get("id")): case for case in second.get("cases") or []
+        if isinstance(case, dict) and case.get("id")
+    }
+    combined_cases = []
+    for raw in first.get("cases") or []:
+        case = dict(raw)
+        peer = other.get(str(case.get("id") or ""))
+        if peer is None:
+            raise RuntimeError("boundary retest cases differ")
+        samples = [
+            float(value) for value in case.get("operator_samples_ms") or []
+        ] + [
+            float(value) for value in peer.get("operator_samples_ms") or []
+        ]
+        if not samples:
+            samples = [float(case["latency_ms"]), float(peer["latency_ms"])]
+        mean = statistics.fmean(samples)
+        case.update({
+            "latency_ms": mean,
+            "latency_mean_ms": mean,
+            "latency_median_ms": statistics.median(samples),
+            "latency_stddev_ms": statistics.stdev(samples) if len(samples) > 1 else 0.0,
+            "latency_cv": (
+                statistics.stdev(samples) / mean if len(samples) > 1 and mean > 0 else 0.0
+            ),
+            "latency_min_ms": min(samples),
+            "latency_max_ms": max(samples),
+            "operator_samples_ms": samples,
+            "sample_count": len(samples),
+            "measurement_batches": 2,
+        })
+        combined_cases.append(case)
+    result = dict(first)
+    result["cases"] = combined_cases
+    result["measurement_batches"] = 2
+    result["aggregation"] = "arithmetic mean of all raw hipprof DurationNs operator samples"
+    result.pop("score", None)
+    return result
 
 
 def _tree_digest(root: Path) -> str:

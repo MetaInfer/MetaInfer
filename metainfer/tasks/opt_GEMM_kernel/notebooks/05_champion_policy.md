@@ -1,14 +1,29 @@
 # Champion/challenger policy
 
-Every iteration starts from the persisted champion, not merely the most recent
-candidate. A challenger is promoted only after compile, complete correctness,
-multi-shape scoring and critical-regression gates pass.
+Every HIP iteration starts from the persisted HIP Champion. While Triton remains
+Champion, iterations start from certified Initial HIP because Triton has no
+editable HIP submission tree.
 
-The challenger must also exceed the champion's weighted speedup by the noise
-threshold. Failed and non-promoted candidates remain in iteration history for
-diagnosis, but they never become the starting implementation for the next
-iteration.
+A challenger is eligible only after the system build and every correctness case
+pass. Its immutable hipprof performance report must contain exactly one finite
+positive operator latency for every frozen benchmark shape. Promotion then
+requires both per-shape gates:
 
-At the end of the task, `state/champion/submission/` is the selected artifact
-and `champion.json` identifies its source iteration and score.
+```text
+candidate_ms < triton_baseline_ms
+candidate_ms < champion_ms * (1 - noise_threshold)
+```
 
+The strict promotion comparison rejects equality where it would not represent a
+real improvement. One failed shape rejects the challenger; no weighted mean,
+critical-shape exception, or favorable aggregate can compensate.
+
+`champion.json` v2 stores Champion kind, source iteration, submission SHA-256,
+promotion metadata, and a task-state-relative measurement-report path plus
+SHA-256. It does not copy per-shape latency or aggregate score. Promotion and
+cold restart verify and reload that report. Iteration score and timeline values
+are derived historical snapshots only.
+
+Failed and non-promoted candidates remain in iteration history for diagnosis but
+never become the next starting implementation. The selected HIP artifact is
+stored under `champion/submission/`; a Triton Champion has no copied HIP source.

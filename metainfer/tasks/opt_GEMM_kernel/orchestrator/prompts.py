@@ -54,12 +54,23 @@ Previous sanitized evaluator feedback:
 {feedback}
 ```
 
-Read the contract and evaluation-protocol notebooks, then inspect the current
-`submission/`. If `perf_plan.md` exists, it is the previous iteration's
-F-phase recommendation: evaluate it against the current champion and public
-feedback instead of ignoring it. Write the new `plan.md` in the iteration
-directory. Choose one bounded, testable change, state the expected affected
-shapes, risks, and rollback rule. Do not edit `submission/` in this phase.
+Inspect the current `submission/`, the frozen public shapes, and the latest
+per-shape evidence before reading optimization notes. Treat notebooks as
+historical evidence, known constraints, and candidate hypotheses—not as an
+exhaustive search space, a required dispatch recipe, or a substitute for
+analyzing the current source and hardware. Notebook absolute timings are not
+cross-machine service-level targets. If `perf_plan.md` exists, evaluate its
+hypothesis against the current Champion, operator latency, dispatch breakdown,
+and PMC/resource evidence rather than applying it mechanically.
+
+Write the new `plan.md` in the iteration directory. Select one evidence-backed,
+bounded, measurable, reversible change; novelty is not a goal. State the exact
+affected shape IDs, numerical latency expectation, source-level mechanism,
+expected counter/resource movement, named control shapes expected to remain
+unchanged, risks, and rollback rule. Valid directions include reducing summed GPU operator
+time, reducing dispatch/reduction work, improving HBM or L2 efficiency,
+reducing VGPR/AGPR/SGPR/LDS/scratch pressure, or improving parallelism when the
+available evidence supports it. Do not edit `submission/` in this phase.
 
 {BOUNDARY}
 """
@@ -146,11 +157,48 @@ Champion decision:
 {json.dumps(promotion, indent=2, ensure_ascii=False)}
 ```
 
-Write `perf_plan.md` in the iteration directory. Identify the shapes that
-improved or regressed, distinguish measurement noise from a plausible kernel
-bottleneck, use the system-provided hardware counters when present, and
-propose one bounded next optimization. Do not edit
+Write `perf_plan.md` in the iteration directory. Start from the current source
+and every public shape's hipprof GPU operator time. For multi-dispatch calls,
+interpret total operator latency and the per-kernel contribution breakdown;
+do not treat the longest kernel or PMC replay duration as latency. Correlate
+regressions with HBM read/write traffic and bandwidth, L2 behavior,
+VGPR/AGPR/SGPR, LDS, scratch, dispatch count, and occupancy/wave information
+only when the profiler actually reports it.
+
+Identify every failed shape and use reported dispersion/CV and any boundary
+retest to distinguish noise from a plausible bottleneck. Rank up to three
+evidence-backed hypotheses, then recommend one bounded, measurable, reversible
+next optimization. Novelty is not a goal: prefer the strongest measured
+evidence even when the direction is already documented. Include numerical
+latency expectations for affected shapes, named control shapes expected to stay
+unchanged, expected counter/resource changes, and an explicit rollback rule. Do not edit
 `submission/`; the next A/B phases execute the new plan.
+
+{BOUNDARY}
+"""
+
+
+def repair_prompt(
+    req: Dict[str, Any], submission_dir: Path, iteration: int,
+    feedback: Dict[str, Any],
+) -> str:
+    return f"""You are making the single allowed build/correctness repair for GEMM iteration {iteration}.
+
+Writable submission directory: {submission_dir}
+Sanitized compiler/correctness evidence:
+```json
+{json.dumps(feedback, indent=2, ensure_ascii=False)}
+```
+
+Make only the smallest source change needed to address the evidenced failure.
+Do not introduce a new optimization, broaden the original plan, change the ABI,
+or modify any evaluator/profiler file. Update `CHANGELOG.md` with the repair.
+If the evidence is insufficient, leave source unchanged and explain why there.
+
+Public requirements:
+```json
+{_requirements(req)}
+```
 
 {BOUNDARY}
 """
@@ -170,9 +218,11 @@ def with_human_guidance(prompt: str, items: List[Dict[str, Any]]) -> str:
 
 The task owner submitted the following optimization ideas while the task was
 running. Treat them as high-priority hypotheses within the public GEMM
-contract. Inspect the current code and evidence before applying them. If an
-idea is unsafe, incompatible with the ABI, or contradicted by measurements,
-explain that in the plan/changelog instead of silently forcing it.
+contract, not as instructions to bypass independent analysis. Inspect the
+current code, target shapes, hipprof operator timing, dispatch breakdown, PMC
+evidence, and hardware constraints before applying them. If an idea is unsafe,
+incompatible with the ABI, or contradicted by measurements, explain that in
+the plan/changelog instead of silently forcing it.
 
 {rendered}
 

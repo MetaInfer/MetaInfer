@@ -11,6 +11,7 @@ import re
 import resource
 import shutil
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -23,6 +24,22 @@ class ProfilerError(RuntimeError):
 def _disable_core_dump() -> None:
     """Prevent a profiler crash from writing a multi-gigabyte core file."""
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def _python_executable() -> str:
+    """Return the real interpreter even when a launcher rewrites argv[0]."""
+    candidate = Path(sys.executable) if sys.executable else None
+    if candidate is not None and candidate.name.lower().startswith("python"):
+        return str(candidate.resolve())
+    try:
+        executable = Path("/proc/self/exe").resolve(strict=True)
+    except OSError as exc:
+        raise ProfilerError("cannot resolve the Python executable") from exc
+    if not executable.name.lower().startswith("python"):
+        raise ProfilerError(
+            f"resolved process executable is not Python: {executable}"
+        )
+    return str(executable)
 
 
 def _version(executable: str) -> str:
@@ -134,16 +151,14 @@ class FrozenProfilerProfile:
         if executable is None:
             if raw.get("required", True):
                 raise ProfilerError(
-                    "Hygon K100/gfx928 requires hipprof, rocprofv3, or rocprof "
-                    "on the target node"
+                    "Hygon K100/gfx928 requires hipprof on the target node"
                 )
             return None
-        if "hipprof" in executable.name:
-            kind = "hipprof"
-        elif "rocprofv3" in executable.name:
-            kind = "rocprofv3"
-        else:
-            kind = "rocprof"
+        if "hipprof" not in executable.name:
+            raise ProfilerError(
+                f"Hygon K100/gfx928 timing requires hipprof, got {executable}"
+            )
+        kind = "hipprof"
         available = _available_counters(executable, kind)
         configured = [list(map(str, group)) for group in raw.get("counter_groups") or []]
         groups = (
@@ -180,6 +195,10 @@ class FrozenProfilerProfile:
         return cls(**data)
 
     def verify(self) -> None:
+        if self.tool_kind != "hipprof":
+            raise ProfilerError(
+                f"Hygon K100/gfx928 timing requires hipprof, got {self.tool_kind}"
+            )
         data = asdict(self)
         expected = _fingerprint({**data, "fingerprint": ""})
         if expected != self.fingerprint:
@@ -203,10 +222,12 @@ class ProfilerRunner:
         *,
         private_env: Mapping[str, str],
         harness_argv: Optional[List[str]] = None,
+        benchmark_protocol: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.profile = profile
         self.private_env = dict(private_env)
         self.harness_argv = harness_argv
+        self.benchmark_protocol = dict(benchmark_protocol or {})
 
     def run(
         self,
@@ -214,22 +235,48 @@ class ProfilerRunner:
         output_dir: Path,
         *,
         role: str,
+        collection_mode: str = "trace",
+        case_ids: Optional[List[str]] = None,
+        run_label: Optional[str] = None,
+        implementation: Optional[str] = None,
     ) -> ProfileResult:
         try:
             self.profile.verify()
         except Exception as exc:  # noqa: BLE001
             return ProfileResult(False, {}, str(exc))
 
-        if self.harness_argv is not None:
-            harness_cmd = list(self.harness_argv)
-        else:
-            harness = artifact_dir / "metainfer_gemm_harness"
-            if not harness.is_file():
-                return ProfileResult(False, {}, f"native harness is missing: {harness}")
-            harness_cmd = [str(harness.resolve())]
+        if self.profile.tool_kind != "hipprof":
+            return ProfileResult(
+                False, {},
+                f"K100 performance evaluation requires hipprof, got {self.profile.tool_kind}",
+            )
+        if self.harness_argv is None or len(self.harness_argv) < 2:
+            return ProfileResult(False, {}, "frozen hipprof workload driver is missing")
+        harness_cmd = list(self.harness_argv)
 
-        root = output_dir / f"{role}-hardware-profile"
+        if collection_mode not in {"trace", "full"}:
+            return ProfileResult(False, {}, f"invalid collection mode: {collection_mode}")
+        root = output_dir / (run_label or f"{role}-hardware-profile")
         root.mkdir(parents=True, exist_ok=True)
+        evaluator = Path(harness_cmd[1]).resolve()
+        suite = evaluator.with_name("run_hipprof_suite.py")
+        analyzer = evaluator.with_name("analyze_hipprof_suite.py")
+        if not suite.is_file() or not analyzer.is_file():
+            return ProfileResult(False, {}, "task-local hipprof suite or analyzer is missing")
+        return self._run_hipprof_suite(
+            artifact_dir, output_dir, root, role, suite, analyzer,
+            collection_mode=collection_mode, case_ids=case_ids,
+            report_label=run_label or role, implementation=implementation)
+
+    def _run_legacy_profile_route(
+        self,
+        artifact_dir: Path,
+        output_dir: Path,
+        root: Path,
+        role: str,
+        harness_cmd: List[str],
+    ) -> ProfileResult:
+        """Retained only for parsing historical profiler fixtures."""
         cases: List[Dict[str, Any]] = []
         commands: List[List[str]] = []
         for case_id in self.profile.representative_cases:
@@ -302,6 +349,175 @@ class ProfilerRunner:
         _write_json(output_dir / f"{role}-hardware-profile.json", report)
         return ProfileResult(True, report)
 
+    def _run_hipprof_suite(
+        self,
+        artifact_dir: Path,
+        output_dir: Path,
+        root: Path,
+        role: str,
+        suite: Path,
+        analyzer: Path,
+        *,
+        collection_mode: str,
+        case_ids: Optional[List[str]],
+        report_label: str,
+        implementation: Optional[str],
+    ) -> ProfileResult:
+        """Run task-local full trace + PMC/read/write collection.
+
+        The frozen harness owns case enumeration and analysis. The system still
+        owns the resolved hipprof executable, candidate artifact, weights, and
+        output directory; no external benchmark checkout is consulted.
+        """
+        implementation = implementation or (
+            "triton" if role == "baseline" else "candidate"
+        )
+        if implementation not in {"triton", "candidate"}:
+            return ProfileResult(False, {}, f"invalid implementation: {implementation}")
+        python_executable = _python_executable()
+        command = [
+            python_executable, str(suite),
+            "--hipprof", self.profile.executable,
+            "--output-dir", str(root.resolve()),
+            "--implementations", implementation,
+            "--passes", collection_mode,
+        ]
+        if case_ids:
+            command.extend(["--case-ids", ",".join(case_ids)])
+        env = dict(os.environ)
+        env.update(self.private_env)
+        env.update({
+            "METAINFER_EVALUATION_PHASE": "profile-batch",
+            "METAINFER_EVALUATION_ROLE": role,
+            "METAINFER_BUILD_ARTIFACT_DIR": str(artifact_dir.resolve()),
+            "METAINFER_REPORT_PATH": str((root / "suite-report.json").resolve()),
+            "METAINFER_BENCHMARK_PROTOCOL": json.dumps(
+                self.benchmark_protocol, sort_keys=True
+            ),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        try:
+            proc = subprocess.run(
+                command, cwd=str(suite.parent), env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=2400 if collection_mode == "full" else 900,
+                check=False, preexec_fn=_disable_core_dump,
+            )
+        except subprocess.TimeoutExpired as exc:
+            report = self._report([], [command])
+            _write_json(output_dir / f"{report_label}-hardware-profile.json", report)
+            return ProfileResult(False, report, f"hipprof suite timed out: {exc}")
+        (root / "suite.stdout.log").write_text(proc.stdout or "", encoding="utf-8")
+        (root / "suite.stderr.log").write_text(proc.stderr or "", encoding="utf-8")
+        if proc.returncode:
+            report = self._report([], [command])
+            _write_json(output_dir / f"{report_label}-hardware-profile.json", report)
+            return ProfileResult(False, report, "task-local hipprof suite failed")
+
+        analyze_command = [python_executable, str(analyzer), str(root.resolve())]
+        analyzed = subprocess.run(
+            analyze_command, cwd=str(analyzer.parent), env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=300, check=False, preexec_fn=_disable_core_dump,
+        )
+        (root / "analyze.stdout.log").write_text(
+            analyzed.stdout or "", encoding="utf-8")
+        (root / "analyze.stderr.log").write_text(
+            analyzed.stderr or "", encoding="utf-8")
+        if analyzed.returncode:
+            report = self._report([], [command, analyze_command])
+            _write_json(output_dir / f"{report_label}-hardware-profile.json", report)
+            return ProfileResult(False, report, "task-local hipprof analysis failed")
+
+        metrics = json.loads((root / "metrics.json").read_text(encoding="utf-8"))
+        cases = []
+        for row in metrics.get("rows", []):
+            read_bytes = float(row.get("hbm_read_bytes") or 0)
+            write_bytes = float(row.get("hbm_write_bytes") or 0)
+            try:
+                kernel_breakdown = json.loads(
+                    row.get("trace_kernel_means_json") or "{}"
+                )
+            except (TypeError, json.JSONDecodeError):
+                kernel_breakdown = {}
+            cases.append({
+                "id": row["case_id"],
+                "duration_ns": float(row["operator_mean_us"]) * 1000.0,
+                "latency_mean_us": float(row["operator_mean_us"]),
+                "latency_median_us": float(row.get("operator_median_us") or 0),
+                "latency_stddev_us": float(row.get("operator_stddev_us") or 0),
+                "latency_cv": float(row.get("operator_cv") or 0),
+                "latency_min_us": float(row.get("operator_min_us") or 0),
+                "latency_max_us": float(row.get("operator_max_us") or 0),
+                "operator_samples_us": list(row.get("operator_samples_us") or []),
+                "dispatch_count": int(row.get("trace_dispatches_per_call") or 0),
+                "pmc_dispatch_count": int(row.get("pmc_dispatch_count") or 0),
+                "kernel_name": row.get("main_kernel", ""),
+                "kernel_breakdown_us": kernel_breakdown,
+                "vgpr_count": int(row.get("vgpr") or 0),
+                "agpr_count": int(row.get("agpr") or 0),
+                "sgpr_count": int(row.get("sgpr") or 0),
+                "lds_bytes": int(row.get("lds_bytes") or 0),
+                "scratch_bytes": int(row.get("scratch_bytes") or 0),
+                "grid_size": int(row.get("grid_size") or 0),
+                "workgroup_size": int(row.get("workgroup_size") or 0),
+                "wave_size": int(row.get("wave_size") or 0),
+                "waves_per_workgroup": row.get("waves_per_workgroup"),
+                "occupancy_pct": row.get("occupancy_pct"),
+                "l2_hit_pct": row.get("l2_hit_pct"),
+                "hbm_read_bytes": read_bytes,
+                "hbm_write_bytes": write_bytes,
+                "hbm_read_gbps": row.get("hbm_read_gbs"),
+                "hbm_write_gbps": row.get("hbm_write_gbs"),
+                "measured_bandwidth_gbps": row.get("hbm_total_gbs"),
+                "compute_busy_pct": None,
+                "matrix_instructions": None,
+                "valu_instructions": None,
+                "counters": {
+                    "HBM_READ_BYTES": read_bytes,
+                    "HBM_WRITE_BYTES": write_bytes,
+                },
+            })
+        report = self._report(cases, [command, analyze_command])
+        # The task-local analyzer has already validated the exact requested
+        # case set. Representative-case coverage applies only to the legacy
+        # route, not to scoped diagnostic collections.
+        report["passed"] = bool(cases)
+        report["collection_mode"] = collection_mode
+        report["collection_method"] = (
+            "task-local hipprof trace plus pmc/pmc-read/pmc-write"
+            if collection_mode == "full" else "task-local hipprof trace"
+        )
+        report["pass_records"] = metrics.get("pass_records") or []
+        report["full_metrics_csv"] = str((root / "metrics.csv").resolve())
+        report["timing_source"] = "hipprof kernel DurationNs"
+        report["timing_cases"] = [
+            {
+                "id": row["case_id"],
+                "latency_ms": float(row["operator_mean_us"]) / 1000.0,
+                "latency_mean_ms": float(row["operator_mean_us"]) / 1000.0,
+                "latency_median_ms": float(row.get("operator_median_us") or 0) / 1000.0,
+                "latency_stddev_ms": float(row.get("operator_stddev_us") or 0) / 1000.0,
+                "latency_cv": float(row.get("operator_cv") or 0),
+                "latency_min_ms": float(row.get("operator_min_us") or 0) / 1000.0,
+                "latency_max_ms": float(row.get("operator_max_us") or 0) / 1000.0,
+                "operator_samples_ms": [
+                    float(value) / 1000.0
+                    for value in row.get("operator_samples_us") or []
+                ],
+                "sample_count": len(row.get("operator_samples_us") or []),
+                "kernel_name": row.get("main_kernel") or row.get("timed_kernel", ""),
+                "dispatch_count": int(row.get("trace_dispatches_per_call") or 0),
+                "kernel_breakdown_us": json.loads(
+                    row.get("trace_kernel_means_json") or "{}"
+                ),
+            }
+            for row in metrics.get("rows", [])
+        ]
+        _write_json(output_dir / f"{report_label}-hardware-profile.json", report)
+        return ProfileResult(report["passed"], report,
+                             None if report["passed"] else "profile cases missing")
+
     def _command(
         self, harness_cmd: List[str], case_id: str, counters: List[str], output: Path,
     ) -> List[str]:
@@ -332,9 +548,13 @@ class ProfilerRunner:
         ]
 
     def _report(self, cases: List[Dict[str, Any]], commands: List[List[str]]) -> Dict[str, Any]:
+        observed = {
+            str(case.get("id") or case.get("case_id") or "") for case in cases
+        }
+        expected = set(self.profile.representative_cases)
         return {
             "schema_version": 1,
-            "passed": len(cases) == len(self.profile.representative_cases),
+            "passed": bool(cases) and expected.issubset(observed),
             "profile_id": self.profile.id,
             "label": self.profile.label,
             "gpu_arch": self.profile.gpu_arch,

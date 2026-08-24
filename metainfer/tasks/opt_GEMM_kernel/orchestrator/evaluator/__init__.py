@@ -2,7 +2,12 @@
 
 from .champion import ChampionStore
 from .runner import EvaluationError, EvaluationResult, EvaluatorRunner
-from .scoring import ScoreResult, compare_measurements, score_benchmark
+from .scoring import (
+    PromotionResult,
+    ScoreResult,
+    compare_against_champion,
+    compare_measurements,
+)
 from .spec import BenchmarkCaseSpec, FrozenEvaluatorBundle, KernelTaskSpec, SpecError
 from .weights import FrozenWeightBundle
 
@@ -15,8 +20,9 @@ __all__ = [
     "FrozenEvaluatorBundle",
     "FrozenWeightBundle",
     "KernelTaskSpec",
+    "PromotionResult",
     "ScoreResult",
     "SpecError",
+    "compare_against_champion",
     "compare_measurements",
-    "score_benchmark",
 ]

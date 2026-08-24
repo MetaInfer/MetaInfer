@@ -1,85 +1,109 @@
 # opt_GEMM_kernel
 
-An independent MetaInfer task for arena-style GEMM kernel optimization. It
+An independent MetaInfer task for arena-style W8A8 GEMM kernel optimization. It
 does not import or modify `opt_kernel`, `gen_cpp_infer_framework`, or
 `gen_infer_framework`.
 
 ## Runtime inputs
 
 - `initial_submission`: initial HIP challenger and optimization-seed directory.
-- `evaluator_bundle`: task-author-provided harness directory containing
-  `task.yaml` and its correctness and benchmark runners. In the UI this is
-  called **Harness path**. MetaInfer snapshots it as the system-owned frozen
-  evaluator before execution.
-- `weight_bundle`: task-author-provided `model_weights/` directory containing
-  `info.json` and one raw `.bin` per tensor. The UI calls it **Weight
-  directory**. MetaInfer freezes it separately under `system_weights/`, outside
-  all optimizer-agent workspaces.
-- hardware profile selection. The first registered profile is **Hygon K100 / gfx928**.
+- `evaluator_bundle`: task-author-provided harness containing `task.yaml`, the
+  correctness runner, and the task-local hipprof suite. The UI calls this
+  **Harness path**. MetaInfer freezes it before execution.
+- `weight_bundle`: task-author-provided `model_weights/` containing `info.json`
+  and one raw `.bin` per tensor. MetaInfer freezes it under `system_weights/`,
+  outside every optimizer-agent workspace.
+- hardware profile selection. The registered production profile is
+  **Hygon K100 / gfx928**.
 
-The evaluator's `task.yaml::public_contract` owns dtype, layout and ABI, while
-its benchmark cases own shapes. These values are parsed once, frozen, supplied
-to agents, and displayed read-only; they are not duplicated as manual UI
-fields.
+`task.yaml::public_contract` is the source of truth for dtype, layout, numerics,
+and ABI. Its benchmark matrix owns the exact shapes. The UI renders these
+values read-only rather than asking the task owner to duplicate them.
 
-The initial submission includes a constrained `submission.yaml`; it does not
-own CMake, compiler or profiler commands. The task-local
-`orchestrator/hardware_profiles.yaml` binds the K100 selection to DTK/HIP,
-gfx928, CMake + Ninja, `-O3`, and a preferred `hipprof --pmc` route with
-rocprofv3/rocprof fallbacks. MetaInfer
-resolves the installed executables,
-materializes `system_build/{build_profile.json,CMakeLists.txt,build.sh}`, and
-freezes the device compiler, host C++ compiler, CMake, Ninja/Make generator,
-GPU architecture, fixed flags, and their fingerprint.
+## System-owned execution
 
-The evaluator bundle is copied into task state before agents run and checked
-against a SHA-256 manifest before and after each gate. The optimizer only
-receives public notebooks and sanitized feedback.
+The submission may list source/include paths and allowlisted build options in
+`submission.yaml`; it does not own CMake, compiler, architecture, evaluator, or
+profiler commands. The K100 hardware profile freezes DTK/HIP, gfx928, CMake +
+Ninja, `-O3`, hipprof, all profiler arguments, and a fingerprint of the resolved
+tools and protocol.
 
-The six iteration phases match the C++/Python framework loop exactly:
-`A_plan -> B_implement -> C_test -> D_review -> E_perf_test -> F_perf_plan`.
-`S_baseline` is a one-time preflight and is not a seventh loop phase. It first
-certifies the frozen Triton implementation (correctness, event benchmark, and
-PMC) as the iteration-0 Champion, then independently compiles and certifies the
-Initial HIP submission with its own correctness, benchmark, PMC, and artifact
-directories. Initial HIP replaces Triton only when the existing evaluator and
-noise/critical-regression gates accept it. Inside
-`C_test`, MetaInfer runs its fixed SystemBuilder and then the harness
-correctness command. `E_perf_test` first runs the full frozen event-timed
-benchmark and then profiles only three representative public shapes with the
-fixed K100 counter groups. The Harness `profile CASE_ID` entrypoint performs
-activation generation/quantization, weight loading and copies before its one
-candidate GEMM launch, so those preparation costs are not attributed to GEMM.
-`D_review` reviews C evidence; `F_perf_plan` analyzes E evidence and prepares
-the next optimization.
-See `harness/README.md` for the authoring workspace and runtime protocol.
+The evaluator and weight snapshots are SHA-256 verified at every gate. Agents
+receive only the public contract, notebooks, current submission, and sanitized
+system evidence. They cannot replace correctness, timing, scoring, or promotion
+logic.
 
-## Loop
+## Performance protocol
+
+K100 performance latency comes only from the required task-local hipprof trace
+suite. For each of the 60 frozen benchmark shapes, candidate and Triton setup,
+JIT, allocation, copies, weight preprocessing, packing, workspace initialization,
+and synchronization complete before the marked interval. The interval contains
+110 steady-state calls: 10 warmup calls followed by 100 measured calls.
+
+For each logical GEMM call, MetaInfer sums `DurationNs` for every related GPU
+dispatch. It then takes the arithmetic mean of the final 100 operator sums.
+This is GPU operator time only: host launch API time and synchronization overhead
+are excluded. A split-K main kernel plus reduction is therefore one operator
+sample containing both GPU dispatch durations.
+
+Every iteration remeasures the current Champion and candidate in the same
+round. Reports retain all raw operator samples and expose mean, median,
+standard deviation, CV, and observed range. Results near the noise boundary
+trigger a second equal-size hipprof trace for both sides; the decision uses the
+arithmetic mean of all raw `DurationNs` operator samples. No shape weighting or
+synthetic aggregate latency is used.
+
+hipprof `--pmc`, `--pmc-read`, and `--pmc-write` run separately. Routine
+iterations collect them only for failed diagnostic shapes; a promotable
+candidate receives a full-shape PMC archive. They provide
+HBM traffic/bandwidth, L2 behavior, VGPR/AGPR/SGPR, LDS, scratch, dispatch and
+wave metadata. Occupancy or wave residency is shown only when the profiler
+reports a reliable value. PMC replay duration is never latency. Each profiler
+pass records its real wall time and has an independent timeout. Missing hipprof,
+incomplete cases, unstable dispatch patterns, mismatched protocol fingerprints,
+or collection/analyzer failures are infrastructure failures; there is no event
+or rocprof timing fallback for K100.
+
+## Loop and promotion
 
 ```text
-Certified Triton Champion -> Certified Initial HIP challenger
+Certified Triton baseline -> Certified Initial HIP challenger
 -> A plan -> B implement -> C test -> D review -> E perf test -> F perf plan
 ```
 
-Each iteration starts from the persisted HIP Champion source. While Triton is
-still Champion, it starts from the independently certified Initial HIP source
-because Triton has no editable HIP submission tree. A candidate must pass every
-declared correctness and performance case, satisfy the weighted and critical
-shape gates, and beat the champion by more than the noise threshold before it
-is promoted.
+`S_baseline` is one-time preflight, not a seventh iteration phase. It certifies
+Triton correctness/performance, then independently builds and certifies Initial
+HIP. `C_test` runs the system build and frozen correctness command. `E_perf_test`
+runs the all-shape hipprof suite and the immutable performance-report gate.
 
-The task registers its own New Task card and creation form. Its detail page is
-kernel-specific: certified hardware/build identity, weighted latency, speedup,
-TFLOPS, modelled memory bandwidth, measured memory bandwidth, L2 hit rate,
-compute busy, VGPR/LDS pressure, critical-shape regression, per-case profile,
-and champion history. Modelled TFLOPS/bandwidth come from frozen evaluator
-metadata; hardware counters come only from the frozen system profiler.
+A candidate must satisfy all of these conditions:
 
-The detail page also provides a live optimization-guidance queue. A task owner can
-submit an optimization hypothesis at any time; it is durably delivered to the
-next planner or implementer launch and shown as pending/applied in the UI.
-Guidance can affect generated candidates but never changes evaluator or
-champion gates.
+1. compile and pass every declared correctness case;
+2. return one finite positive hipprof operator latency for every benchmark shape;
+3. preserve the certified lineage that originally beat Triton on every shape;
+4. be below the same-round `champion_ms * (1 - noise_threshold)` on every shape.
 
-See `notebooks/02_evaluation_protocol.md` for the evaluator bundle schema and
-structured report examples.
+There are no shape weights, critical-shape exceptions, or aggregate score that
+can compensate for a losing shape. When Triton remains Champion, the next HIP
+iteration still starts from certified Initial HIP because Triton has no editable
+HIP submission tree.
+
+The authoritative performance data is an immutable JSON report referenced by
+relative task-state path plus SHA-256. Triton, Initial HIP, every iteration, and
+Champion records point to these reports. Cold restart verifies and reloads the
+referenced report; iteration scores, timeline fields, and UI summaries are
+historical or derived views and never drive promotion.
+
+The detail page exposes raw per-shape baseline/candidate/Champion latency,
+speedup, regression, kernel dispatch breakdown, modeled rates from frozen
+metadata, HBM read/write/total bandwidth, L2, registers, LDS/scratch, and
+available wave/occupancy evidence. It does not produce a weighted overall score.
+
+Live task-owner guidance is durable input to the next planner or implementer,
+but remains a hypothesis. It cannot alter compilation, correctness, profiler,
+all-shape, or Champion gates.
+
+See `harness/README.md` for harness ownership,
+`notebooks/02_evaluation_protocol.md` for report and gate semantics, and
+`notebooks/04_profiling.md` for the K100 hipprof route.
