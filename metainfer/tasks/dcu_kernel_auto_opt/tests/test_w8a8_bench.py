@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import torch
-
 import pytest
+
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 
 from ..assets.w8a8_bench import (
     exact_w8a8_reference,
@@ -15,6 +18,7 @@ from ..assets.w8a8_bench import (
 )
 
 
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
 def test_exact_reference_uses_integer_dot_before_scaling():
     a = torch.tensor([[127, 127, 127], [-127, 1, 2]], dtype=torch.int8)
     b = torch.tensor(
@@ -56,6 +60,7 @@ def test_reference_cache_path_matches_benchmark_naming():
     assert path == Path("/tmp/cache") / "exact-int64-v1-m4096-n2304-k6144.pt"
 
 
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
 def test_save_reference_cache_roundtrip(tmp_path):
     reference = torch.tensor(
         [[1.5, -2.5], [3.0, 4.5]], dtype=torch.bfloat16

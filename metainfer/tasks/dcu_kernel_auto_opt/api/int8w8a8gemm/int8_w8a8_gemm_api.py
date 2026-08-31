@@ -37,7 +37,24 @@ from __future__ import annotations
 
 from typing import Final, Mapping
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError:  # Metadata validation runs in CPU-only CI.
+    torch = None  # type: ignore[assignment]
+
+
+def _torch_no_grad():
+    """Return PyTorch's decorator, or an import-only CI fallback."""
+    if torch is None:
+        return lambda function: function
+    return torch.no_grad()
+
+
+def _require_torch() -> None:
+    if torch is None:
+        raise RuntimeError(
+            "the INT8 W8A8 runtime API requires PyTorch in the DCU environment"
+        )
 
 
 # These are logical (K, N) dimensions after TP partitioning, not checkpoint
@@ -242,6 +259,7 @@ def _check_cuda_tensor(
     *,
     contiguous: bool = True,
 ) -> None:
+    _require_torch()
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if not tensor.is_cuda:
@@ -304,6 +322,7 @@ def validate_optimization_shape(shape: Mapping[str, object]) -> None:
 
 
 def _optional_op(namespace: str, name: str):
+    _require_torch()
     try:
         return getattr(getattr(torch.ops, namespace), name)
     except AttributeError:
@@ -320,7 +339,7 @@ def _required_op(namespace: str, name: str):
     return op
 
 
-@torch.no_grad()
+@_torch_no_grad()
 def prepare_weight(
     raw_weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -461,7 +480,7 @@ def validate_gemm_out_inputs(
     return m, n, k
 
 
-@torch.no_grad()
+@_torch_no_grad()
 def w8a8_gemm_out(
     x_q: torch.Tensor,
     packed_weight: torch.Tensor,
