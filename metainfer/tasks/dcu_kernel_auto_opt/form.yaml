@@ -1,0 +1,185 @@
+- key: operator
+  question: "Which operator will this task optimize? The concrete adapter contract is supplied when the operator is connected."
+  header: "Operator"
+  required: true
+  multi: false
+  default: "Quantized GEMM"
+  options:
+    - label: "Quantized GEMM"
+      description: "INT8/BF16/FP16 matrix multiplication, including W8A8"
+    - label: "Attention"
+      description: "MHA, MQA, GQA or MLA kernels"
+    - label: "RMSNorm / LayerNorm"
+      description: "Normalization kernels"
+    - label: "RoPE"
+      description: "Rotary positional embedding"
+    - label: "Custom operator"
+      description: "An extracted DCU kernel with a custom adapter"
+
+- key: kernel_language
+  question: "Kernel implementation stack."
+  header: "Stack"
+  required: true
+  multi: false
+  default: "HIP C++"
+  options:
+    - label: "HIP C++"
+      description: "Native DTK/HIP kernel for gfx928"
+    - label: "PyTorch HIP extension"
+      description: "HIP source loaded through a PyTorch extension"
+    - label: "TileLang / Triton"
+      description: "Generated kernel stack when supported by the target project"
+
+- key: target_hardware
+  question: "Target DCU platform."
+  header: "Hardware"
+  required: true
+  multi: false
+  default: "K500SM_AI / gfx928"
+  options:
+    - label: "K500SM_AI / gfx928"
+      description: "worker29, four DCUs, wavefront 64"
+    - label: "Other DCU"
+      description: "Requires an explicit hardware adapter"
+
+- key: dtype
+  question: "Compute and storage dtype."
+  header: "Dtype"
+  required: true
+  multi: false
+  default: "INT8 W8A8"
+  options:
+    - label: "INT8 W8A8"
+      description: "INT8 activation and weight"
+    - label: "FP16 / BF16"
+      description: "Half-precision floating point"
+    - label: "Other"
+      description: "Defined by the concrete operator adapter"
+
+- key: claude_model
+  question: "Claude model used by coordinator, kernel workers, repairs, synthesis, and validation."
+  header: "Claude model"
+  required: true
+  multi: false
+  default: "Opus"
+  options:
+    - label: "Opus"
+      description: "Highest-reasoning model for difficult kernel architecture and correctness work"
+    - label: "Sonnet"
+      description: "Faster model for lower-cost optimization runs"
+
+- key: execution_mode
+  question: "Task execution mode for this run."
+  header: "Mode"
+  required: true
+  multi: false
+  default: "Generate & optimize (auto-create kernel repo)"
+  options:
+    - label: "Generate & optimize (auto-create kernel repo)"
+      description: "Agent generates the complete kernel repo from scratch, then optimizes it. No pre-existing kernel code required."
+
+- key: target_repo_path
+  question: "Repository folder name under kernel-repos next to MetaInfer. Example: int8 test2 creates and directly uses kernel-repos/int8 test2."
+  header: "Kernel repo"
+  required: false
+  form: text
+  default: ""
+
+- key: model
+  question: "Which model's INT8 W8A8 GEMM workload will this task optimize? Shape selection is grouped by TP size (1/4/8)."
+  header: "Model"
+  required: true
+  multi: false
+  default: "DeepSeek V4 Flash"
+  options:
+    - label: "DeepSeek V4 Flash"
+      description: "SGLang DeepSeek-V4-Flash Channel INT8 W8A8 (TP1/4/8), current default workload"
+    - label: "Hy3 (Hunyuan 3)"
+      description: "Hy3 Channel INT8 W8A8 via vLLM v0.18.0"
+    - label: "MiniMax M3"
+      description: "MiniMax M3 W8A8; currently not deployable for testing"
+    - label: "GLM5.2"
+      description: "GLM-5.2 INT4/INT8 mix via SGLang v0.5.15"
+
+- key: shape_assignment_mode
+  question: "Choose whether the control plane or you assign shapes to physical GPUs."
+  header: "Shape assignment"
+  required: true
+  multi: false
+  default: "AI automatic"
+  options:
+    - label: "AI automatic"
+      description: "The control plane deterministically balances exact shapes across available GPUs"
+    - label: "Manual by GPU"
+      description: "Use four GPU cards below to explicitly choose where every shape is optimized"
+
+- key: shape_scope
+  question: "Choose whether this task optimizes the complete API workload or only a selected subset."
+  header: "Optimization scope"
+  required: true
+  multi: false
+  default: "All API shapes"
+  options:
+    - label: "All API shapes"
+      description: "Optimize every default shape exposed by the immutable operator API"
+    - label: "Selected shapes only"
+      description: "Optimize a task-sized subset; unselected shapes remain on the trusted fallback and are regression-tested"
+
+- key: shape_config
+  question: "Reads default optimization shapes from the fixed operator API. In manual mode, assign every shape to one GPU."
+  header: "Workload"
+  required: false
+  form: textarea
+  default: ""
+  override_component: "shape-input"
+
+- key: correctness_ref
+  question: "Trusted correctness reference owned by the MetaInfer adapter."
+  header: "Reference"
+  required: true
+  multi: false
+  default: "PyTorch eager"
+  options:
+    - label: "PyTorch eager"
+      description: "Compare with a deterministic PyTorch implementation"
+    - label: "SGLang operator"
+      description: "Compare with the extracted SGLang reference path"
+    - label: "Adapter-provided reference"
+      description: "The concrete adapter supplies the immutable reference"
+
+- key: perf_target
+  question: "Optional performance target, for example >=1.2x baseline."
+  header: "Perf bar"
+  required: false
+  default: "Improve stable median without P90 regression"
+
+- key: max_iterations
+  question: "Maximum optimization rounds per worker."
+  header: "Max iters"
+  required: true
+  multi: false
+  default: "5"
+  options:
+    - label: "1"
+      description: "Single-round validation"
+    - label: "3"
+      description: "Quick MVP exercise"
+    - label: "5"
+      description: "Default"
+    - label: "10"
+      description: "Longer optimization loop"
+    - label: "20"
+      description: "Extended exploration"
+
+- key: minimum_improvement_percent
+  question: "Final target improvement over the fixed baseline. This is not the per-round candidate acceptance threshold."
+  header: "Final improve"
+  required: true
+  form: number
+  default: 1.0
+
+- key: extra_notes
+  question: "Additional constraints, such as determinism or forbidden libraries."
+  header: "Notes"
+  required: false
+  form: textarea
