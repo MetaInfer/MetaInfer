@@ -37,24 +37,7 @@ from __future__ import annotations
 
 from typing import Final, Mapping
 
-try:
-    import torch
-except ModuleNotFoundError:  # Metadata validation runs in CPU-only CI.
-    torch = None  # type: ignore[assignment]
-
-
-def _torch_no_grad():
-    """Return PyTorch's decorator, or an import-only CI fallback."""
-    if torch is None:
-        return lambda function: function
-    return torch.no_grad()
-
-
-def _require_torch() -> None:
-    if torch is None:
-        raise RuntimeError(
-            "the INT8 W8A8 runtime API requires PyTorch in the DCU environment"
-        )
+import torch
 
 
 # These are logical (K, N) dimensions after TP partitioning, not checkpoint
@@ -76,15 +59,111 @@ TP8_OPERATOR_KN: Final[Mapping[str, tuple[int, int]]] = {
     "shared_gate_up_proj": (4096, 512),
     "shared_down_proj": (256, 4096),
 }
+HY3_TP4_OPERATOR_KN: Final[Mapping[str, tuple[int, int]]] = {
+    "qkv_proj": (4096, 2560),
+    "o_proj": (2048, 4096),
+    "shared_gate_up_proj": (4096, 768),
+    "shared_down_proj": (384, 4096),
+}
+# Additional TP4/TP8 model-catalog operators (Hy3, MiniMax M3, GLM5.2).
+# These mirror the frontend workload catalog (static/dkao-shape-input.js)
+# and the measured Triton baseline table (orchestrator/w8a8_baselines.py) so
+# tasks created from the model catalog pass the fixed contract validation.
+# They are deliberately excluded from TP_OPERATOR_KN below, so
+# DEFAULT_OPTIMIZATION_SHAPES (DeepSeek TP4/TP8 only) is unchanged.
+HY3_TP8_OPERATOR_KN: Final[Mapping[str, tuple[int, int]]] = {
+    "qkv_proj": (4096, 1280),
+    "o_proj": (1024, 4096),
+    "shared_gate_up_proj": (4096, 384),
+    "shared_down_proj": (192, 4096),
+}
+MINIMAX_TP4_OPERATOR_KN: Final[Mapping[str, tuple[int, int]]] = {
+    "qkv_proj": (6144, 2304),
+    "qkv_proj_and_indexer_qk": (6144, 2560),
+    "o_proj": (2048, 6144),
+    "shared_gate_up_proj": (6144, 1536),
+    "shared_down_proj": (768, 6144),
+}
+MINIMAX_TP8_OPERATOR_KN: Final[Mapping[str, tuple[int, int]]] = {
+    "qkv_proj": (6144, 1280),
+    "qkv_proj_and_indexer_qk": (6144, 1536),
+    "o_proj": (1024, 6144),
+    "shared_gate_up_proj": (6144, 768),
+    "shared_down_proj": (384, 6144),
+}
+GLM52_TP4_OPERATOR_KN: Final[Mapping[str, tuple[int, int]]] = {
+    "fused_qkv_a_proj": (6144, 2624),
+    "q_b_proj": (2048, 4096),
+    "kv_b_proj": (512, 7168),
+    "o_proj": (4096, 6144),
+    "shared_gate_up_proj": (6144, 1024),
+    "shared_down_proj": (512, 6144),
+}
+GLM52_TP8_OPERATOR_KN: Final[Mapping[str, tuple[int, int]]] = {
+    "fused_qkv_a_proj": (6144, 2624),
+    "q_b_proj": (2048, 2048),
+    "kv_b_proj": (512, 3584),
+    "o_proj": (2048, 6144),
+    "shared_gate_up_proj": (6144, 512),
+    "shared_down_proj": (256, 6144),
+}
+
+
+def _merge_kn_tables(
+    *tables: Mapping[str, tuple[int, int]],
+) -> Mapping[str, tuple[tuple[int, int], ...]]:
+    """Merge (K, N) tables per operator, keeping every distinct pair.
+
+    A shared operator name (e.g. ``o_proj``) may carry different (K, N)
+    pairs per model; each pair stays individually allowed.
+    """
+    merged: dict[str, list[tuple[int, int]]] = {}
+    for table in tables:
+        for operator, kn in table.items():
+            if kn not in merged.setdefault(operator, []):
+                merged[operator].append(kn)
+    return {operator: tuple(kns) for operator, kns in merged.items()}
+
+
+_TP4_CATALOG_OPERATOR_KN: Final[Mapping[str, tuple[tuple[int, int], ...]]] = (
+    _merge_kn_tables(
+        TP4_OPERATOR_KN,
+        HY3_TP4_OPERATOR_KN,
+        MINIMAX_TP4_OPERATOR_KN,
+        GLM52_TP4_OPERATOR_KN,
+    )
+)
+_TP8_CATALOG_OPERATOR_KN: Final[Mapping[str, tuple[tuple[int, int], ...]]] = (
+    _merge_kn_tables(
+        TP8_OPERATOR_KN,
+        HY3_TP8_OPERATOR_KN,
+        MINIMAX_TP8_OPERATOR_KN,
+        GLM52_TP8_OPERATOR_KN,
+    )
+)
 TP_OPERATOR_KN: Final[Mapping[int, Mapping[str, tuple[int, int]]]] = {
     4: TP4_OPERATOR_KN,
     8: TP8_OPERATOR_KN,
 }
+TP4_OPERATOR_ALLOWED_KN: Final[Mapping[str, frozenset[tuple[int, int]]]] = {
+    operator: frozenset(kns)
+    for operator, kns in _TP4_CATALOG_OPERATOR_KN.items()
+}
+TP8_OPERATOR_ALLOWED_KN: Final[Mapping[str, frozenset[tuple[int, int]]]] = {
+    operator: frozenset(kns)
+    for operator, kns in _TP8_CATALOG_OPERATOR_KN.items()
+}
+TP_OPERATOR_ALLOWED_KN: Final[
+    Mapping[int, Mapping[str, frozenset[tuple[int, int]]]]
+] = {
+    4: TP4_OPERATOR_ALLOWED_KN,
+    8: TP8_OPERATOR_ALLOWED_KN,
+}
 TP4_W8A8_KN: Final[frozenset[tuple[int, int]]] = frozenset(
-    TP4_OPERATOR_KN.values()
+    kn for allowed in TP4_OPERATOR_ALLOWED_KN.values() for kn in allowed
 )
 TP8_W8A8_KN: Final[frozenset[tuple[int, int]]] = frozenset(
-    TP8_OPERATOR_KN.values()
+    kn for allowed in TP8_OPERATOR_ALLOWED_KN.values() for kn in allowed
 )
 SUPPORTED_W8A8_KN: Final[frozenset[tuple[int, int]]] = (
     TP4_W8A8_KN | TP8_W8A8_KN
@@ -97,6 +176,14 @@ DEFAULT_OPTIMIZATION_M_VALUES: Final[tuple[int, ...]] = (2, 16, 3072)
 # the original three M values, so each TP4 operator gets exactly one M=4096
 # shape while TP8 defaults are unchanged.
 TP4_EXTRA_OPTIMIZATION_M_VALUES: Final[tuple[int, ...]] = (4096,)
+# Model-catalog TP8 large-prefill boundary added on 2026-08-27. The DeepSeek
+# TP8 default workload keeps the original three M values; Hy3 / MiniMax M3 /
+# GLM5.2 TP8 operators are additionally optimizable at M=4096 via
+# "Selected shapes only" (their (K,N) pairs are already in the allowed sets
+# and their Triton CUDA-graph baselines are measured). This constant is not
+# applied by _default_optimization_shapes(), so DEFAULT_OPTIMIZATION_SHAPES
+# (DeepSeek-only) and its serial-validation fallback scope are unchanged.
+MODEL_TP8_EXTRA_OPTIMIZATION_M_VALUES: Final[tuple[int, ...]] = (4096,)
 
 
 def _default_optimization_shapes() -> tuple[dict[str, int | str], ...]:
@@ -155,7 +242,6 @@ def _check_cuda_tensor(
     *,
     contiguous: bool = True,
 ) -> None:
-    _require_torch()
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if not tensor.is_cuda:
@@ -200,25 +286,24 @@ def validate_optimization_shape(shape: Mapping[str, object]) -> None:
         raise ValueError(
             "optimization shape requires tp_size, operator, M, N and K"
         ) from exc
-    operators = TP_OPERATOR_KN.get(tp_size)
+    operators = TP_OPERATOR_ALLOWED_KN.get(tp_size)
     if operators is None:
         raise ValueError(f"tp_size must be 4 or 8, got {tp_size}")
-    expected = operators.get(operator)
-    if expected is None:
+    allowed = operators.get(operator)
+    if allowed is None:
         raise ValueError(
             f"unsupported TP={tp_size} operator {operator!r}; "
             f"supported={sorted(operators)}"
         )
-    if (k, n) != expected:
+    if (k, n) not in allowed:
         raise ValueError(
-            f"TP={tp_size} {operator} requires (K, N)={expected}, "
+            f"TP={tp_size} {operator} requires (K, N) in {sorted(allowed)}, "
             f"got ({k}, {n})"
         )
     _check_target_shape(m, n, k)
 
 
 def _optional_op(namespace: str, name: str):
-    _require_torch()
     try:
         return getattr(getattr(torch.ops, namespace), name)
     except AttributeError:
@@ -235,7 +320,7 @@ def _required_op(namespace: str, name: str):
     return op
 
 
-@_torch_no_grad()
+@torch.no_grad()
 def prepare_weight(
     raw_weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -297,7 +382,6 @@ def allocate_workspace(
     Capacity is shape-aware and capped by a fixed byte budget. This permits
     non-power-of-two split-K choices while keeping allocation bounded.
     """
-    _require_torch()
     _check_target_shape(m, n, k)
     required_bytes = max(
         WORKSPACE_ALIGNMENT,
@@ -377,7 +461,7 @@ def validate_gemm_out_inputs(
     return m, n, k
 
 
-@_torch_no_grad()
+@torch.no_grad()
 def w8a8_gemm_out(
     x_q: torch.Tensor,
     packed_weight: torch.Tensor,
@@ -421,14 +505,24 @@ def w8a8_gemm_out(
 __all__ = [
     "DEFAULT_OPTIMIZATION_M_VALUES",
     "DEFAULT_OPTIMIZATION_SHAPES",
+    "GLM52_TP4_OPERATOR_KN",
+    "GLM52_TP8_OPERATOR_KN",
+    "HY3_TP4_OPERATOR_KN",
+    "HY3_TP8_OPERATOR_KN",
     "MAX_M",
     "MIN_M",
+    "MINIMAX_TP4_OPERATOR_KN",
+    "MINIMAX_TP8_OPERATOR_KN",
+    "MODEL_TP8_EXTRA_OPTIMIZATION_M_VALUES",
     "TP4_EXTRA_OPTIMIZATION_M_VALUES",
     "TP4_DECODE_KN",
+    "TP4_OPERATOR_ALLOWED_KN",
     "TP4_OPERATOR_KN",
     "TP4_W8A8_KN",
+    "TP8_OPERATOR_ALLOWED_KN",
     "TP8_OPERATOR_KN",
     "TP8_W8A8_KN",
+    "TP_OPERATOR_ALLOWED_KN",
     "TP_OPERATOR_KN",
     "SUPPORTED_W8A8_KN",
     "WORKSPACE_BUDGET_BYTES",

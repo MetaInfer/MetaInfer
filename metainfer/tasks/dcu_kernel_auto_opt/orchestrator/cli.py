@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import os
+import json
 from pathlib import Path
 
 
@@ -17,17 +17,27 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--dry-run", action="store_true")
     run_p.add_argument(
         "--claude-bin",
-        default=os.environ.get("METAINFER_CLAUDE_BIN", "ccb"),
+        default=None,
+        help=(
+            "Agent binary override. Defaults are resolved from the task's "
+            "agent_framework answer: ccb -> METAINFER_CLAUDE_BIN (or 'ccb'), "
+            "dsh -> the bundled bridge/dsh/dsh_agent.py wrapper."
+        ),
     )
     args = parser.parse_args(argv)
     if args.command == "run":
+        from .config import resolve_agent_framework, resolve_claude_bin
         from .orchestrator import run_with_requirements
+
+        req = json.loads(args.requirements.read_text(encoding="utf-8"))
+        framework = resolve_agent_framework(req)
+        claude_bin = resolve_claude_bin(framework, explicit=args.claude_bin)
         return run_with_requirements(
             args.requirements,
             state_dir=args.state_dir,
             workspace_dir=args.workspace_dir,
             dry_run=args.dry_run,
-            claude_bin=args.claude_bin,
+            claude_bin=claude_bin,
         )
     return 1
 

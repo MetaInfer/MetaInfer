@@ -203,6 +203,28 @@ _TRITON_GRAPH_BASELINES_US = {
     (8, 3072, 6144, 384): ("shared_down_proj", 4925.667),
     (8, 3072, 6144, 1024): ("o_proj", 11664.713),
     (8, 3072, 6144, 2048): ("o_proj", 22305.402),
+    # Model-catalog TP8 M=4096 large-prefill baselines measured on 2026-08-27
+    # (worker29, gfx928) with the same protocol as the 2026-08-12 catalog:
+    # lmslim int8_utils.matmul_kernel (the W8A8 Triton baseline), GPU events,
+    # CUDA Graph replay, hot cache, warmups=10, samples=20, launches/sample=5,
+    # BM256/BN256/BK64 (matmul_int8 default for M>1024). Covers the Hy3 /
+    # MiniMax M3 / GLM5.2 TP8 operators at M=4096 (see
+    # MODEL_TP8_EXTRA_OPTIMIZATION_M_VALUES in the operator API contract).
+    (8, 4096, 1280, 4096): ("qkv_proj", 19381.383),
+    (8, 4096, 4096, 1024): ("o_proj", 14151.792),
+    (8, 4096, 384, 4096): ("shared_gate_up_proj", 16712.231),
+    (8, 4096, 4096, 192): ("shared_down_proj", 10762.616),
+    (8, 4096, 1280, 6144): ("qkv_proj", 41000.618),
+    (8, 4096, 1536, 6144): ("qkv_proj_and_indexer_qk", 35604.698),
+    (8, 4096, 6144, 1024): ("o_proj", 19897.517),
+    (8, 4096, 768, 6144): ("shared_gate_up_proj", 31882.257),
+    (8, 4096, 6144, 384): ("shared_down_proj", 22389.162),
+    (8, 4096, 2624, 6144): ("fused_qkv_a_proj", 68661.417),
+    (8, 4096, 2048, 2048): ("q_b_proj", 14385.571),
+    (8, 4096, 3584, 512): ("kv_b_proj", 6939.939),
+    (8, 4096, 6144, 2048): ("o_proj", 54775.797),
+    (8, 4096, 512, 6144): ("shared_gate_up_proj", 21254.589),
+    (8, 4096, 6144, 256): ("shared_down_proj", 17700.262),
 }
 
 

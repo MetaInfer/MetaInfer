@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import subprocess
 from pathlib import Path
@@ -21,25 +20,29 @@ from ..orchestrator.config import (
 )
 from ..orchestrator.gen_and_opt_pipeline import (
     GenAndOptPipeline,
+    _COORDINATOR_AGENT_ARGS,
+    _PERF_GATE_MAX_RETRIES,
+    _PERF_GATE_RETRY_INTERVAL_S,
     _artifact_symbol_prefix,
+    _final_performance_gate,
     _final_synthesis_prompt,
     _is_control_plane_artifact,
     _render_prebuilt_dispatch,
     _require_valid_child_assignments,
 )
 from ..orchestrator import phases
+from ..orchestrator import w8a8_pipeline as pipeline_module
 from ..orchestrator.w8a8_pipeline import (
     RealW8A8OptimizationPipeline,
     W8A8Runner,
+    _BENCHMARK_TIMEOUT_S,
     _check_required_files,
+    _REFERENCE_PREPARE_TIMEOUT_S,
     archive_iteration_candidate,
     candidate_iteration_destination,
     publish_iteration_candidate,
     snapshot_accepted_kernel_artifact,
 )
-
-
-TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 
 
 def test_generated_repo_is_valid_existing_repo_seed(tmp_path):
@@ -300,7 +303,7 @@ assignments:
     req["answers"]["mock_iterations"] = "2"
     config = load_config(req)
     pipeline = _make_pipeline(req, tmp_path)
-    pipeline.store.init_or_resume("iteration-timeout-test")
+    pipeline.store.init_or_resume("iteration-timeout-test", "dcu-kernel-auto-opt")
     root = pipeline.workspace_dir / "workers" / "worker_0"
     source = root / "source"
     source.joinpath("csrc").mkdir(parents=True)
@@ -393,7 +396,6 @@ def test_control_plane_artifacts_are_not_attributed_to_agent():
     assert not _is_control_plane_artifact("csrc/w8a8_gemm_hip.hip")
 
 
-@pytest.mark.skipif(not TORCH_AVAILABLE, reason="PyTorch is not installed")
 def test_trusted_harness_pytorch_reference_self_test():
     harness = (
         Path(__file__).resolve().parent.parent
@@ -1200,8 +1202,9 @@ def test_parallel_child_large_prefill_bootstrap_starts_with_dumma():
 
     assert "large-Prefill\nscalar K loop is not a usable" in prompt
     assert "INT8 DUMMA m16n16k32" in prompt
+    assert "references/int8w8a8-gemm/hy3/TP4/M4096/o_proj.hip" in prompt
     assert "references/w8a8_gemm_variants.hip" in prompt
-    assert "neither a\nwhitelist nor a restriction" in prompt
+    assert "neither a whitelist nor a restriction" in prompt
     assert '"path": "dumma_prefill_with_scalar_fallback"' in prompt
     assert "Keep one simple scalar int8/int32 fallback" in prompt
 
@@ -1382,6 +1385,185 @@ def test_compile_cache_is_content_addressed(tmp_path):
     ).read_text() == "// candidate one\n"
 
 
+def _runner_with_source(tmp_path: Path) -> tuple[W8A8Runner, Path]:
+    worker = tmp_path / "worker"
+    csrc = worker / "source" / "csrc"
+    csrc.mkdir(parents=True)
+    csrc.joinpath("bindings.cpp").write_text("// binding\n")
+    csrc.joinpath("w8a8_gemm_hip.hip").write_text("// kernel\n")
+    return W8A8Runner(worker, 0), worker
+
+
+def _fake_run_for_reference(records: list):
+    """Return a _run stand-in that seeds the reference cache on demand."""
+
+    def fake_run(command, *, cwd, env=None, timeout=None):
+        records.append((list(command), timeout))
+        if "--prepare-reference" in command:
+            def arg(name):
+                return command[command.index(name) + 1]
+            cache_dir = Path(arg("--reference-cache-dir"))
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            m, n, k = int(arg("--m")), int(arg("--n")), int(arg("--k"))
+            (cache_dir / f"exact-int64-v1-m{m}-n{n}-k{k}.pt").write_bytes(
+                b"ref"
+            )
+            stdout = (
+                '{"reference_prepared": true, '
+                '"reference_cache_hit": false}\n'
+            )
+        else:
+            stdout = (
+                '{"passed": true, "graph_capture_passed": true, '
+                '"median_us": 1.0, "mismatch_count": 0}\n'
+            )
+        return SimpleNamespace(stdout=stdout, returncode=0, stderr="")
+
+    return fake_run
+
+
+def test_benchmark_prepares_reference_cache_when_missing(
+    tmp_path, monkeypatch
+):
+    runner, worker = _runner_with_source(tmp_path)
+    records: list = []
+    monkeypatch.setattr(pipeline_module, "_run", _fake_run_for_reference(records))
+
+    metrics = runner.benchmark(
+        {"M": 4096, "N": 2304, "K": 6144}, check_correctness=True
+    )
+
+    # The reference is prepared first, outside the benchmark budget.
+    assert len(records) == 2
+    prepare_command, prepare_timeout = records[0]
+    assert "--prepare-reference" in prepare_command
+    assert prepare_timeout == _REFERENCE_PREPARE_TIMEOUT_S
+    bench_command, bench_timeout = records[1]
+    assert "--prepare-reference" not in bench_command
+    assert bench_timeout == _BENCHMARK_TIMEOUT_S
+    assert runner._reference_cache_path(4096, 2304, 6144).is_file()
+    assert metrics["median_us"] == 1.0
+
+
+def test_benchmark_reuses_existing_reference_cache(tmp_path, monkeypatch):
+    runner, worker = _runner_with_source(tmp_path)
+    path = runner._reference_cache_path(4096, 2304, 6144)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"ref")
+    records: list = []
+    monkeypatch.setattr(pipeline_module, "_run", _fake_run_for_reference(records))
+
+    runner.benchmark(
+        {"M": 4096, "N": 2304, "K": 6144}, check_correctness=True
+    )
+
+    assert len(records) == 1  # no prepare-reference call
+    assert "--prepare-reference" not in records[0][0]
+
+
+def test_benchmark_skips_reference_prep_when_correctness_disabled(
+    tmp_path, monkeypatch
+):
+    runner, worker = _runner_with_source(tmp_path)
+    records: list = []
+    monkeypatch.setattr(pipeline_module, "_run", _fake_run_for_reference(records))
+
+    runner.benchmark(
+        {"M": 4096, "N": 2304, "K": 6144}, check_correctness=False
+    )
+
+    assert len(records) == 1
+    command, _ = records[0]
+    assert "--prepare-reference" not in command
+    assert "--skip-correctness" in command
+
+
+def test_reference_prep_failure_raises(tmp_path, monkeypatch):
+    runner, worker = _runner_with_source(tmp_path)
+    records: list = []
+
+    def failing_run(command, *, cwd, env=None, timeout=None):
+        records.append((list(command), timeout))
+        return SimpleNamespace(
+            stdout='{"reference_prepared": false}\n',
+            returncode=0,
+            stderr="",
+        )
+
+    monkeypatch.setattr(pipeline_module, "_run", failing_run)
+
+    with pytest.raises(RuntimeError, match="reference cache preparation failed"):
+        runner.benchmark(
+            {"M": 4096, "N": 2304, "K": 6144}, check_correctness=True
+        )
+
+
+class _FakeTimelineStore:
+    def __init__(self):
+        self.events = []
+
+    def append_timeline(self, type_: str, payload: dict):
+        self.events.append((type_, payload))
+
+
+def _perf_gate(benchmark, median_us, best=100.0, store=None, **kw):
+    return _final_performance_gate(
+        shape_id="minimax_tp8_qkv_proj_m16",
+        best_median=best,
+        metrics={"passed": True, "median_us": median_us},
+        benchmark=benchmark,
+        max_retries=kw.pop("max_retries", 3),
+        retry_interval_s=kw.pop("retry_interval_s", 300),
+        store=store or _FakeTimelineStore(),
+    )
+
+
+def test_perf_gate_accepts_without_retry():
+    store = _FakeTimelineStore()
+    result = _perf_gate(lambda: None, median_us=90.0, store=store)
+    assert result["median_us"] == 90.0
+    assert store.events == []
+
+
+def test_perf_gate_retries_until_best_passes(monkeypatch):
+    sleeps: list = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+    store = _FakeTimelineStore()
+    calls = {"n": 0}
+
+    def benchmark():
+        calls["n"] += 1
+        return {"passed": True, "median_us": 120.0 if calls["n"] == 1 else 95.0}
+
+    result = _perf_gate(benchmark, median_us=130.0, store=store)
+    # 130 (>105) -> retry1 120 (>105) -> retry2 95 (<=105) -> accept min 95
+    assert calls["n"] == 2
+    assert result["median_us"] == 95.0
+    assert sleeps == [300, 300]
+    assert [t for t, _ in store.events] == [
+        "final_perf_gate_retry", "final_perf_gate_retry",
+    ]
+    assert store.events[0][1]["attempt"] == 1
+    assert store.events[1][1]["attempt"] == 2
+
+
+def test_perf_gate_fails_only_after_all_retries(monkeypatch):
+    sleeps: list = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+    with pytest.raises(RuntimeError, match="after 3 re-measures"):
+        _perf_gate(lambda: {"passed": True, "median_us": 200.0}, median_us=200.0)
+    assert len(sleeps) == 3
+
+
+def test_perf_gate_retry_correctness_failure_raises(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    with pytest.raises(RuntimeError, match="correctness failed"):
+        _perf_gate(
+            lambda: {"passed": False, "median_us": 999.0},
+            median_us=200.0,
+        )
+
+
 def test_iteration_archive_keeps_kernel_but_shares_api(tmp_path):
     source = tmp_path / "source"
     source.joinpath("csrc").mkdir(parents=True)
@@ -1430,6 +1612,12 @@ def test_iteration_archive_is_published_to_candidate_repo(tmp_path):
     assert not saved.is_symlink()
 
 
+def test_coordinator_uses_minimal_file_tool_allowlist():
+    assert _COORDINATOR_AGENT_ARGS == [
+        "--tools", "Read,Glob,Grep,Write",
+    ]
+
+
 def test_bridge_path_translation_does_not_rewrite_workspaces_segment():
     """The /workspaces directory name must not be translated a second time."""
     from ..bridge.agent_bridge_server import (
@@ -1453,8 +1641,10 @@ def test_bridge_accepts_source_only_agent_tool_restrictions():
 
     args = [
         "-p",
-        "--disallowedTools",
-        "Bash,Skill,WebFetch,WebSearch",
+        "--setting-sources",
+        "project,local",
+        "--tools",
+        "Read,Glob,Grep,Write,Edit",
     ]
     assert _validated_args(args) == args
 
@@ -1464,8 +1654,8 @@ def test_bridge_enforces_source_only_tools_for_older_orchestrators():
 
     assert _validated_args(["-p"]) == [
         "-p",
-        "--disallowedTools",
-        "Bash,Skill,WebFetch,WebSearch",
+        "--tools",
+        "Read,Glob,Grep,Write,Edit",
     ]
 
 

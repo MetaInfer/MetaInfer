@@ -1,5 +1,9 @@
 // Operator-specific guided shape input for dcu-kernel-auto-opt.
-// Registered with the shell's form widget registry by form-overrides.js.
+// Self-registers via globalThis.__metainferOverrides — no imports from
+// shared modules, no circular deps, no dynamic import needed.
+//
+// The form-renderer polls __metainferOverrides and picks us up once this
+// file is loaded as a side-effect of the importmap entry.
 
 import { html } from "htm/preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
@@ -18,8 +22,10 @@ function parseCsvInts(raw) {
 // validates every submitted shape against the frozen operator contract, so a
 // stale UI list fails closed instead of starting an invalid optimization.
 var W8A8_M_VALUES = [2, 16, 3072];
-// TP4-only large-prefill boundary added on 2026-08-06; TP1/TP8 keep the
-// three original M values. The backend validates shapes against the contract.
+// Large-prefill boundary added on 2026-08-06 for TP4; extended to the
+// Hy3 / MiniMax M3 / GLM5.2 TP8 catalogs on 2026-08-27 via per-topology
+// mValues. DeepSeek TP1/TP8 keep the three original M values. The backend
+// validates shapes against the contract.
 var W8A8_TP4_M_VALUES = [2, 16, 3072, 4096];
 
 // Model label → W8A8 GEMM workload. (M, K) @ (K, N) per weight name and TP
@@ -88,6 +94,7 @@ var MODEL_WORKLOADS = {
       },
       {
         tp_size: 8,
+        mValues: [2, 16, 3072, 4096],
         operators: [
           { operator: "qkv_proj", K: 4096, N: 1280 },
           { operator: "o_proj", K: 1024, N: 4096 },
@@ -122,6 +129,7 @@ var MODEL_WORKLOADS = {
       },
       {
         tp_size: 8,
+        mValues: [2, 16, 3072, 4096],
         operators: [
           { operator: "qkv_proj", K: 6144, N: 1280 },
           { operator: "qkv_proj_and_indexer_qk", K: 6144, N: 1536 },
@@ -159,6 +167,7 @@ var MODEL_WORKLOADS = {
       },
       {
         tp_size: 8,
+        mValues: [2, 16, 3072, 4096],
         operators: [
           { operator: "fused_qkv_a_proj", K: 6144, N: 2624 },
           { operator: "q_b_proj", K: 2048, N: 2048 },
@@ -176,8 +185,10 @@ function modelCatalog(modelLabel) {
   var model = MODEL_WORKLOADS[modelLabel] || MODEL_WORKLOADS["DeepSeek V4 Flash"];
   var shapes = [];
   (model.topologies || []).forEach(function (topology) {
-    var mValues = topology.tp_size === 4
-      ? W8A8_TP4_M_VALUES : W8A8_M_VALUES;
+    // Per-topology M values override the defaults; TP4 and the Hy3/MiniMax/
+    // GLM TP8 catalogs cover the M=4096 large-prefill boundary.
+    var mValues = topology.mValues || (topology.tp_size === 4
+      ? W8A8_TP4_M_VALUES : W8A8_M_VALUES);
     topology.operators.forEach(function (item) {
       mValues.forEach(function (M) {
         shapes.push({
@@ -1196,5 +1207,11 @@ function ShapeInputInner(_a) {
   `;
 }
 
-// Named export registered by form-overrides.js.
+// ---- register ---------------------------------------------------------------
+
+var _g = (typeof globalThis !== "undefined" ? globalThis : window);
+var _bridge = (_g.__metainferOverrides = _g.__metainferOverrides || {});
+_bridge["shape-input"] = ShapeInputInner;
+
+// Named export for the form-renderer to pick up.
 export var ShapeInput = ShapeInputInner;

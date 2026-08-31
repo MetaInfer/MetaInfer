@@ -6,7 +6,7 @@ import metainfer.tasks  # noqa: F401
 from metainfer.orchestrator.registry import get_orchestrator
 from metainfer.server.forms import load_form_schema
 from metainfer.server.registry import get
-from ..server.routes import read_worker_lanes
+from ..server.routes import _restart_worker_commands, read_worker_lanes
 
 
 def test_task_and_web_plugins_registered():
@@ -14,7 +14,6 @@ def test_task_and_web_plugins_registered():
     plugin = get("dcu-kernel-auto-opt")
     assert plugin is not None
     assert plugin.detail_view_module == "app/dkao-detail"
-    assert "app/form-overrides/dcu-kernel-auto-opt" in plugin.importmap_entries
 
 
 def test_form_schema_is_available():
@@ -25,7 +24,8 @@ def test_form_schema_is_available():
     assert {
         "operator", "kernel_language", "target_hardware", "shape_config",
         "dtype", "correctness_ref", "perf_target", "max_iterations",
-        "execution_mode", "target_repo_path", "claude_model",
+        "execution_mode", "target_repo_path", "agent_framework",
+        "agent_model",
     } <= keys
     shape = next(
         field for field in schema["fields"]
@@ -34,13 +34,23 @@ def test_form_schema_is_available():
     assert shape["required"] is False
     assert shape["default"] == ""
     assert shape["override_component"] == "shape-input"
+    framework = next(
+        field for field in schema["fields"]
+        if field["key"] == "agent_framework"
+    )
+    assert framework["default"] == "ccb"
+    assert [option["label"] for option in framework["options"]] == [
+        "ccb", "dsh"
+    ]
     model = next(
         field for field in schema["fields"]
-        if field["key"] == "claude_model"
+        if field["key"] == "agent_model"
     )
     assert model["default"] == "Opus"
+    assert model["override_component"] == "agent-model"
+    assert model["override_module"] == "app/dkao-agent-fields"
     assert [option["label"] for option in model["options"]] == [
-        "Opus", "Sonnet"
+        "Opus", "Sonnet", "deepseek-v4-flash"
     ]
 
 
@@ -49,6 +59,27 @@ def test_worker_lanes_always_has_four_rows(tmp_path):
     assert [row["worker_id"] for row in lanes["workers"]] == [
         "worker_0", "worker_1", "worker_2", "worker_3",
     ]
+
+
+def test_restart_commands_let_lane_resolve_agent_binary(tmp_path):
+    # Regression: the restart route used to force METAINFER_CLAUDE_BIN
+    # (ccb's binary) as an explicit --claude-bin, which breaks dsh-framework
+    # lanes whose agents must run through bridge/dsh/dsh_agent.py. The lane
+    # binaries resolve the framework-appropriate binary themselves.
+    requirements = tmp_path / "requirements.json"
+    requirements.write_text("{}", encoding="utf-8")
+    state = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    command, integration = _restart_worker_commands(
+        requirements, state, workspace, "worker_1"
+    )
+    for cmd in (command, integration):
+        assert "--claude-bin" not in cmd
+        assert "--worker-id" in cmd
+        assert cmd[cmd.index("--worker-id") + 1] == "worker_1"
+        assert str(requirements) in cmd
+    assert "restart_worker" in command[2]
+    assert "integrate_restarted_worker" in integration[2]
 
 
 def test_worker_lanes_surface_live_optimization_step(tmp_path):

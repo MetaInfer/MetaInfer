@@ -5,13 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
 from metainfer.orchestrator._bootstrap import make_subagent_manager
 from metainfer.orchestrator.state import StateStore
 
-from .config import load_config, replace_assignments
+from .config import (
+    load_config,
+    replace_assignments,
+    resolve_claude_bin,
+)
 from .gen_and_opt_pipeline import GenAndOptPipeline
 from .result_store import write_json
 
@@ -22,11 +27,22 @@ def main() -> int:
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--workspace-dir", type=Path, required=True)
     parser.add_argument("--worker-id", required=True)
-    parser.add_argument("--claude-bin", default="ccb")
+    parser.add_argument(
+        "--claude-bin",
+        default=None,
+        help=(
+            "Agent binary override; defaults resolved from agent_framework "
+            "(ccb -> METAINFER_CLAUDE_BIN or 'ccb', dsh -> "
+            "bridge/dsh/dsh_agent.py)."
+        ),
+    )
     args = parser.parse_args()
 
     req = json.loads(args.requirements.read_text(encoding="utf-8"))
     config = load_config(req)
+    claude_bin = resolve_claude_bin(
+        config.agent_framework, explicit=args.claude_bin
+    )
     matches = [
         assignment
         for assignment in config.assignments
@@ -46,7 +62,10 @@ def main() -> int:
     restart_root.mkdir(parents=True, exist_ok=False)
     prior_failure = worker_root / "failure.json"
     if prior_failure.is_file():
-        prior_failure.replace(restart_root / "prior_failure.json")
+        # shutil.move, not Path.replace: on overlayfs the archive dir is
+        # freshly created (upper layer) while failure.json may live in a
+        # lower layer, so os.rename raises EXDEV.
+        shutil.move(str(prior_failure), str(restart_root / "prior_failure.json"))
 
     store = StateStore(args.state_dir)
     store.append_timeline(
@@ -60,7 +79,7 @@ def main() -> int:
         },
     )
     manager = make_subagent_manager(
-        claude_bin=args.claude_bin,
+        claude_bin=claude_bin,
         model=config.claude_model,
         permission_mode="bypassPermissions",
         effort="max",

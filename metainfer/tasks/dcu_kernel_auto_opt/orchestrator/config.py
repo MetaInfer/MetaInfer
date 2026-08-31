@@ -15,9 +15,91 @@ SMOKE_MODE = "Infrastructure smoke (not operator optimization)"
 W8A8_MODE = "Real INT8 W8A8 GEMM"
 GEN_AND_OPT_MODE = "Generate & optimize (auto-create kernel repo)"
 CLAUDE_MODELS = {
-    "Sonnet": "sonnet",
-    "Opus": "opus",
+    "Sonnet": "claude-sonnet-5",
+    "Opus": "claude-opus-5",
 }
+# Agent frameworks selectable from the new-task form. Each framework maps a
+# user-facing model label to the model id handed to SubAgentManager (and from
+# there to the agent binary via --model). ccb keeps Claude Code semantics;
+# dsh routes claude_bin to bridge/dsh/dsh_agent.py (see resolve_claude_bin).
+CCB_FRAMEWORK = "ccb"
+DSH_FRAMEWORK = "dsh"
+DSH_DEFAULT_MODEL_ID = "deepseek/deepseek-v4-flash-0731"
+
+
+def dsh_model_id() -> str:
+    """Model id used for the dsh framework (env DSH_AGENT_MODEL overrides)."""
+    override = os.environ.get("DSH_AGENT_MODEL")
+    return (override.strip() if override and override.strip()
+            else DSH_DEFAULT_MODEL_ID)
+
+
+def agent_framework_models(framework: str) -> Dict[str, str]:
+    """Label -> model id for one agent framework."""
+    if framework == DSH_FRAMEWORK:
+        return {"deepseek-v4-flash": dsh_model_id()}
+    return dict(CLAUDE_MODELS)
+
+
+def agent_framework_default_model(framework: str) -> str:
+    return "deepseek-v4-flash" if framework == DSH_FRAMEWORK else "Opus"
+
+
+def resolve_agent_framework(req: Mapping[str, Any]) -> str:
+    """Read + validate the agent_framework answer (default ccb)."""
+    answers = _answers(req)
+    framework = str(
+        answers.get("agent_framework") or CCB_FRAMEWORK
+    ).strip().lower()
+    if framework not in {CCB_FRAMEWORK, DSH_FRAMEWORK}:
+        raise ValueError(
+            "agent_framework must be one of "
+            f"{sorted([CCB_FRAMEWORK, DSH_FRAMEWORK])}"
+        )
+    return framework
+
+
+def resolve_model_id(
+    req: Mapping[str, Any], framework: str | None = None
+) -> str:
+    """Resolve the model id for the chosen framework.
+
+    Prefers the ``agent_model`` answer; falls back to the legacy
+    ``claude_model`` answer (pre-framework requirements files) and finally to
+    the framework default.
+    """
+    framework = framework or resolve_agent_framework(req)
+    answers = _answers(req)
+    models = agent_framework_models(framework)
+    label = str(answers.get("agent_model") or "").strip()
+    if not label:
+        label = str(answers.get("claude_model") or "").strip()
+    if not label:
+        label = agent_framework_default_model(framework)
+    try:
+        return models[label]
+    except KeyError as exc:
+        raise ValueError(
+            f"agent_model must be one of {sorted(models)} for "
+            f"framework {framework!r}"
+        ) from exc
+
+
+def resolve_claude_bin(framework: str, explicit: str | None = None) -> str:
+    """Pick the agent binary for a framework.
+
+    An explicit ``--claude-bin`` always wins. Otherwise dsh uses the bundled
+    ccb-compatible DSH wrapper (bridge/dsh/dsh_agent.py) and ccb falls back to
+    ``METAINFER_CLAUDE_BIN`` (or ``ccb``).
+    """
+    if explicit:
+        return explicit
+    if framework == DSH_FRAMEWORK:
+        return str(
+            Path(__file__).resolve().parents[1]
+            / "bridge" / "dsh" / "dsh_agent.py"
+        )
+    return os.environ.get("METAINFER_CLAUDE_BIN", "ccb")
 # A small, stable gain may be accumulated across rounds. The user-facing
 # minimum_improvement_percent is the final target versus the fixed baseline.
 ROUND_ACCEPTANCE_IMPROVEMENT_PERCENT = 1.0
@@ -95,6 +177,9 @@ class OptimizerConfig:
     shape_scope: str
     mock_iterations: int
     minimum_improvement_percent: float
+    # Agent framework (ccb | dsh) that produced claude_model; the pipeline
+    # uses it to pick the agent binary via resolve_claude_bin.
+    agent_framework: str = CCB_FRAMEWORK
 
 
 def _answers(req: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -156,11 +241,8 @@ def _parse_shape_config(raw: Any) -> Dict[str, Any]:
 
 def load_config(req: Mapping[str, Any]) -> OptimizerConfig:
     answers = _answers(req)
-    model_label = str(answers.get("claude_model") or "Opus")
-    try:
-        claude_model = CLAUDE_MODELS[model_label]
-    except KeyError as exc:
-        raise ValueError("claude_model must be Sonnet or Opus") from exc
+    agent_framework = resolve_agent_framework(req)
+    claude_model = resolve_model_id(req, agent_framework)
     mode = str(answers.get("execution_mode", MOCK_MODE))
     if mode not in {
         MOCK_MODE,
@@ -329,6 +411,7 @@ def load_config(req: Mapping[str, Any]) -> OptimizerConfig:
         shape_scope=shape_scope,
         mock_iterations=iterations,
         minimum_improvement_percent=threshold,
+        agent_framework=agent_framework,
     )
 
 
@@ -351,6 +434,7 @@ def replace_assignments(
         shape_scope=config.shape_scope,
         mock_iterations=config.mock_iterations,
         minimum_improvement_percent=config.minimum_improvement_percent,
+        agent_framework=config.agent_framework,
     )
 
 
