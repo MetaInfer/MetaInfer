@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-import torch
-
 import pytest
+
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 
 from ..assets.w8a8_bench import (
     exact_w8a8_reference,
@@ -10,6 +13,7 @@ from ..assets.w8a8_bench import (
 )
 
 
+@pytest.mark.skipif(torch is None, reason="PyTorch is not installed")
 def test_exact_reference_uses_integer_dot_before_scaling():
     a = torch.tensor([[127, 127, 127], [-127, 1, 2]], dtype=torch.int8)
     b = torch.tensor(
