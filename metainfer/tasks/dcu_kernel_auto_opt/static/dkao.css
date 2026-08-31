@@ -894,3 +894,16 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* Kernel repository rename panel */
+.dkao-repo-panel .dkao-repo-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.dkao-repo-panel .dkao-rename-msg {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}

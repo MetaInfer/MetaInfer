@@ -57,6 +57,35 @@ def test_fixed_baseline_rejects_unknown_shape():
         )
 
 
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        # Hy3 TP8 M=4096 (measured 2026-08-27, CUDA-graph replay).
+        ({"tp_size": 8, "M": 4096, "N": 1280, "K": 4096}, 19381.383),
+        ({"tp_size": 8, "M": 4096, "N": 4096, "K": 1024}, 14151.792),
+        ({"tp_size": 8, "M": 4096, "N": 384, "K": 4096}, 16712.231),
+        ({"tp_size": 8, "M": 4096, "N": 4096, "K": 192}, 10762.616),
+        # MiniMax M3 TP8 M=4096.
+        ({"tp_size": 8, "M": 4096, "N": 1280, "K": 6144}, 41000.618),
+        ({"tp_size": 8, "M": 4096, "N": 1536, "K": 6144}, 35604.698),
+        ({"tp_size": 8, "M": 4096, "N": 6144, "K": 1024}, 19897.517),
+        ({"tp_size": 8, "M": 4096, "N": 768, "K": 6144}, 31882.257),
+        ({"tp_size": 8, "M": 4096, "N": 6144, "K": 384}, 22389.162),
+        # GLM5.2 TP8 M=4096.
+        ({"tp_size": 8, "M": 4096, "N": 2624, "K": 6144}, 68661.417),
+        ({"tp_size": 8, "M": 4096, "N": 2048, "K": 2048}, 14385.571),
+        ({"tp_size": 8, "M": 4096, "N": 3584, "K": 512}, 6939.939),
+        ({"tp_size": 8, "M": 4096, "N": 6144, "K": 2048}, 54775.797),
+        ({"tp_size": 8, "M": 4096, "N": 512, "K": 6144}, 21254.589),
+        ({"tp_size": 8, "M": 4096, "N": 6144, "K": 256}, 17700.262),
+    ],
+)
+def test_model_catalog_tp8_m4096_baselines(shape, expected):
+    record = fixed_triton_graph_baseline("shape", shape)
+    assert record["median_us"] == expected
+    assert record["timing_scope"] == "prefill_graph_replay"
+
+
 def test_bootstrap_metrics_are_kept_separate():
     bootstrap = {"passed": True, "median_us": 123.0}
     record = fixed_triton_graph_baseline(

@@ -11,7 +11,7 @@ from pathlib import Path
 from metainfer.orchestrator._bootstrap import make_subagent_manager
 from metainfer.orchestrator.state import StateStore
 
-from .config import load_config
+from .config import load_config, resolve_claude_bin
 from .gen_and_opt_pipeline import GenAndOptPipeline
 from .result_store import write_json
 from .w8a8_pipeline import evaluate_final_target
@@ -46,12 +46,23 @@ def main() -> int:
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--workspace-dir", type=Path, required=True)
     parser.add_argument("--worker-id", required=True)
-    parser.add_argument("--claude-bin", required=True)
+    parser.add_argument(
+        "--claude-bin",
+        default=None,
+        help=(
+            "Agent binary override; defaults resolved from agent_framework "
+            "(ccb -> METAINFER_CLAUDE_BIN or 'ccb', dsh -> "
+            "bridge/dsh/dsh_agent.py)."
+        ),
+    )
     parser.add_argument("--timeout", type=int, default=43200)
     args = parser.parse_args()
 
     req = _load(args.requirements)
     config = load_config(req)
+    claude_bin = resolve_claude_bin(
+        config.agent_framework, explicit=args.claude_bin
+    )
     assignment = next(
         item for item in config.assignments
         if item.worker_id == args.worker_id
@@ -85,7 +96,7 @@ def main() -> int:
     os.environ["METAINFER_TASK_ID"] = str(req.get("task_id") or "task")
     os.environ["METAINFER_SERIAL_VALIDATE_GPU"] = str(assignment.gpu)
     manager = make_subagent_manager(
-        claude_bin=args.claude_bin,
+        claude_bin=claude_bin,
         model=config.claude_model,
         permission_mode="bypassPermissions",
         effort="max",

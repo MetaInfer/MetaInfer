@@ -470,7 +470,7 @@ function WorkerLane({ lane, taskId, onSaved }) {
   `;
 }
 
-function SkillFile({ skill, canPublish, onPublish, busy }) {
+function SkillFile({ skill, canPublish, canFuse, onPublish, onFuse, busy }) {
   return html`
     <details class="dkao-skill-file">
       <summary>
@@ -478,21 +478,59 @@ function SkillFile({ skill, canPublish, onPublish, busy }) {
           <strong>${skill.name}</strong>
           <small>${skill.kind} · ${skill.source}</small>
         </span>
+        ${canFuse ? html`
+          <button
+            class="btn"
+            type="button"
+            disabled=${busy === `fuse-${skill.name}`}
+            onClick=${(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onFuse(skill);
+            }}
+          >${busy === `fuse-${skill.name}` ? "Fusing…" : "融合到 Skill 库"}</button>
+        ` : null}
         ${canPublish ? html`
           <button
             class="btn btn-primary"
             type="button"
-            disabled=${busy}
+            disabled=${busy === `publish-${skill.name}`}
             onClick=${(event) => {
               event.preventDefault();
               event.stopPropagation();
               onPublish(skill);
             }}
-          >${busy ? "Adding…" : "Add to existing"}</button>
+          >${busy === `publish-${skill.name}` ? "Adding…" : "Add to existing"}</button>
         ` : html`<span class="pill success">existing</span>`}
       </summary>
       <pre>${skill.content}</pre>
     </details>
+  `;
+}
+
+function SkillFuseStatus({ status, onRollback }) {
+  if (!status || status.status === "idle") return null;
+  if (status.status === "running") {
+    return html`<div class="task-banner"><span class="spin"></span> 融合中…（主 agent 正在扫描 skill 库并决策）</div>`;
+  }
+  if (status.status === "error") {
+    return html`<div class="task-banner task-banner-err">融合失败: ${status.error || "unknown error"}</div>`;
+  }
+  const synced = status.synced_to_ccb;
+  return html`
+    <div class="task-banner">
+      融合完成：${status.action === "merge" ? `已融入 "${status.name}"` : `新增 skill "${status.name}"`}
+      ${synced && (synced.added?.length || synced.updated?.length)
+        ? ` · 已同步到 ccb 库${synced.added?.length ? `（新增 ${synced.added.length}）` : ""}${synced.updated?.length ? `（更新 ${synced.updated.length}）` : ""}`
+        : ""}
+      ${status.action === "merge" ? html`
+        <button class="btn" type="button"
+          onClick=${() => onRollback(status.name)}>还原</button>
+      ` : null}
+      ${status.diff ? html`
+        <details class="dkao-skill-diff"><summary>查看 diff</summary><pre>${status.diff}</pre></details>
+      ` : null}
+    </div>
   `;
 }
 
@@ -510,9 +548,16 @@ function SkillLibrary({ taskId, onClose }) {
     }
   }, [taskId]);
   useEffect(() => { load(); }, [load]);
+  // While a fusion job is running, poll the library so the status flips to
+  // done/error without a manual refresh.
+  useEffect(() => {
+    if (!library || library.fuse_status?.status !== "running") return;
+    const id = setInterval(load, 4000);
+    return () => clearInterval(id);
+  }, [library, load]);
   const publish = async (skill) => {
-    if (!window.confirm(`Add "${skill.name}" to the existing Claude skill library?`)) return;
-    setBusy(skill.name);
+    if (!window.confirm(`Add "${skill.name}" to the existing skill library (dsh, mirrored to Claude)?`)) return;
+    setBusy(`publish-${skill.name}`);
     try {
       const base = `/api/dcu-kernel-auto-opt/${encodeURIComponent(taskId)}`;
       await postJson(
@@ -525,13 +570,55 @@ function SkillLibrary({ taskId, onClose }) {
       setBusy("");
     }
   };
+  const fuse = async (skill) => {
+    if (!window.confirm(
+      `Have the main agent fuse "${skill.name}" into the existing skill library?`
+    )) return;
+    setBusy(`fuse-${skill.name}`);
+    try {
+      const base = `/api/dcu-kernel-auto-opt/${encodeURIComponent(taskId)}`;
+      await postJson(`${base}/skills/fuse`, { skill_name: skill.name });
+      await load();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy("");
+    }
+  };
+  const syncNow = async () => {
+    setBusy("sync");
+    try {
+      const base = `/api/dcu-kernel-auto-opt/${encodeURIComponent(taskId)}`;
+      await postJson(`${base}/skills/sync`, {});
+      await load();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy("");
+    }
+  };
+  const rollback = async (name) => {
+    if (!window.confirm(`Restore the last backup of skill "${name}"?`)) return;
+    setBusy(`rollback-${name}`);
+    try {
+      const base = `/api/dcu-kernel-auto-opt/${encodeURIComponent(taskId)}`;
+      await postJson(`${base}/skills/${encodeURIComponent(name)}/rollback`, {});
+      await load();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy("");
+    }
+  };
   return html`
     <section class="panel dkao-skill-library">
       <div class="dkao-skill-library-title">
         <div>
           <h2>Skill library</h2>
-          <p class="muted">Review generated evidence before publishing it to Claude.</p>
+          <p class="muted">dsh 库为权威，融合/发布后自动同步到 Claude (ccb) 库。</p>
         </div>
+        <button class="btn" type="button" disabled=${busy === "sync"}
+          onClick=${syncNow}>${busy === "sync" ? "Syncing…" : "同步 Skill 库"}</button>
         <button class="btn" type="button" onClick=${onClose}>Close</button>
       </div>
       ${error ? html`<div class="task-banner task-banner-err">${error}</div>` : null}
@@ -542,6 +629,7 @@ function SkillLibrary({ taskId, onClose }) {
             ? ` (${library.quarantined_count} pending files quarantined)` : ""}
         </div>
       ` : null}
+      <${SkillFuseStatus} status=${library?.fuse_status} onRollback=${rollback} />
       ${!library ? html`<p class="muted">Loading skills…</p>` : html`
         <div class="dkao-skill-columns">
           <div class="dkao-skill-column">
@@ -561,8 +649,10 @@ function SkillLibrary({ taskId, onClose }) {
                 <${SkillFile}
                   skill=${skill}
                   canPublish=${true}
-                  busy=${busy === skill.name}
+                  canFuse=${true}
+                  busy=${busy}
                   onPublish=${publish}
+                  onFuse=${fuse}
                 />
               `)}
               ${!(library.pending || []).length
@@ -601,6 +691,60 @@ export default function DcuKernelAutoOptDetail({ taskId, data }) {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  // ---- variant library (加入 variant 按钮) ------------------------------ //
+  const [variantBusy, setVariantBusy] = useState("");
+  const [variantMsg, setVariantMsg] = useState("");
+  const [variantIndex, setVariantIndex] = useState(null); // null = loading
+  const loadVariants = useCallback(async () => {
+    if (!taskId) return;
+    try {
+      const base = `/api/dcu-kernel-auto-opt/${encodeURIComponent(taskId)}`;
+      const data = await fetchJson(`${base}/variants`);
+      // Map shape -> variant record (incl. median_us/speedup/source) so the
+      // update flow can compare the existing variant against this task.
+      setVariantIndex(new Map((data.variants || []).map((v) => [v.shape, v])));
+    } catch (err) { /* non-fatal */ }
+  }, [taskId]);
+  useEffect(() => { loadVariants(); }, [loadVariants]);
+  const addVariant = async (shape) => {
+    const existing = variantIndex ? variantIndex.get(shape) : null;
+    if (existing) {
+      const candidate = bestRoundPerShape(runtime.lanes).get(shape) || {};
+      const newUs = candidate.median_us;
+      const oldUs = existing.median_us;
+      let verdict = "";
+      if (newUs != null && oldUs != null) {
+        verdict = newUs < oldUs
+          ? "（本次更快）"
+          : newUs > oldUs ? "（本次更慢）" : "（持平）";
+      }
+      const ok = window.confirm(
+        `该算子已有 variant：median ${oldUs ?? "?"} µs`
+        + `（来源 ${existing.source || "?"}）。\n`
+        + `本次候选：median ${newUs ?? "?"} µs ${verdict}。\n`
+        + `用本次候选替换？旧文件会备份（.bak-*）。`
+      );
+      if (!ok) return;
+    }
+    setVariantBusy(shape);
+    setVariantMsg("");
+    try {
+      const base = `/api/dcu-kernel-auto-opt/${encodeURIComponent(taskId)}`;
+      const res = await postJson(`${base}/variants`, { shape_id: shape });
+      const meta = res.meta || {};
+      const tp = meta.tp != null ? `tp${meta.tp}` : "tp?";
+      setVariantMsg(
+        `已加入 variant: ${meta.type} | ${meta.model} | ${tp} | ${meta.operator}`
+        + `（${res.action === "updated" ? "更新已有分区" : "新增分区"}）`
+      );
+      await loadVariants();
+    } catch (err) {
+      setVariantMsg(`加入 variant 失败: ${String(err)}`);
+    } finally {
+      setVariantBusy("");
+    }
+  };
+
   const report = runtime.summary?.report;
   const run = runtime.summary?.run;
   const stopped = run?.final_status === "stopped";
@@ -608,6 +752,32 @@ export default function DcuKernelAutoOptDetail({ taskId, data }) {
   const smokeOnly = report?.mode === "real-agent-dcu-smoke"
     || ["Real agents + DCU (smoke harness)", "Infrastructure smoke (not operator optimization)"]
       .includes(runtime.summary?.plan?.execution_mode);
+  const repoPath = runtime.summary?.plan?.kernel_repo;
+  const repoName = repoPath ? String(repoPath).split("/").pop() : null;
+  // ---- kernel repo rename ------------------------------------------- //
+  const [renameBusy, setRenameBusy] = useState(false);
+  const [renameMsg, setRenameMsg] = useState("");
+  const renameRepo = async () => {
+    if (!repoName) return;
+    const target = window.prompt(
+      "新的仓库名（kernel-repos/ 下的目录名）:", repoName
+    );
+    if (!target || target.trim() === "" || target.trim() === repoName) return;
+    setRenameBusy(true);
+    setRenameMsg("");
+    try {
+      const base = `/api/dcu-kernel-auto-opt/${encodeURIComponent(taskId)}`;
+      const res = await postJson(`${base}/rename-repo`, {
+        new_name: target.trim(),
+      });
+      setRenameMsg(`已重命名: ${res.old_name} → ${res.new_name}`);
+      await refresh();
+    } catch (err) {
+      setRenameMsg(`重命名失败: ${String(err)}`);
+    } finally {
+      setRenameBusy(false);
+    }
+  };
   const bestRounds = bestRoundPerShape(runtime.lanes);
   const shapeOrder = new Map(
     (runtime.summary?.plan?.shapes || []).map((item, index) => [item.id, index]),
@@ -629,6 +799,23 @@ export default function DcuKernelAutoOptDetail({ taskId, data }) {
           <strong>Task stopped in ${run?.current_phase || "startup"}:</strong>
           ${stopReason}
         </div>
+      ` : null}
+
+      ${repoName ? html`
+        <section class="panel dkao-repo-panel">
+          <h2>
+            Kernel repository
+            <span class="muted"> — ${repoName}</span>
+          </h2>
+          <div class="dkao-repo-actions">
+            <button
+              class="btn"
+              disabled=${renameBusy}
+              onClick=${renameRepo}
+            >${renameBusy ? "Renaming…" : "重命名仓库"}</button>
+            ${renameMsg ? html`<span class="dkao-rename-msg">${renameMsg}</span>` : null}
+          </div>
+        </section>
       ` : null}
 
       <section class="panel dkao-state-panel">
@@ -668,7 +855,7 @@ export default function DcuKernelAutoOptDetail({ taskId, data }) {
           </h3>
           <table class="iter-table">
             <thead>
-              <tr><th>Shape</th><th>Worker</th><th>Best round</th><th>Performance</th><th>Speedup</th><th>INT8 TOPS</th><th>Algorithmic BW</th></tr>
+              <tr><th>Shape</th><th>Worker</th><th>Best round</th><th>Performance</th><th>Speedup</th><th>INT8 TOPS</th><th>Algorithmic BW</th><th>Variant</th></tr>
             </thead>
             <tbody>
               ${bestRoundEntries.map(([shape, item]) => html`
@@ -680,10 +867,22 @@ export default function DcuKernelAutoOptDetail({ taskId, data }) {
                   <td>${metric(item.speedup, 3)}×</td>
                   <td>${metric(item.metrics.logical_tops ?? item.metrics.tflops, 3)}</td>
                   <td>${metric(item.metrics.algorithmic_bandwidth_gb_s ?? item.metrics.bandwidth_gb_s, 2)} GB/s</td>
+                  <td>
+                    <button class="btn" type="button"
+                      disabled=${variantBusy === shape}
+                      onClick=${() => addVariant(shape)}>
+                      ${variantBusy === shape
+                        ? "处理中…"
+                        : (variantIndex && variantIndex.has(shape))
+                          ? "更新 variant"
+                          : "加入 variant"}
+                    </button>
+                  </td>
                 </tr>
               `)}
             </tbody>
           </table>
+          ${variantMsg ? html`<p class="muted dkao-variant-msg">${variantMsg}</p>` : null}
         ` : null}
         ${report ? html`
           <table class="iter-table">

@@ -62,8 +62,17 @@ from .w8a8_baselines import fixed_triton_graph_baseline
 
 
 _MAX_GENERATE_RETRIES = 3
+_COORDINATOR_AGENT_ARGS = ["--tools", "Read,Glob,Grep,Write"]
 _MAX_BOOTSTRAP_RETRIES = 3
 _MAX_SYNTHESIS_RETRIES = 3
+# µs-scale decode kernels are one-sided noisy on shared GPUs: transient
+# co-tenant load / clock / thermal state only inflates the median, never
+# deflates it. When the final performance gate (final <= 1.05 x worker best)
+# trips with no source change, re-measure up to _PERF_GATE_MAX_RETRIES times,
+# waiting _PERF_GATE_RETRY_INTERVAL_S between attempts, and accept the best
+# (min) median; only fail when every attempt still exceeds the gate.
+_PERF_GATE_MAX_RETRIES = 3
+_PERF_GATE_RETRY_INTERVAL_S = 300
 _PMC_PLAN = {
     "script": "profile_pmc.sh",
     "mode": "hipprof_pmc_csv",
@@ -545,6 +554,62 @@ def _render_prebuilt_dispatch(
     ])
 
 
+def _final_performance_gate(
+    *,
+    shape_id: str,
+    best_median: float,
+    metrics: Dict[str, Any],
+    benchmark,
+    max_retries: int,
+    retry_interval_s: float,
+    store: StateStore,
+) -> Dict[str, Any]:
+    """Accept the final validation measurement for one optimized shape.
+
+    µs-scale decode kernels are one-sided noisy on shared GPUs: transient
+    co-tenant load / clock / thermal state only inflates the median, never
+    deflates it (decode skill §5). When ``median > 1.05 x best`` with no
+    source change, re-measure with the same protocol up to ``max_retries``
+    times, waiting ``retry_interval_s`` between attempts, and accept the best
+    (min) median. Raise only when every attempt still exceeds the gate.
+
+    Returns the metrics dict of the accepted (best) measurement.
+    """
+    final_median = float(metrics.get("median_us") or float("inf"))
+    accepted = metrics
+    retries_left = max_retries
+    while final_median > best_median * 1.05 and retries_left > 0:
+        retries_left -= 1
+        attempt = max_retries - retries_left
+        store.append_timeline(
+            "final_perf_gate_retry",
+            {
+                "shape_id": shape_id,
+                "attempt": attempt,
+                "median_us": final_median,
+                "best_median_us": best_median,
+                "wait_s": retry_interval_s,
+            },
+        )
+        time.sleep(retry_interval_s)
+        retry = benchmark()
+        if not retry.get("passed"):
+            raise RuntimeError(
+                f"correctness failed for {shape_id}: {json.dumps(retry)}"
+            )
+        accepted = retry
+        final_median = min(
+            final_median, float(retry.get("median_us") or float("inf"))
+        )
+    if final_median > best_median * 1.05:
+        raise RuntimeError(
+            f"performance regressed for {shape_id}: final "
+            f"{final_median:.3f} us vs worker best {best_median:.3f} us "
+            f"after {max_retries} re-measures"
+        )
+    return accepted
+
+
 class GenAndOptPipeline(RealW8A8OptimizationPipeline):
     """Coordinate a clean kernel repo, then let child Agents implement it.
 
@@ -935,7 +1000,7 @@ class GenAndOptPipeline(RealW8A8OptimizationPipeline):
                 timeout_s=1800,
                 stuck_timeout_s=600,
                 max_retries=0,
-                extra_args=list(_SOURCE_ONLY_AGENT_ARGS),
+                extra_args=list(_COORDINATOR_AGENT_ARGS),
             )
             self.store.append_timeline(
                 "agent_launch",
@@ -2079,15 +2144,16 @@ class GenAndOptPipeline(RealW8A8OptimizationPipeline):
                     best_by_shape[shape_id].get("median_us")
                     or float("inf")
                 )
-                final_median = float(
-                    metrics.get("median_us") or float("inf")
+                metrics = _final_performance_gate(
+                    shape_id=shape_id,
+                    best_median=best_median,
+                    metrics=metrics,
+                    benchmark=lambda: runner.benchmark(params),
+                    max_retries=_PERF_GATE_MAX_RETRIES,
+                    retry_interval_s=_PERF_GATE_RETRY_INTERVAL_S,
+                    store=self.store,
                 )
-                if final_median > best_median * 1.05:
-                    raise RuntimeError(
-                        f"performance regressed for {shape_id}: final "
-                        f"{final_median:.3f} us vs worker best "
-                        f"{best_median:.3f} us"
-                    )
+                validation[shape_id] = metrics
         except Exception as exc:
             self.store.append_timeline(
                 "final_artifact_link_rejected",
@@ -2161,7 +2227,7 @@ class GenAndOptPipeline(RealW8A8OptimizationPipeline):
         5. SYNTHESIZE → VALIDATE → REPORT.
         """
         task_id = str(self.req.get("task_id", "task"))
-        self.store.init_or_resume(task_id)
+        self.store.init_or_resume(task_id, "dcu-kernel-auto-opt")
         self.store.update_run(
             finished=False,
             final_status=None,

@@ -12,10 +12,7 @@ import statistics
 import sys
 from pathlib import Path
 
-try:
-    import torch
-except ModuleNotFoundError:  # Allow CPU-only CI to import pure helpers.
-    torch = None  # type: ignore[assignment]
+import torch
 
 
 def load_module(module_path: Path, name: str):
@@ -113,11 +110,75 @@ def exact_w8a8_reference(
     return scaled.to(torch.bfloat16).to(device)
 
 
+def w8a8_seed(m: int, n: int, k: int) -> int:
+    """Deterministic seed shared by the timed run and reference preparation."""
+    return 20260724 + m + n + k
+
+
+def generate_w8a8_inputs(m: int, n: int, k: int):
+    """Generate the exact deterministic inputs a timed run would use.
+
+    Inputs are produced on CUDA/HIP so the RNG stream matches the timed
+    benchmark; a reference pre-seeded from these inputs is therefore
+    bit-identical to one computed inside the benchmark itself.
+    """
+    torch.manual_seed(w8a8_seed(m, n, k))
+    a = torch.randint(
+        -127, 128, (m, k), dtype=torch.int8, device="cuda"
+    )
+    b = torch.randint(
+        -127, 128, (k, n), dtype=torch.int8, device="cuda"
+    )
+    a_scale = torch.rand(
+        (m, 1), dtype=torch.float32, device="cuda"
+    ) * 0.01
+    b_scale = torch.rand(
+        (n, 1), dtype=torch.float32, device="cuda"
+    ) * 0.01
+    return a, b, a_scale, b_scale
+
+
+def reference_cache_path(
+    m: int, n: int, k: int, cache_dir: Path
+) -> Path:
+    """Path of the exact int64 reference cache for one (M, N, K) shape."""
+    return cache_dir / f"exact-int64-v1-m{m}-n{n}-k{k}.pt"
+
+
+def save_reference_cache(
+    reference: torch.Tensor, reference_path: Path
+) -> None:
+    """Persist a computed reference atomically (tmp + replace).
+
+    The parent directory is created on demand: the timed benchmark can reach
+    this path with a fresh ``--reference-cache-dir`` (e.g. serial validation
+    uses ``final/cache/references``) whose parent has never been created.
+    """
+    reference_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = reference_path.with_name(
+        f"{reference_path.name}.tmp-{os.getpid()}"
+    )
+    torch.save(reference.to("cpu"), temporary)
+    temporary.replace(reference_path)
+
+
+def prepare_reference(m: int, n: int, k: int, cache_dir: Path) -> Path:
+    """Compute and cache the exact reference for one shape.
+
+    This is the slow part (CPU int64 GEMM) of a correctness-checked run for
+    M>=3072; call it once per shape outside the timed benchmark budget.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    reference_path = reference_cache_path(m, n, k, cache_dir)
+    if reference_path.is_file():
+        return reference_path
+    a, b, a_scale, b_scale = generate_w8a8_inputs(m, n, k)
+    reference = exact_w8a8_reference(a, b, a_scale, b_scale)
+    save_reference_cache(reference, reference_path)
+    return reference_path
+
+
 def main() -> int:
-    if torch is None:
-        raise RuntimeError(
-            "w8a8_bench.py requires PyTorch in the DCU benchmark environment"
-        )
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path)
     parser.add_argument("--m", type=int)
@@ -141,6 +202,18 @@ def main() -> int:
         "--profile-only",
         action="store_true",
         help="Alias for --skip-correctness used by trusted PMC profiling.",
+    )
+    parser.add_argument(
+        "--prepare-reference",
+        action="store_true",
+        help=(
+            "Compute and cache the exact CPU int64 reference for (m, n, k) "
+            "using the same deterministic inputs as the timed run, then exit "
+            "without building or running any backend. For M>=3072 this is "
+            "the slow part of a correctness-checked benchmark, so the "
+            "control plane runs it once per shape outside the benchmark "
+            "subprocess timeout."
+        ),
     )
     args = parser.parse_args()
 
@@ -210,6 +283,28 @@ def main() -> int:
 
     if min(args.m, args.n, args.k) <= 0:
         raise ValueError("M, N and K must be positive")
+
+    if args.prepare_reference:
+        if args.reference_cache_dir is None:
+            parser.error(
+                "--prepare-reference requires --reference-cache-dir"
+            )
+        reference_path = reference_cache_path(
+            args.m, args.n, args.k, args.reference_cache_dir
+        )
+        cache_hit = reference_path.is_file()
+        if not cache_hit:
+            prepare_reference(
+                args.m, args.n, args.k, args.reference_cache_dir
+            )
+        print(json.dumps({
+            "reference_prepared": True,
+            "reference_cache_hit": cache_hit,
+            "shape": {"M": args.m, "N": args.n, "K": args.k},
+            "reference_cache_path": str(reference_path),
+        }, sort_keys=True))
+        return 0
+
     source = args.source.resolve()
     fixed_contract = source / "int8_w8a8_gemm_api.py"
     if fixed_contract.is_file():
@@ -227,19 +322,9 @@ def main() -> int:
         api.load_extension()
         fixed_api = False
 
-    torch.manual_seed(20260724 + args.m + args.n + args.k)
-    a = torch.randint(
-        -127, 128, (args.m, args.k), dtype=torch.int8, device="cuda"
+    a, b, a_scale, b_scale = generate_w8a8_inputs(
+        args.m, args.n, args.k
     )
-    b = torch.randint(
-        -127, 128, (args.k, args.n), dtype=torch.int8, device="cuda"
-    )
-    a_scale = torch.rand(
-        (args.m, 1), dtype=torch.float32, device="cuda"
-    ) * 0.01
-    b_scale = torch.rand(
-        (args.n, 1), dtype=torch.float32, device="cuda"
-    ) * 0.01
     out = torch.empty(
         (args.m, args.n), dtype=torch.bfloat16, device="cuda"
     )
@@ -301,9 +386,8 @@ def main() -> int:
     if correctness_checked:
         reference_path = None
         if args.reference_cache_dir is not None:
-            args.reference_cache_dir.mkdir(parents=True, exist_ok=True)
-            reference_path = args.reference_cache_dir / (
-                f"exact-int64-v1-m{args.m}-n{args.n}-k{args.k}.pt"
+            reference_path = reference_cache_path(
+                args.m, args.n, args.k, args.reference_cache_dir
             )
         if reference_path is not None and reference_path.is_file():
             cached_reference = torch.load(
@@ -321,11 +405,7 @@ def main() -> int:
         else:
             reference = exact_w8a8_reference(a, b, a_scale, b_scale)
             if reference_path is not None:
-                temporary = reference_path.with_name(
-                    f"{reference_path.name}.tmp-{os.getpid()}"
-                )
-                torch.save(reference.to("cpu"), temporary)
-                temporary.replace(reference_path)
+                save_reference_cache(reference, reference_path)
         mismatch_mask = out != reference
         mismatch_count = int(mismatch_mask.sum().item())
         passed = mismatch_count == 0

@@ -50,7 +50,7 @@ metainfer/tasks/dcu_kernel_auto_opt/
 ### 2.1 新建任务（表单字段，见 form.yaml）
 
 关键字段：`operator`（Quantized GEMM）、`kernel_language`（HIP C++）、`target_hardware`（K500SM_AI/gfx928）、
-`dtype`（INT8 W8A8）、`claude_model`（Opus/Sonnet）、`execution_mode`（Mock / Real INT8 W8A8 GEMM /
+`dtype`（INT8 W8A8）、`agent_framework`（ccb / dsh）、`agent_model`（ccb: Opus/Sonnet；dsh: deepseek-v4-flash）、`execution_mode`（Mock / Real INT8 W8A8 GEMM /
 Generate & optimize / Infra smoke）、`target_repo_path`、`shape_assignment_mode`（AI automatic / Manual by GPU）、
 `shape_scope`（All API shapes / Selected shapes only）、`shape_config`、`max_iterations`、`minimum_improvement_percent`、`extra_notes`。
 
@@ -167,6 +167,21 @@ TP8 另有 wq_b/wo_b (1024,4096)、gate_up (4096,512)、down (256,4096)、indexe
 
 - `DEFAULT_OPTIMIZATION_M_VALUES = (2, 16, 3072)`；`TP4_EXTRA_OPTIMIZATION_M_VALUES = (4096,)`
   （TP4 专属，2026-08-06 加）→ 默认 42 个 shape（TP4 24 + TP8 18）。
+- **模型目录同步**：前端 `static/dkao-shape-input.js` 的 `MODEL_WORKLOADS`、基线表
+  `orchestrator/w8a8_baselines.py`、权威契约 `api/int8w8a8gemm/int8_w8a8_gemm_api.py`
+  三处必须一致。2026-08-12 前端和基线表加了 Hy3/MiniMax M3/GLM5.2 的 TP1/TP4/TP8 目录，
+  但契约只补了 Hy3 TP4；MiniMax M3 TP4 任务在 prepare 直接
+  `infra_fail`（`qkv_proj (6144,2304)` 不在 `TP4_OPERATOR_ALLOWED_KN` 内）。
+  已把目录 TP4/TP8 形状并入契约的 ALLOWED 集合（`HY3_TP8/MINIMAX_TP4/MINIMAX_TP8/GLM52_TP4/GLM52_TP8_OPERATOR_KN`），
+  但不进 `TP_OPERATOR_KN`，默认 42 shape 不变。**新模型/新 shape 上线时三处一起改**；
+  注意 TP1 目录前端可选、契约仍只收 tp_size 4/8，选 TP1 会同样在 prepare 被拒。
+- **模型目录 TP8 大 prefill 边界（2026-08-27）**：Hy3/MiniMax M3/GLM5.2 的 TP8 形状支持
+  M=4096 优化（"Selected shapes only" 手动选择，如 minimax 任务）。契约加
+  `MODEL_TP8_EXTRA_OPTIMIZATION_M_VALUES=(4096,)`（**不进** `DEFAULT_OPTIMIZATION_SHAPES`，
+  默认 42 不变，串行验证 fallback 不受影响）；前端三个模型的 TP8 topology 加
+  `mValues: [2,16,3072,4096]`；基线表 15 条 `(8,4096,…)` 已实测
+  （`baseline/bench_triton_tp8_m4096.py`，int8_utils.matmul_kernel + CUDA-graph replay，
+  结果存 `baseline/tp8_m4096_graph.json`）。DeepSeek TP8 不加 M=4096。
 - `MIN_M=1, MAX_M=4096`；`WORKSPACE_BUDGET_BYTES=16MB`。
 - **M=4096 时大部分 (N,K) 的 split-K workspace 容量为 0** → 大 M kernel 必须走 2D M-tile 路径，
   不能依赖 split-K workspace。
@@ -196,12 +211,28 @@ TP8 另有 wq_b/wo_b (1024,4096)、gate_up (4096,512)、down (256,4096)、indexe
    `metainfer/tasks/dcu_kernel_auto_opt/api/` 下的权威契约后新建任务。
 4. **CPU int64 reference 在 M≥3072 很慢**（分钟级）→ 用 reference 缓存目录
    （`final/cache/references/`，key 是 m-n-k），w8a8_bench 用 `--reference-cache-dir` 命中。
+   **2026-08-23 起控制面自动预置**：`W8A8Runner.benchmark`（check_correctness 时）发现
+   `workers/<w>/cache/references/exact-int64-v1-m<n>-n<n>-k<k>.pt` 缺失，会先以
+   `--prepare-reference` 模式（独立 3600s 超时 `_REFERENCE_PREPARE_TIMEOUT_S`）生成缓存，
+   再跑 900s 超时的正式 bench（命中缓存）。**坑**：torch.mm 的 int64 GEMM 只有 ~0.2 GFLOPS，
+   M=4096/K=6144 单个参考就要 ~10 分钟 solo、4 worker 并发 CPU 争抢更久——没预置缓存时
+   bootstrap 的 900s 子进程必然超时（minimaxm3-dsh-tp4-m4096-1-0c2f84a9 的 worker_0/1/3 就因此
+   3 次全超时 failed）。老任务仓库里已 staging 的 w8a8_bench.py 是旧版（无 `--prepare-reference`），
+   恢复老任务需把新 harness 提交进任务仓库（同步 `scaffold_manifest.json` 的
+   `control_plane_files.w8a8_bench.py` digest）再重启 worker；新建任务自动用新版。
 5. **serial validate 失败后的恢复流程**（有先例 `zth_infer/recover_c9_serial_validate.py`、
    `recover_cc86e2b2_serial_validate.py`）：
    patch `workers/<w>/accepted/<shape>/kernel.hip` → 用 hipcc 重编 `kernel.cuda.o`
    （`-O3 --offload-arch=gfx928 -std=c++17 -fPIC -fno-gpu-rdc`）→ 更新
    `result.json`/`manifest.json` 里的 `source_sha256/object_sha256` → 写恢复驱动
    （`GenAndOptPipeline._phase(VALIDATE,...) → _synthesize_final_candidate → _phase(REPORT)`）。
+   WebUI 的 `POST /workers/{id}/restart` 注意两点（2026-08-23 修过）：
+   - **不再强制传 `--claude-bin`**（原来传 `METAINFER_CLAUDE_BIN`，对 dsh 框架会拉起
+     Claude 二进制而不是 `bridge/dsh/dsh_agent.py`）；`restart_worker.py` /
+     `integrate_restarted_worker.py` 自己按 `agent_framework` 解析。
+   - `restart_worker.py` 归档 `failure.json` 用 `shutil.move` 而非 `Path.replace`：
+     overlayfs 下老文件在 lower layer、新 `restarts/` 目录在 upper layer，
+     `os.rename` 抛 EXDEV（[Errno 18] Invalid cross-device link）。
    注意：容器内后台跑长任务用 `docker exec -d`，否则进程会随 exec 会话结束被杀。
 6. **前端 shape 常量** `static/dkao-shape-input.js` 与 API 默认 shape 要同步
    （TP4 专属 M=4096 是分别维护的）。
@@ -218,9 +249,13 @@ TP8 另有 wq_b/wo_b (1024,4096)、gate_up (4096,512)、down (256,4096)、indexe
 3. 看一个真实任务现场（已成功的例子：`dcu-kernel-auto-opt-cc86e2b2`）：
    `plan.json`（配置）、`shared_baseline/results.json`（基线）、`workers/*/accepted/*`（kernel）、
    `final/source/csrc/w8a8_dispatch.cpp`（路由）、`final_report.json`（结果）。
-4. 内核级工作参考 skill：`int8-w8a8-quantized-gemm-optimization`、`dcu-kernel-tuning`、
-   `hygon-dcu-kernel`、`hygon-gfx928-memory-isa`、`sglang-custom-kernel-integration`；
-   环境/SSH/容器细节参考 `remote-dcu-env`。
+4. 内核级工作参考 skill：W8A8 调优已按阶段拆成 skill 家族（2026-08-23）——
+   `int8-w8a8-gemm-decode`（M≤32）+ `int8-w8a8-gemm-prefill`（M>32）+ 共享地基
+   `int8-w8a8-gemm-foundations`；旧名 `int8-w8a8-quantized-gemm-optimization` 保留为路由器。
+   其余：`dcu-kernel-tuning`、`hygon-dcu-kernel`、`hygon-gfx928-memory-isa`、
+   `sglang-custom-kernel-integration`；环境/SSH/容器细节参考 `remote-dcu-env`。
+   改动 skill 库（`~/.dsh/skills/`）后记得跑 `sync_skill_libraries()` 镜像到
+   `~/.claude/skills/`（skill_store 测试里有覆盖）。
 5. 改动任何行为后：更新本文件相关段落 + 跑 tests + 用真实任务验证（优先在 zth_meta 里）。
 
 ## 7. 不确定性标注

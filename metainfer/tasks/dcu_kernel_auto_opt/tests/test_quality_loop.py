@@ -494,8 +494,8 @@ def test_isa_policy_requires_eight_hip_rounds_and_plateau():
     assert late["phase"] == "isa_guided_hip"
     assert late["skill_allowed"] is True
     assert late["raw_inline_asm_allowed"] is False
-    assert "Skill" in _SOURCE_ONLY_AGENT_ARGS[1].split(",")
-    assert "Skill" not in _ISA_AGENT_ARGS[1].split(",")
+    assert "Skill" not in _SOURCE_ONLY_AGENT_ARGS[1].split(",")
+    assert "Skill" in _ISA_AGENT_ARGS[1].split(",")
 
 
 def test_isa_policy_does_not_count_failed_attempts_as_hip_rounds():

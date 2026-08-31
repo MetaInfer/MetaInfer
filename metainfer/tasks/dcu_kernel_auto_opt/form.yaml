@@ -56,17 +56,33 @@
     - label: "Other"
       description: "Defined by the concrete operator adapter"
 
-- key: claude_model
-  question: "Claude model used by coordinator, kernel workers, repairs, synthesis, and validation."
-  header: "Claude model"
+- key: agent_framework
+  question: "Agent framework used by coordinator, kernel workers, repairs, synthesis, and validation."
+  header: "Agent framework"
+  required: true
+  multi: false
+  default: "ccb"
+  options:
+    - label: "ccb"
+      description: "Claude Code (claude-sonnet-5 / claude-opus-5)"
+    - label: "dsh"
+      description: "DeepSeek Harness (deepseek-v4-flash)"
+
+- key: agent_model
+  question: "Model used by the selected agent framework (ccb: Sonnet/Opus; dsh: deepseek-v4-flash)."
+  header: "Agent model"
   required: true
   multi: false
   default: "Opus"
+  override_component: "agent-model"
+  override_module: "app/dkao-agent-fields"
   options:
     - label: "Opus"
-      description: "Highest-reasoning model for difficult kernel architecture and correctness work"
+      description: "Pinned to Claude Opus 5 (claude-opus-5) for difficult kernel architecture and correctness work"
     - label: "Sonnet"
-      description: "Faster model for lower-cost optimization runs"
+      description: "Pinned to Claude Sonnet 5 (claude-sonnet-5) for faster, lower-cost optimization runs"
+    - label: "deepseek-v4-flash"
+      description: "DeepSeek Harness model (deepseek-v4-flash)"
 
 - key: execution_mode
   question: "Task execution mode for this run."
@@ -132,6 +148,7 @@
   form: textarea
   default: ""
   override_component: "shape-input"
+  override_module: "app/dkao-shape-input"
 
 - key: correctness_ref
   question: "Trusted correctness reference owned by the MetaInfer adapter."

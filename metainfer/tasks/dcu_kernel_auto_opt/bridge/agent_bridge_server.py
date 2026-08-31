@@ -50,11 +50,11 @@ PATH_ENV = {
 }
 VALUE_FLAGS = {
     "--output-format", "--input-format", "--permission-mode", "--add-dir",
-    "--model", "--effort", "--resume", "--session-id",
-    "--disallowedTools", "--disallowed-tools",
+    "--model", "--effort", "--resume", "--session-id", "--setting-sources",
+    "--tools", "--disallowedTools", "--disallowed-tools",
 }
 BARE_FLAGS = {"-p", "--verbose"}
-SOURCE_ONLY_TOOLS = "Bash,Skill,WebFetch,WebSearch"
+SOURCE_ONLY_TOOLS = "Read,Glob,Grep,Write,Edit"
 CLI_SLOT = threading.Semaphore(int(os.environ.get(
     # worker29 has four physical GPUs and the control plane assigns at most
     # one child per GPU.  A single slot serializes independent workers and
@@ -291,9 +291,9 @@ def _validated_args(args: list[str]) -> list[str]:
         raise ValueError("print mode is required")
     if not any(
         flag in out
-        for flag in ("--disallowedTools", "--disallowed-tools")
+        for flag in ("--tools", "--disallowedTools", "--disallowed-tools")
     ):
-        out.extend(["--disallowedTools", SOURCE_ONLY_TOOLS])
+        out.extend(["--tools", SOURCE_ONLY_TOOLS])
     return out
 
 

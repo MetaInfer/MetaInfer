@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from ..orchestrator.config import load_config
+from ..orchestrator.config import (
+    DSH_DEFAULT_MODEL_ID,
+    dsh_model_id,
+    load_config,
+    resolve_claude_bin,
+)
 from ..orchestrator.gpu_binding import (
     bind_worker_gpu,
     hide_gpus_from_control_plane,
@@ -32,7 +37,7 @@ assignments:
     assert set(cfg.shapes) == {"m2", "m16"}
     assert [a.gpu for a in cfg.assignments] == [0, 1]
     assert cfg.assignment_mode == "manual"
-    assert cfg.claude_model == "opus"
+    assert cfg.claude_model == "claude-opus-5"
 
 
 def test_new_task_can_select_sonnet():
@@ -44,7 +49,7 @@ assignments:
 """)
     req["answers"]["claude_model"] = "Sonnet"
 
-    assert load_config(req).claude_model == "sonnet"
+    assert load_config(req).claude_model == "claude-sonnet-5"
 
 
 def test_unknown_claude_model_is_rejected():
@@ -56,8 +61,82 @@ assignments:
 """)
     req["answers"]["claude_model"] = "default"
 
-    with pytest.raises(ValueError, match="Sonnet or Opus"):
+    with pytest.raises(ValueError, match="agent_model must be one of"):
         load_config(req)
+
+
+def test_dsh_framework_resolves_wrapper_model(monkeypatch):
+    monkeypatch.setenv("DSH_AGENT_MODEL", "deepseek/deepseek-v4-flash-0731")
+    req = _req("""
+shapes:
+  - {id: m2, M: 2, N: 16, K: 32}
+assignments:
+  worker_0: {gpu: 0, shapes: [m2]}
+""")
+    req["answers"]["agent_framework"] = "dsh"
+    req["answers"]["agent_model"] = "deepseek-v4-flash"
+
+    cfg = load_config(req)
+    assert cfg.agent_framework == "dsh"
+    assert cfg.claude_model == "deepseek/deepseek-v4-flash-0731"
+
+
+def test_dsh_default_model_when_agent_model_missing(monkeypatch):
+    monkeypatch.setenv("DSH_AGENT_MODEL", "deepseek/deepseek-v4-flash-0731")
+    req = _req("""
+shapes:
+  - {id: m2, M: 2, N: 16, K: 32}
+assignments:
+  worker_0: {gpu: 0, shapes: [m2]}
+""")
+    req["answers"]["agent_framework"] = "dsh"
+
+    assert load_config(req).claude_model == DSH_DEFAULT_MODEL_ID
+
+
+def test_dsh_rejects_ccb_only_model(monkeypatch):
+    monkeypatch.setenv("DSH_AGENT_MODEL", "deepseek/deepseek-v4-flash-0731")
+    req = _req("""
+shapes:
+  - {id: m2, M: 2, N: 16, K: 32}
+assignments:
+  worker_0: {gpu: 0, shapes: [m2]}
+""")
+    req["answers"]["agent_framework"] = "dsh"
+    req["answers"]["agent_model"] = "Opus"
+
+    with pytest.raises(ValueError, match="framework 'dsh'"):
+        load_config(req)
+
+
+def test_unknown_agent_framework_is_rejected():
+    req = _req("""
+shapes:
+  - {id: m2, M: 2, N: 16, K: 32}
+assignments:
+  worker_0: {gpu: 0, shapes: [m2]}
+""")
+    req["answers"]["agent_framework"] = "bogus"
+
+    with pytest.raises(ValueError, match="agent_framework must be one of"):
+        load_config(req)
+
+
+def test_resolve_claude_bin_per_framework():
+    # dsh -> the bundled ccb-compatible DSH wrapper.
+    dsh_bin = resolve_claude_bin("dsh")
+    assert dsh_bin.endswith("bridge/dsh/dsh_agent.py")
+    # Explicit override always wins.
+    assert resolve_claude_bin("dsh", explicit="/opt/custom/agent") == "/opt/custom/agent"
+    # ccb defaults to the env / "ccb" (METAINFER_CLAUDE_BIN unset here).
+    assert resolve_claude_bin("ccb") == "ccb"
+
+
+def test_dsh_model_id_honors_env(monkeypatch):
+    monkeypatch.setenv("DSH_AGENT_MODEL", "deepseek/deepseek-v4-flash")
+    assert dsh_model_id() == "deepseek/deepseek-v4-flash"
+    monkeypatch.delenv("DSH_AGENT_MODEL")
+    assert dsh_model_id() == DSH_DEFAULT_MODEL_ID
 
 
 def test_explicit_manual_mode_requires_assignments():

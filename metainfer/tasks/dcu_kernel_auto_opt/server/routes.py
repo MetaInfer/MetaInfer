@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -26,9 +27,23 @@ from ..orchestrator.config import (
     GEN_AND_OPT_MODE,
     LEGACY_SMOKE_MODE,
     SMOKE_MODE,
+    load_config,
 )
 from ..orchestrator.guidance import add_guidance, list_guidance
-from ..orchestrator.skill_store import list_skill_library, publish_skill
+from ..orchestrator.rename_kernel_repo import rename_kernel_repo
+from ..orchestrator.skill_store import (
+    fuse_skill,
+    list_skill_library,
+    mark_fuse_running,
+    publish_skill,
+    rollback_skill,
+    sync_skill_libraries,
+)
+from ..orchestrator.variant_store import (
+    add_variant,
+    derive_variant_meta,
+    list_variant_index,
+)
 
 
 PLUGIN_TYPE = "dcu-kernel-auto-opt"
@@ -68,6 +83,44 @@ def _running_pid(path: Path) -> int | None:
     except (OSError, ProcessLookupError):
         return None
     return pid
+
+
+def _restart_worker_commands(
+    requirements: Path,
+    state_dir: Path,
+    workspace_dir: Path,
+    worker_id: str,
+) -> tuple[list[str], list[str]]:
+    """Build the restart + integration commands for one failed worker lane.
+
+    Neither command passes an explicit ``--claude-bin``: the lane binaries
+    resolve the agent binary from the task's ``agent_framework`` themselves
+    (ccb -> METAINFER_CLAUDE_BIN / ``ccb``, dsh -> ``bridge/dsh/dsh_agent.py``),
+    matching how the original run launched its agents.
+    """
+    common = [
+        "--state-dir", str(state_dir),
+        "--workspace-dir", str(workspace_dir),
+        "--worker-id", worker_id,
+    ]
+    command = [
+        sys.executable,
+        "-m",
+        "metainfer.tasks.dcu_kernel_auto_opt.orchestrator.restart_worker",
+        str(requirements),
+        *common,
+    ]
+    integration_command = [
+        sys.executable,
+        "-m",
+        (
+            "metainfer.tasks.dcu_kernel_auto_opt.orchestrator."
+            "integrate_restarted_worker"
+        ),
+        str(requirements),
+        *common,
+    ]
+    return command, integration_command
 
 
 def _read_bootstrap_attempts(
@@ -498,34 +551,10 @@ def build_router(plugin) -> APIRouter:
         requirements = state_dir / "requirements.json"
         if not requirements.is_file():
             raise HTTPException(status_code=400, detail="requirements.json is missing")
-        bridge = os.environ.get("METAINFER_CLAUDE_BIN") or str(
-            Path(__file__).resolve().parent.parent
-            / "bridge" / "agent_bridge_client.py"
-        )
         log_path = state_dir / f"{worker_id}_restart.log"
-        command = [
-            sys.executable,
-            "-m",
-            "metainfer.tasks.dcu_kernel_auto_opt.orchestrator.restart_worker",
-            str(requirements),
-            "--state-dir", str(state_dir),
-            "--workspace-dir", str(workspace_dir),
-            "--worker-id", worker_id,
-            "--claude-bin", bridge,
-        ]
-        integration_command = [
-            sys.executable,
-            "-m",
-            (
-                "metainfer.tasks.dcu_kernel_auto_opt.orchestrator."
-                "integrate_restarted_worker"
-            ),
-            str(requirements),
-            "--state-dir", str(state_dir),
-            "--workspace-dir", str(workspace_dir),
-            "--worker-id", worker_id,
-            "--claude-bin", bridge,
-        ]
+        command, integration_command = _restart_worker_commands(
+            requirements, state_dir, workspace_dir, worker_id
+        )
         try:
             with log_path.open("ab") as log_file:
                 process = subprocess.Popen(
@@ -566,6 +595,33 @@ def build_router(plugin) -> APIRouter:
             "integration_pid": integration_process.pid,
             "isolated": True,
         }
+
+    @router.post("/rename-repo")
+    async def rename_repo(task_id: str, request: Request) -> Dict[str, Any]:
+        """Rename the task's kernel repository and repair all references.
+
+        Body: ``{"new_name": "<kernel-repos directory name>"}``. Refuses
+        while the task's orchestrator is still running.
+        """
+        entry = task_or_404(task_id)
+        require_task_type(entry, PLUGIN_TYPE)
+        state_dir = state_dir_for(entry)
+        workspace_dir = workspace_dir_for(entry)
+        try:
+            body = await request.json()
+        except (ValueError, AttributeError) as exc:
+            raise HTTPException(
+                status_code=400, detail="invalid JSON body"
+            ) from exc
+        new_name = (
+            body.get("new_name") if isinstance(body, dict) else None
+        ) or ""
+        try:
+            return rename_kernel_repo(
+                workspace_dir, new_name, state_dir=state_dir
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.get("/state-graph")
     def state_graph(task_id: str) -> Dict[str, Any]:
@@ -626,5 +682,163 @@ def build_router(plugin) -> APIRouter:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except FileExistsError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post("/skills/sync")
+    def sync_skills(task_id: str) -> Dict[str, Any]:
+        """Manually mirror the authoritative dsh library into the ccb library."""
+        entry = task_or_404(task_id)
+        require_task_type(entry, PLUGIN_TYPE)
+        workspace_dir = workspace_dir_for(entry)
+        return {"sync": sync_skill_libraries(workspace_dir=workspace_dir)}
+
+    @router.post("/skills/fuse")
+    async def fuse_skill_route(task_id: str, request: Request) -> Dict[str, Any]:
+        """Trigger the main-agent fusion of one pending skill into the dsh
+        library (mirrored to ccb afterwards). Runs in the background; poll
+        ``GET /skills`` ``fuse_status`` for progress."""
+        entry = task_or_404(task_id)
+        require_task_type(entry, PLUGIN_TYPE)
+        workspace_dir = workspace_dir_for(entry)
+        state_dir = state_dir_for(entry)
+        plan = _load(workspace_dir / "plan.json", {}) or {}
+        if plan.get("execution_mode") in {LEGACY_SMOKE_MODE, SMOKE_MODE}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "infrastructure-smoke skills are quarantined and cannot "
+                    "be fused"
+                ),
+            )
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - malformed body
+            body = {}
+        skill_name = str(body.get("skill_name") or "").strip()
+        if not skill_name:
+            raise HTTPException(status_code=400, detail="missing skill_name")
+        pending = workspace_dir / "skills" / "pending" / skill_name
+        if not (pending / "SKILL.md").is_file():
+            raise HTTPException(
+                status_code=404,
+                detail=f"pending skill not found: {skill_name}",
+            )
+        req = read_requirements(state_dir)
+        if req is None:
+            raise HTTPException(
+                status_code=400,
+                detail="no requirements.json to read agent framework from",
+            )
+        config = load_config(req)
+        mark_fuse_running(workspace_dir, skill_name)
+
+        def _run_fusion() -> None:
+            try:
+                fuse_skill(
+                    config=config,
+                    workspace_dir=workspace_dir,
+                    state_dir=state_dir,
+                    skill_name=skill_name,
+                )
+            except Exception:  # noqa: BLE001 - status file carries the error
+                pass
+
+        threading.Thread(target=_run_fusion, daemon=True).start()
+        return {
+            "ok": True,
+            "action": "fuse",
+            "skill_name": skill_name,
+            "status": "running",
+        }
+
+    @router.post("/skills/{skill_name}/rollback")
+    def rollback(task_id: str, skill_name: str) -> Dict[str, Any]:
+        """Restore the latest SKILL.md backup of a fused skill in the dsh
+        library and re-mirror to ccb."""
+        entry = task_or_404(task_id)
+        require_task_type(entry, PLUGIN_TYPE)
+        workspace_dir = workspace_dir_for(entry)
+        try:
+            return {"result": rollback_skill(skill_name, workspace_dir=workspace_dir)}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.get("/variants")
+    def variants_index(task_id: str) -> Dict[str, Any]:
+        """Return the fine-grained variant index (which shapes are already
+        captured in the shared variant library)."""
+        entry = task_or_404(task_id)
+        require_task_type(entry, PLUGIN_TYPE)
+        return {"variants": list_variant_index()}
+
+    @router.post("/variants")
+    async def add_variant_route(task_id: str, request: Request) -> Dict[str, Any]:
+        """Add one optimized shape's accepted kernel into the shared variant
+        library, organized by operator type / model / TP / specific operator.
+        Replaces an existing section for the same shape (with a file backup)."""
+        entry = task_or_404(task_id)
+        require_task_type(entry, PLUGIN_TYPE)
+        state_dir = state_dir_for(entry)
+        workspace_dir = workspace_dir_for(entry)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - malformed body
+            body = {}
+        shape_id = str(body.get("shape_id") or "").strip()
+        if not shape_id:
+            raise HTTPException(status_code=400, detail="missing shape_id")
+        req = read_requirements(state_dir)
+        if req is None:
+            raise HTTPException(
+                status_code=400, detail="no requirements.json for this task"
+            )
+        answers = req.get("answers") if isinstance(req.get("answers"), dict) else req
+
+        # Locate the accepted kernel for this shape under any worker lane.
+        accepted = None
+        for worker_root in sorted((workspace_dir / "workers").glob("worker_*")):
+            candidate = worker_root / "accepted" / shape_id / "kernel.hip"
+            if candidate.is_file():
+                accepted = candidate
+                break
+        if accepted is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no accepted kernel for shape {shape_id}",
+            )
+        manifest_path = accepted.parent / "manifest.json"
+        manifest = _load(manifest_path, {})
+        metrics = dict(manifest.get("metrics") or {})
+        # baseline from the task's fixed user-supplied table for the speedup.
+        initial = _load(workspace_dir / "final_report.json", {}).get("initial_metrics") or {}
+        baseline = None
+        b = initial.get(shape_id)
+        if isinstance(b, dict):
+            baseline = b.get("median_us")
+        elif b is not None:
+            baseline = b
+        if baseline is not None and metrics.get("median_us"):
+            metrics["baseline_us"] = baseline
+            metrics["speedup"] = float(baseline) / float(metrics["median_us"])
+
+        meta = derive_variant_meta(answers, shape_id)
+        kernel_source = accepted.read_text(encoding="utf-8", errors="replace")
+        commit = str(manifest.get("commit") or "")
+        try:
+            result = add_variant(
+                meta=meta,
+                kernel_source=kernel_source,
+                commit=commit,
+                metrics=metrics,
+                source_task=str(req.get("task_id") or task_id),
+                backup=True,
+                # Hard guard: a strictly slower candidate may not replace the
+                # existing variant for the same shape (equal/faster may).
+                reject_slower_than_existing=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, **result}
 
     return router

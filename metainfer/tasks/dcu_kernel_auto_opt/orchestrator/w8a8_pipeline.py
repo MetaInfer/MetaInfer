@@ -65,12 +65,12 @@ _REQUIRED_FILE_SETS = (
     ),
 )
 _SOURCE_ONLY_AGENT_ARGS = [
-    "--disallowedTools",
-    "Bash,Skill,WebFetch,WebSearch",
+    "--tools",
+    "Read,Glob,Grep,Write,Edit",
 ]
 _ISA_AGENT_ARGS = [
-    "--disallowedTools",
-    "Bash,WebFetch,WebSearch",
+    "--tools",
+    "Read,Glob,Grep,Write,Edit,Skill",
 ]
 _MAX_IN_ROUND_REPAIRS = 4
 _MAX_INFRASTRUCTURE_RECOVERY_ROUNDS = 5
@@ -80,6 +80,17 @@ _PLATEAU_MAX_REGRESSION_PERCENT = 2.0
 _SHADOW_MIN_IMPROVEMENT_PERCENT = 0.3
 _AGENT_TIMEOUT_S = 900
 _AGENT_STUCK_TIMEOUT_S = 600
+# Trusted harness subprocess budget for one correctness-checked benchmark or
+# PMC profile run. With the reference auto-seeded (_REFERENCE_PREPARE_TIMEOUT_S)
+# this only needs to cover hipcc compile (~30s) + graph capture + timing;
+# 1200s adds margin for slow compiles or a busy host (was 900s, which M=4096
+# correctness runs blew through before reference pre-seeding existed).
+_BENCHMARK_TIMEOUT_S = 1200
+# The CPU int64 exact reference for M>=3072 is the dominant cost of a
+# correctness-checked benchmark (measured ~0.2 GFLOPS for torch.mm int64, so
+# M=4096/K=6144 needs ~10+ minutes solo and more under worker contention).
+# It is prepared once per shape outside the benchmark subprocess budget.
+_REFERENCE_PREPARE_TIMEOUT_S = 3600
 _UNSUPPORTED_SKILL_CLAIMS = (
     "scalar is optimal",
     "dumma is unavailable",
@@ -849,6 +860,12 @@ class W8A8Runner:
             k = int(shape["K"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("W8A8 shapes require integer M, N and K") from exc
+        if check_correctness:
+            # The CPU int64 reference is the slow part of a
+            # correctness-checked benchmark for M>=3072; prepare and cache it
+            # once per shape outside the 900s benchmark subprocess budget so
+            # the timed run below always hits the cache.
+            self._ensure_reference_cache(m, n, k)
         command = [
             "python3", str(self.harness), "--source", str(self.source),
             "--m", str(m), "--n", str(n), "--k", str(k),
@@ -867,11 +884,54 @@ class W8A8Runner:
             command.append("--skip-correctness")
         build = self._prepare_compile_cache()
         result = _run(
-            command, cwd=self.source, env=self.env, timeout=900
+            command, cwd=self.source, env=self.env,
+            timeout=_BENCHMARK_TIMEOUT_S,
         )
         metrics = _last_json(result.stdout)
         metrics["compile_cache_key"] = build["build_key"]
         return metrics
+
+    def _reference_cache_path(self, m: int, n: int, k: int) -> Path:
+        """Path of the exact int64 reference cache for one (M, N, K)."""
+        return (
+            self.worker_root / "cache" / "references"
+            / f"exact-int64-v1-m{m}-n{n}-k{k}.pt"
+        )
+
+    def _ensure_reference_cache(self, m: int, n: int, k: int) -> None:
+        """Compute and cache the exact CPU int64 reference once per shape.
+
+        ``w8a8_bench.py --prepare-reference`` regenerates the exact
+        deterministic inputs the timed run uses (fixed seed, CUDA RNG) and
+        persists the reference, so a cache hit inside the benchmark is
+        bit-identical to computing it there. M>=3072 references can take
+        ~10+ minutes (CPU int64 GEMM at ~0.2 GFLOPS), which is why this runs
+        under its own generous timeout instead of the benchmark's 900s.
+        """
+        reference_path = self._reference_cache_path(m, n, k)
+        if reference_path.is_file():
+            return
+        cache_dir = reference_path.parent
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        command = [
+            "python3", str(self.harness), "--source", str(self.source),
+            "--m", str(m), "--n", str(n), "--k", str(k),
+            "--reference-cache-dir", str(cache_dir),
+            "--prepare-reference",
+        ]
+        result = _run(
+            command, cwd=self.source, env=self.env,
+            timeout=_REFERENCE_PREPARE_TIMEOUT_S,
+        )
+        payload = _last_json(result.stdout)
+        if (
+            not payload.get("reference_prepared")
+            or not reference_path.is_file()
+        ):
+            raise RuntimeError(
+                "reference cache preparation failed for "
+                f"M={m}, N={n}, K={k}: {result.stdout[-2000:]}"
+            )
 
     def profile_pmc(
         self,
@@ -905,7 +965,7 @@ class W8A8Runner:
             ],
             cwd=self.source,
             env=self.env,
-            timeout=900,
+            timeout=_BENCHMARK_TIMEOUT_S,
         )
         evidence = parse_pmc_csv(output_dir / "pmc.csv")
         read_csv = output_dir / "pmc-read.csv"
@@ -982,7 +1042,7 @@ class RealW8A8OptimizationPipeline:
 
     def run(self, *, dry_run: bool = False) -> Dict[str, Any]:
         task_id = str(self.req.get("task_id", "task"))
-        self.store.init_or_resume(task_id)
+        self.store.init_or_resume(task_id, "dcu-kernel-auto-opt")
         self.store.update_run(
             current_iteration=0,
             finished=False,
@@ -1509,7 +1569,12 @@ rejected ideas, integration/validation rules, and fallback behavior. Clearly
 mark unavailable shapes as unoptimized; never infer success from a timed-out
 or failed worker. Compiler errors are candidate failures, not proof that
 DUMMA, a dtype, or a HIP API is unsupported. Never call the baseline optimal
-when no candidate was accepted.
+when no candidate was accepted. If the task spans both phases, keep decode
+(M<=32) and prefill (M>32) in clearly separated sections and mirror the
+canonical skill family structure (int8-w8a8-gemm-decode /
+int8-w8a8-gemm-prefill + int8-w8a8-gemm-foundations): shared contract/layout/
+benchmark rules belong to the foundations section, phase-specific recipes and
+acceptance rules to the phase section.
 """
         prompt_file = self.workspace_dir / "skills" / "main-agent.prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")

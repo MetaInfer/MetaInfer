@@ -599,11 +599,20 @@ int32 accumulation. Use enough M/N tiles to expose CU parallelism; keep the
 first implementation direct or single-buffered and avoid split-K, raw asm,
 or speculative deep pipelines.
 
-When `references/w8a8_gemm_variants.hip` is present, you may read and adapt a
-measured DUMMA implementation as an implementation reference. It is neither a
-whitelist nor a restriction: take only the minimum code needed for a correct
-starting point and continue exploring freely in later rounds. Do not claim
-its measurements until the trusted control plane revalidates this source.
+When variant reference code is present, you may read and adapt measured
+implementations as reference. Variants live in a staged tree under
+`references/` organized as `<operator+dtype>/<model>/<TP>/<M>/<operator>.hip`
+(for example `references/int8w8a8-gemm/hy3/TP4/M4096/o_proj.hip`); the
+legacy flat file `references/w8a8_gemm_variants.hip` is also available.
+Navigate the tree with `ls`/`find` to the directory matching your exact
+operator/dtype, model, TP, and M family, then read only the specific operator
+file you need. Variants are neither a whitelist nor a restriction: take only
+the minimum code needed for a correct starting point and continue exploring
+freely in later rounds. Do not claim their measurements until the trusted
+control plane revalidates this source. Reusing a variant never locks you into
+it: adapt freely, combine ideas, or ignore it and start fresh — every
+accepted kernel must still pass the full correctness/Graph/median-P90/
+resource validation.
 
 Keep one simple scalar int8/int32 fallback for unmatched shapes and small-M
 API cases. Shapes with M < 128 may use that scalar fallback for bootstrap.

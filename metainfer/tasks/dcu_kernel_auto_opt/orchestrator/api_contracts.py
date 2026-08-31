@@ -94,15 +94,25 @@ def resolve_operator_api(
             "named _check_target_shape"
         )
     # Reference variant HIP code lives in the plugin's variant/ directory;
-    # fall back to the legacy location next to the API file.
+    # fall back to the legacy location next to the API file. The fine-grained
+    # variant TREE (variant/<op+dtype>/<model>/<TP>/<M>/<operator>.hip) is
+    # staged alongside the legacy single file so agents can navigate both.
     variant_root = Path(__file__).resolve().parents[1] / "variant"
-    variant_sources = tuple(
-        path for path in (variant_root / W8A8_VARIANTS_FILENAME,)
-        if path.is_file()
-    ) or tuple(
-        path for path in (source.parent / W8A8_VARIANTS_FILENAME,)
-        if path.is_file()
+    legacy = next(
+        (path for path in (variant_root / W8A8_VARIANTS_FILENAME,)
+         if path.is_file()),
+        next((path for path in (source.parent / W8A8_VARIANTS_FILENAME,)
+              if path.is_file()), None),
     )
+    variant_sources: tuple = ()
+    if legacy is not None:
+        variant_sources += (legacy,)
+    # every subdirectory of variant/ is a fine-grained variant family tree
+    # (e.g. int8w8a8-gemm/hy3/TP4/M4096/o_proj.hip)
+    if variant_root.is_dir():
+        variant_sources += tuple(
+            path for path in sorted(variant_root.iterdir()) if path.is_dir()
+        )
     return OperatorAPIContract(
         operator=operator,
         dtype=dtype,
@@ -208,11 +218,28 @@ def stage_operator_references(
     contract: OperatorAPIContract,
     destination_dir: Path,
 ) -> list[Path]:
-    """Stage optional read-only evidence without adding it to the build."""
+    """Stage optional read-only evidence without adding it to the build.
+
+    Files are copied into ``references/`` as-is; directories (the fine-grained
+    variant tree) are copied recursively under ``references/<name>/``.
+    """
     staged: list[Path] = []
     references_dir = destination_dir / "references"
     for source in contract.reference_sources:
         references_dir.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            destination = references_dir / source.name
+            if destination.exists():
+                shutil.rmtree(destination)
+            shutil.copytree(
+                source, destination,
+                ignore=shutil.ignore_patterns("*.bak-*"),
+            )
+            for path in destination.rglob("*"):
+                if path.is_file():
+                    path.chmod(0o444)
+            staged.append(destination)
+            continue
         destination = references_dir / source.name
         if destination.exists():
             destination.chmod(0o644)
