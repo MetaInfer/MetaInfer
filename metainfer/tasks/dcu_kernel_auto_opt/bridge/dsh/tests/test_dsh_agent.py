@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import sys
 import types
 import unittest
@@ -96,14 +97,27 @@ class FakeStdin:
 
 
 def run_wrapper(module, argv, prompt):
+    """Run the wrapper with a scripted prompt/stdin, plus a fake API key.
+
+    ``dsh_agent.main()`` refuses to start without credentials (TENCENT_API_KEY
+    / DEEPSEEK_API_KEY env or ~/.dsh/.credentials.yaml). CI runners have none
+    of those, so inject a dummy key for the duration of the call to keep the
+    tests hermetic and environment-independent.
+    """
     out, err = io.StringIO(), io.StringIO()
     old_stdin = sys.stdin
+    saved_key = os.environ.get("TENCENT_API_KEY")
+    os.environ["TENCENT_API_KEY"] = saved_key or "ci-test-key"
     sys.stdin = FakeStdin(prompt)
     try:
         with redirect_stdout(out), redirect_stderr(err):
             code = module.main(argv)
     finally:
         sys.stdin = old_stdin
+        if saved_key is None:
+            os.environ.pop("TENCENT_API_KEY", None)
+        else:
+            os.environ["TENCENT_API_KEY"] = saved_key
     return code, out.getvalue(), err.getvalue()
 
 
