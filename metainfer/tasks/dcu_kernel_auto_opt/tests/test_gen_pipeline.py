@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 from pathlib import Path
@@ -36,6 +37,9 @@ from ..orchestrator.w8a8_pipeline import (
     publish_iteration_candidate,
     snapshot_accepted_kernel_artifact,
 )
+
+
+TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 
 
 def test_generated_repo_is_valid_existing_repo_seed(tmp_path):
@@ -389,6 +393,7 @@ def test_control_plane_artifacts_are_not_attributed_to_agent():
     assert not _is_control_plane_artifact("csrc/w8a8_gemm_hip.hip")
 
 
+@pytest.mark.skipif(not TORCH_AVAILABLE, reason="PyTorch is not installed")
 def test_trusted_harness_pytorch_reference_self_test():
     harness = (
         Path(__file__).resolve().parent.parent
