@@ -307,7 +307,7 @@ assignments:
     req["answers"]["mock_iterations"] = "2"
     config = load_config(req)
     pipeline = _make_pipeline(req, tmp_path)
-    pipeline.store.init_or_resume("iteration-timeout-test", "dcu-kernel-auto-opt")
+    pipeline.store.init_or_resume("iteration-timeout-test")
     root = pipeline.workspace_dir / "workers" / "worker_0"
     source = root / "source"
     source.joinpath("csrc").mkdir(parents=True)

@@ -1042,7 +1042,7 @@ class RealW8A8OptimizationPipeline:
 
     def run(self, *, dry_run: bool = False) -> Dict[str, Any]:
         task_id = str(self.req.get("task_id", "task"))
-        self.store.init_or_resume(task_id, "dcu-kernel-auto-opt")
+        self.store.init_or_resume(task_id)
         self.store.update_run(
             current_iteration=0,
             finished=False,
