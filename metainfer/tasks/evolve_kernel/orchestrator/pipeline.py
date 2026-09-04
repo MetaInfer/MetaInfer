@@ -31,7 +31,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import phases as P
+from .headroom import analyze_headroom, headroom_result_to_dict, headroom_dict_to_summary
 from .kernel_library import KernelEntry, KernelLibrary, MAX_LIBRARY_SIZE
+from .profiling import (
+    run_hipprof_profile,
+    profile_result_to_dict,
+    profile_to_advice,
+    profile_summary_for_storage,
+)
 from .harness import (
     build_correctness_harness_template,
     build_perf_harness_template,
@@ -310,6 +317,11 @@ class Orchestrator:
                 phase_rec["failure"] = failure
             if perf:
                 phase_rec["perf"] = perf
+
+            # Persist phases to disk IMMEDIATELY so the failure log in the
+            # WebUI sees results even for intra-iteration retries (F→G→F
+            # loops where consume_iteration=False keeps the iteration open).
+            self.store.write_iteration(iter_num, iter_rec.to_dict())
 
             # Get next transition
             t = P.next_transition(phase, outcome)
@@ -601,6 +613,10 @@ class Orchestrator:
                 failure_feedback=ctx.failure if ctx.failure and "correctness" in (ctx.failure or "").lower() else None,
                 iteration=n,
                 logs_dir=self._logs_dir_for(n),
+                headroom_bottleneck=ctx.selected_kernel.headroom_bottleneck or "",
+                headroom_bw_util_pct=ctx.selected_kernel.headroom_roofline_efficiency_pct,
+                headroom_compute_util_pct=ctx.selected_kernel.headroom_roofline_efficiency_pct,
+                headroom_pct=ctx.selected_kernel.headroom_pct,
             ),
             timeout=self.cfg.agent_timeout_s,
             resume_session_id=ctx.session_id,
@@ -616,6 +632,28 @@ class Orchestrator:
         opt_path = iter_dir / "optimized_kernel.py"
         if not opt_path.exists():
             return P.LOGIC_FAIL, None, "Agent did not produce optimized_kernel.py"
+
+        # HIP C++ mode: validate that the .cpp file exists and compiles
+        if self._get_optimizer_mode() == "hip_cpp":
+            cpp_path = iter_dir / "optimized_kernel.cpp"
+            if not cpp_path.exists():
+                # Agent might have inlined C++ code in the Python wrapper,
+                # which is acceptable but not ideal. Log a warning.
+                self.store.append_timeline("hip_cpp_missing_source", {
+                    "iteration": n,
+                    "warning": "optimized_kernel.cpp not found; agent may have inlined C++ in .py",
+                })
+            else:
+                # Validate HIP compilation
+                cpp_ok, cpp_error = self._validate_hip_kernel(cpp_path, n)
+                if not cpp_ok:
+                    self.store.append_timeline("hip_compile_error", {
+                        "iteration": n,
+                        "error": cpp_error[:500],
+                    })
+                    # Don't fail the phase — let G phase (correctness) catch
+                    # runtime compilation errors. The harness will report
+                    # import failures with details.
 
         ctx.session_id = None
         return P.OK, None, None
@@ -724,19 +762,104 @@ class Orchestrator:
             ctx.no_improvement_count += 1
             return P.LOGIC_FAIL, None, f"Perf measurement failed: {perf_result.get('error', 'unknown')}"
 
-        # 2. Complexity evaluation
+        # Read optimized kernel code for headroom analysis and complexity evaluation
         opt_code = evolved_path.read_text(encoding="utf-8")
+
+        # 1.5. Headroom analysis (roofline model)
+        headroom = analyze_headroom(
+            kernel_code=opt_code,
+            kernel_fn_name=ctx.kernel_fn_name,
+            exec_time_ms=exec_time_ms,
+            req=self.req,
+        )
+        headroom_dict = headroom_result_to_dict(headroom)
+        headroom_summary = headroom_dict_to_summary(headroom_dict)
+
+        self.store.append_timeline("headroom_analysis", {
+            "iteration": n,
+            "bottleneck": headroom.bottleneck,
+            "bw_util_pct": headroom_summary.get("bw_util_pct", 0.0),
+            "compute_util_pct": headroom_summary.get("compute_util_pct", 0.0),
+            "headroom_pct": headroom.headroom_pct,
+        })
+
+        # 1.6. Fine-grained profiling via hipprof (optional, controlled by requirements)
+        profile_result = None
+        profile_advice = ""
+        enable_profiling = self.req.get("enable_profiling", False)
+        if isinstance(enable_profiling, str):
+            enable_profiling = enable_profiling.lower() in ("true", "yes", "1")
+        if enable_profiling:
+            try:
+                profile_result = run_hipprof_profile(
+                    kernel_script=evolved_path,
+                    shape_args={"M": headroom.M, "N": headroom.N, "K": headroom.K},
+                    kernel_fn_name=ctx.kernel_fn_name,
+                    output_dir=iter_dir / "profiling",
+                    timeout_s=120,
+                )
+                profile_advice = profile_to_advice(
+                    profile_result, headroom.M, headroom.N, headroom.K,
+                )
+                self.store.append_timeline("profiling_complete", {
+                    "iteration": n,
+                    "success": profile_result.success,
+                    "kernel_duration_us": profile_result.kernel_duration_us,
+                    "achieved_bw_gbps": profile_result.achieved_bw_total_gbps,
+                    "occupancy_pct": profile_result.achieved_occupancy_pct,
+                })
+            except Exception as e:
+                self.store.append_timeline("profiling_error", {
+                    "iteration": n,
+                    "error": str(e)[:500],
+                })
+
+        # 2. Complexity evaluation
         complexity = self._evaluate_complexity(opt_code, n, iter_dir)
+
+        # 2.5. In HIP mode, also capture the real .cpp kernel source
+        cpp_code: Optional[str] = None
+        optimizer_mode = self._get_optimizer_mode()
+        if optimizer_mode == "hip_cpp":
+            cpp_path = iter_dir / "optimized_kernel.cpp"
+            if cpp_path.exists():
+                try:
+                    cpp_code = cpp_path.read_text(encoding="utf-8")
+                except Exception:
+                    pass
 
         # 3. Create kernel entry and try to add to library
         entry = KernelEntry(
             id=str(uuid.uuid4()),
             code=opt_code,
+            cpp_code=cpp_code,
             exec_time_ms=exec_time_ms,
             complexity_score=complexity,
             combined_score=0.0,
             iteration_added=n,
             parent_id=ctx.selected_kernel.id if ctx.selected_kernel else None,
+            headroom_bottleneck=headroom.bottleneck,
+            headroom_roofline_efficiency_pct=headroom.roofline_efficiency_pct,
+            headroom_pct=headroom.headroom_pct,
+            headroom_p_max_tflops=headroom.p_max_tflops,
+            headroom_p_bw_roof_tflops=headroom.p_bandwidth_roof_tflops,
+            headroom_ai_ridge=headroom.ai_ridge,
+            headroom_suggestions_json=json.dumps(headroom.suggestions, ensure_ascii=False),
+            headroom_advice=headroom.optimization_advice,
+            headroom_achieved_bw_gbps=headroom.achieved_bw_gbps,
+            headroom_achieved_tflops=headroom.achieved_tflops,
+            headroom_peak_bw_gbps=headroom.peak_bw_gbps,
+            headroom_peak_tflops=headroom.peak_tflops,
+            headroom_arithmetic_intensity=headroom.arithmetic_intensity,
+            headroom_measured_ai=headroom.measured_ai,
+            headroom_shape_label=headroom.shape_label,
+            headroom_M=headroom.M, headroom_N=headroom.N, headroom_K=headroom.K,
+            profiled=(profile_result is not None and profile_result.success),
+            profiling_kernel_duration_us=profile_result.kernel_duration_us if profile_result else 0.0,
+            profiling_achieved_bw_gbps=profile_result.achieved_bw_total_gbps if profile_result else 0.0,
+            profiling_occupancy_pct=profile_result.achieved_occupancy_pct if profile_result else 0.0,
+            profiling_l2_cache_hit_pct=profile_result.l2_cache_hit_pct if profile_result else 0.0,
+            profiling_advice=profile_advice if profile_advice else None,
         )
         entry.recompute_combined()
 
@@ -747,10 +870,13 @@ class Orchestrator:
         ctx.current_complexity = complexity
 
         # Track optimization history
-        ctx.optimization_history.append(
+        history_line = (
             f"Iter {n}: exec={exec_time_ms:.4f}ms, complexity={complexity:.2f}, "
             f"combined={entry.combined_score:.4f}, added={'YES' if added else 'NO'}"
         )
+        if profile_advice:
+            history_line += f"\n  Profile: {profile_advice[:300]}"
+        ctx.optimization_history.append(history_line)
 
         # Update best
         if exec_time_ms < ctx.best_exec_time_ms:
@@ -770,6 +896,18 @@ class Orchestrator:
             shared_kernel.parent.mkdir(parents=True, exist_ok=True)
             shared_kernel.write_text(opt_code, encoding="utf-8")
 
+            # HIP C++ mode: also persist the .cpp source alongside the .py wrapper
+            if self._get_optimizer_mode() == "hip_cpp":
+                cpp_path = iter_dir / "optimized_kernel.cpp"
+                if cpp_path.exists():
+                    shared_cpp = self.cfg.workspace_dir / "optimized_kernels" / f"{entry.id}.cpp"
+                    shared_cpp.write_text(cpp_path.read_text(encoding="utf-8"))
+                else:
+                    self.store.append_timeline("hip_cpp_source_missing_on_save", {
+                        "iteration": n,
+                        "kernel_id": entry.id,
+                    })
+
         perf_dict = {
             "exec_time_ms": exec_time_ms,
             "speedup": speedup,
@@ -777,6 +915,10 @@ class Orchestrator:
             "combined_score": entry.combined_score,
             "added_to_library": added,
             "library_size": ctx.library.size,
+            "headroom_bottleneck": headroom_summary.get("bottleneck"),
+            "headroom_pct": headroom_summary.get("headroom_pct"),
+            "headroom_bw_util_pct": headroom_summary.get("bw_util_pct"),
+            "headroom_compute_util_pct": headroom_summary.get("compute_util_pct"),
         }
 
         return P.OK, perf_dict, None
@@ -1074,6 +1216,42 @@ class Orchestrator:
             "Need either 'kernel_file_path' (path to a Triton .py file) or 'kernel_code' (inline source). "
             "Create a new task using the current form to provide a kernel file."
         )
+
+    def _get_optimizer_mode(self) -> str:
+        """Read and normalize optimizer_mode from task requirements.
+
+        Returns one of: 'triton', 'hip_cpp'.
+        """
+        mode = self.req.get("optimizer_mode", "Triton (standard)")
+        if isinstance(mode, list):
+            mode = mode[0] if mode else "Triton (standard)"
+        if mode in ("HIP C++ (from scratch)", "hip_cpp", "hip"):
+            return "hip_cpp"
+        else:
+            return "triton"  # default
+
+    def _validate_hip_kernel(
+        self, cpp_path: Path, iteration: int,
+    ) -> Tuple[bool, str]:
+        """Run hipcc syntax check on a HIP C++ kernel file.
+
+        Returns (success: bool, error_output: str).
+        """
+        try:
+            proc = subprocess.run(
+                ["hipcc", "-fsyntax-only", "-x", "hip", str(cpp_path)],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode == 0:
+                return True, ""
+            error = (proc.stderr or proc.stdout or "unknown compilation error")[:2000]
+            return False, error
+        except subprocess.TimeoutExpired:
+            return False, "hipcc syntax check timed out after 60s"
+        except FileNotFoundError:
+            return False, "hipcc not found in PATH — cannot validate HIP kernel"
+        except Exception as e:
+            return False, f"hipcc validation error: {e!r}"
 
     def _resolve_max_iterations(self) -> int:
         from metainfer.orchestrator.requirements import req_field_int

@@ -60,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
     run_p.add_argument("--model", default=None, help="Override model for sub-agents")
     run_p.add_argument("--effort", default=None, choices=_VALID_EFFORTS,
                        help=f"Claude Code effort level (default: {DEFAULT_EFFORT!r})")
+    run_p.add_argument("--gpu-device", type=str, default=None,
+                       help="CUDA visible device(s), e.g. '0' or '0,1'. Sets CUDA_VISIBLE_DEVICES env var before importing torch.")
     run_p.add_argument("--max-iterations", type=int, default=None,
                        help="Override max iterations")
     run_p.add_argument("--extra-claude-arg", action="append", default=[],
@@ -68,6 +70,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "run":
+        # Set GPU device BEFORE importing torch/triton inside the orchestrator
+        if args.gpu_device is not None:
+            import os
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_device
         from .orchestrator import run_with_requirements
         return run_with_requirements(
             requirements_path=args.requirements,

@@ -33,6 +33,40 @@ class KernelEntry:
     iteration_added: int = 0
     parent_id: Optional[str] = None
 
+    # Headroom analysis (populated during Phase H after perf measurement)
+    headroom_bottleneck: Optional[str] = None        # memory_bound | compute_bound | inefficient | near_optimal
+    headroom_roofline_efficiency_pct: float = 0.0    # P_achieved / P_max × 100 — primary metric
+    headroom_pct: float = 0.0                        # 100 - roofline_efficiency (for backward compat)
+    headroom_p_max_tflops: float = 0.0               # min(P_compute, BW_peak × AI)
+    headroom_p_bw_roof_tflops: float = 0.0           # BW_peak × AI
+    headroom_ai_ridge: float = 0.0                   # P_compute / BW_hbm ridge point
+    headroom_suggestions_json: Optional[str] = None  # JSON-encoded list of suggestion strings
+    headroom_advice: Optional[str] = None            # human-readable optimization advice paragraph
+    headroom_achieved_bw_gbps: float = 0.0           # achieved HBM bandwidth (GB/s) — from theoretical bytes
+    headroom_achieved_tflops: float = 0.0            # achieved compute throughput (TFLOPS) — from theoretical FLOPs
+    headroom_peak_bw_gbps: float = 0.0               # peak HBM bandwidth of the GPU
+    headroom_peak_tflops: float = 0.0                # peak TFLOPS for the kernel's compute dtype
+    headroom_arithmetic_intensity: float = 0.0       # FLOP / byte (HBM-level, theoretical)
+    headroom_measured_ai: float = 0.0                # FLOP / byte from profiler-measured HBM bytes (0=none)
+    headroom_shape_label: str = ""                   # shape used for roofline analysis (e.g. "M×2048 (K)×4096")
+    headroom_M: int = 0
+    headroom_N: int = 0
+    headroom_K: int = 0
+    # Deprecated fields kept for backward compat with old kernel_library.json
+    headroom_bw_util_pct: float = 0.0
+    headroom_compute_util_pct: float = 0.0
+
+    # HIP C++ kernel source (from scratch mode — the real .cpp file content)
+    cpp_code: Optional[str] = None
+
+    # hipprof profiling (populated during Phase H when enable_profiling=True)
+    profiled: bool = False
+    profiling_kernel_duration_us: float = 0.0
+    profiling_achieved_bw_gbps: float = 0.0
+    profiling_occupancy_pct: float = 0.0
+    profiling_l2_cache_hit_pct: float = 0.0
+    profiling_advice: Optional[str] = None             # profiling-based optimization advice
+
     def recompute_combined(self) -> float:
         """Recompute combined_score from exec_time and complexity.
 
@@ -146,6 +180,36 @@ class KernelLibrary:
                 combined_score=d.get("combined_score", 0.0),
                 iteration_added=d.get("iteration_added", 0),
                 parent_id=d.get("parent_id"),
+                headroom_bottleneck=d.get("headroom_bottleneck"),
+                headroom_roofline_efficiency_pct=(
+                    d.get("headroom_roofline_efficiency_pct", 0.0)
+                    or max(d.get("headroom_bw_util_pct", 0), d.get("headroom_compute_util_pct", 0))
+                ),
+                headroom_pct=d.get("headroom_pct", 0.0),
+                headroom_p_max_tflops=d.get("headroom_p_max_tflops", 0.0),
+                headroom_p_bw_roof_tflops=d.get("headroom_p_bw_roof_tflops", 0.0),
+                headroom_ai_ridge=d.get("headroom_ai_ridge", 0.0),
+                headroom_suggestions_json=d.get("headroom_suggestions_json"),
+                headroom_advice=d.get("headroom_advice"),
+                headroom_achieved_bw_gbps=d.get("headroom_achieved_bw_gbps", 0.0),
+                headroom_achieved_tflops=d.get("headroom_achieved_tflops", 0.0),
+                headroom_peak_bw_gbps=d.get("headroom_peak_bw_gbps", 0.0),
+                headroom_peak_tflops=d.get("headroom_peak_tflops", 0.0),
+                headroom_arithmetic_intensity=d.get("headroom_arithmetic_intensity", 0.0),
+                headroom_measured_ai=d.get("headroom_measured_ai", 0.0),
+                headroom_shape_label=d.get("headroom_shape_label", ""),
+                headroom_M=d.get("headroom_M", 0),
+                headroom_N=d.get("headroom_N", 0),
+                headroom_K=d.get("headroom_K", 0),
+                headroom_bw_util_pct=d.get("headroom_bw_util_pct", 0.0),
+                headroom_compute_util_pct=d.get("headroom_compute_util_pct", 0.0),
+                cpp_code=d.get("cpp_code"),
+                profiled=d.get("profiled", False),
+                profiling_kernel_duration_us=d.get("profiling_kernel_duration_us", 0.0),
+                profiling_achieved_bw_gbps=d.get("profiling_achieved_bw_gbps", 0.0),
+                profiling_occupancy_pct=d.get("profiling_occupancy_pct", 0.0),
+                profiling_l2_cache_hit_pct=d.get("profiling_l2_cache_hit_pct", 0.0),
+                profiling_advice=d.get("profiling_advice"),
             )
             for d in data
         ]

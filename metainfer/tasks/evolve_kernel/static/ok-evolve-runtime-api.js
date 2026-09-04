@@ -56,3 +56,27 @@ export async function getRetrospective(taskId, n) {
   if (!res.ok) throw new Error(`retrospective ${n}: ${res.status}`);
   return res.json();
 }
+
+export async function getKernelLineage(taskId, kernelId) {
+  const res = await fetch(`${BASE(taskId)}/kernel-library/${kernelId}/lineage`);
+  if (!res.ok) throw new Error(`kernel lineage: ${res.status}`);
+  return res.json();
+}
+
+export async function getFailures(taskId) {
+  const res = await fetch(`${BASE(taskId)}/failures`);
+  if (!res.ok) throw new Error(`failures: ${res.status}`);
+  return res.json();
+}
+
+export async function getShapeBenchmark(taskId) {
+  const res = await fetch(`${BASE(taskId)}/shape-benchmark`);
+  if (!res.ok) throw new Error(`shape-benchmark: ${res.status}`);
+  return res.json();
+}
+
+export async function refreshShapeBenchmark(taskId) {
+  const res = await fetch(`${BASE(taskId)}/shape-benchmark/refresh`, { method: "POST" });
+  if (!res.ok) throw new Error(`shape-benchmark refresh: ${res.status}`);
+  return res.json();
+}

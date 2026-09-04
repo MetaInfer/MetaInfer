@@ -1,10 +1,10 @@
 # Question bank for the `evolve-kernel` task type .
 # LLM-guided iterative GPU kernel optimization.
-# The user provides a Triton kernel file; the orchestrator generates
-# test harnesses and iteratively optimizes the kernel.
+# Supports Triton kernel optimization and full HIP C++ rewrites.
+# The orchestrator generates test harnesses and iteratively optimizes the kernel.
 
 - key: kernel_file_path
-  question: "Path to the Triton kernel .py file (must contain a @triton.jit decorated function):"
+  question: "Path to the kernel .py file (Triton @triton.jit or plain Python wrapper for HIP C++):"
   header: "Kernel file"
   required: true
 
@@ -28,8 +28,50 @@
     - label: "50"
       description: "Deep optimization, long-running"
 
+- key: optimizer_mode
+  question: "Optimization strategy?"
+  header: "Mode"
+  required: false
+  multi: false
+  default: "Triton (standard)"
+  options:
+    - label: "Triton (standard)"
+      description: "Pure Triton optimization — autotuning, tile size tuning, memory coalescing"
+    - label: "HIP C++ (from scratch)"
+      description: "Full HIP C++ rewrite w/ inline GCN assembly — max perf, replaces Triton entirely"
+
+- key: enable_profiling
+  question: "Enable hipprof GPU profiling (kernel duration + bandwidth estimation)?"
+  header: "Profiling"
+  required: false
+  multi: false
+  default: "No"
+  options:
+    - label: "No"
+      description: "Standard perf harness only (end-to-end exec time)"
+    - label: "Yes"
+      description: "Run hipprof for per-kernel timing + data-movement analysis"
+
+- key: multi_gpu
+  question: "Distribute optimization across multiple GPUs?"
+  header: "Multi-GPU"
+  required: false
+  multi: false
+  default: "no"
+  options:
+    - label: "Single GPU"
+      description: "Run on one GPU only (default)"
+    - label: "All GPUs (auto)"
+      description: "Split target shapes across all available GPUs"
+
+- key: gpu_count
+  question: "Number of GPUs to use (only if Multi-GPU is on, leave blank for auto-detect):"
+  header: "GPU Count"
+  required: false
+  default: ""
+
 - key: extra_notes
-  question: "Extra constraints or notes for the optimizer?"
+  question: "Extra constraints, target shapes (for multi-GPU splitting), or notes for the optimizer?"
   header: "Notes"
   required: false
 

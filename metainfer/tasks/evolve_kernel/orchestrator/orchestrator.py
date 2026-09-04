@@ -63,17 +63,56 @@ def run_with_requirements(
     req: Dict[str, Any] = json.loads(requirements_path.read_text(encoding="utf-8"))
     task_id = req.get("task_id", "task")
 
-    set_process_name("metainfer-orch-evolve-kernel")
-
+    # Resolve dirs early — needed by both single-GPU and multi-GPU paths
     if state_dir is None:
         state_dir = Path.cwd() / "nodes" / "localhost" / ".metainfer" / "tasks" / task_id
     if workspace_dir is None:
         workspace_dir = Path.cwd() / "nodes" / "localhost" / "workspaces" / task_id
     paths = _task_subdirs(state_dir, workspace_dir)
 
+    # Copy requirements if needed
     target_req = paths["requirements"]
     if requirements_path.resolve() != target_req.resolve():
         target_req.write_text(requirements_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # Also copy reference kernel from kernel_file_path to workspace
+    kernel_path_str = req.get("kernel_file_path", "")
+    if kernel_path_str:
+        kernel_path = Path(kernel_path_str)
+        if kernel_path.is_file():
+            ref_dir = workspace_dir / "reference"
+            ref_dir.mkdir(parents=True, exist_ok=True)
+            ref_path = ref_dir / "original_kernel.py"
+            if not ref_path.is_file():
+                ref_path.write_text(kernel_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # Multi-GPU dispatch: one orchestrator spawns N GPU workers internally
+    multi_gpu = req.get("multi_gpu", "no")
+    if multi_gpu in ("All GPUs (auto)", "yes", "true", "1"):
+        set_process_name("metainfer-orch-evolve-kernel-multi")
+        print(f"[metainfer-evolve-kernel] MULTI-GPU mode")
+        print(f"[metainfer-evolve-kernel] task_id        = {task_id}")
+        print(f"[metainfer-evolve-kernel] state dir      = {state_dir}")
+        print(f"[metainfer-evolve-kernel] workspace dir  = {workspace_dir}")
+
+        from ._parallel import MultiGpuOrchestrator
+        write_pid_file(paths["pid_file"], task_id)
+        orch_multi = MultiGpuOrchestrator(
+            req=req,
+            state_dir=state_dir,
+            workspace_dir=workspace_dir,
+            claude_bin=claude_bin,
+            model=model,
+            permission_mode=permission_mode,
+            effort=effort,
+        )
+        try:
+            orch_multi.run()
+        finally:
+            clear_pid_file(paths["pid_file"])
+        return 0
+
+    set_process_name("metainfer-orch-evolve-kernel")
 
     write_pid_file(paths["pid_file"], task_id)
 
